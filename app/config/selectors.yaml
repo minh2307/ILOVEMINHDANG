@@ -14,6 +14,11 @@ gemini:
   authenticated_marker:
     - css: '[contenteditable="true"][role="textbox"]'
     - css: 'textarea'
+    - css: 'div[contenteditable="true"]'
+    - role: textbox
+      name: Enter a prompt here
+    - role: textbox
+      name: Nhập câu lệnh tại đây
   new_chat:
     - role: button
       name: New chat
@@ -88,10 +93,15 @@ cdha:
   upload_started:
     - text: Đang tải lên
     - text: Uploading
+    - text: Đang kiểm tra PHI & upload JPEG...
+    - text: Đang xử lý…
     - css: '[role="progressbar"]'
   upload_complete:
     - text: Tải lên hoàn tất
     - text: Upload complete
+    - text: Hoàn tất
+    - text: Xong
+    - text: check_circle
     - css: '[data-upload-status="complete"]'
   upload_error:
     - text: Tải lên thất bại

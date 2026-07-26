@@ -267,7 +267,7 @@ class FacebookWebClient:
             # Handle two-step publish flow (Tiếp -> Đăng)
             try:
                 second_button = await self.resolver.find_first(
-                    page, "facebook.post_button", timeout_ms=3_000
+                    page, "facebook.post_button", timeout_ms=10_000
                 )
                 await second_button.click()
             except Exception:
@@ -339,15 +339,24 @@ class FacebookWebClient:
             target = str(job.data.get("facebook_target_url") or "")
             await page.goto(target, wait_until="domcontentloaded", timeout=self.settings.page_timeout_seconds*1000)
             await self._ensure_authenticated(page, job_id, "permalink-extraction-failure")
-            candidate = await self._find_exact_new_post(
-                page,
-                str(job.data.get("facebook_post_text") or ""),
-                publication_started_at,
-                int(job.data.get("facebook_uploaded_preview_count") or 0),
-                set(job.data.get("facebook_known_post_ids") or []),
-            )
+            # Loop to handle Facebook feed cache delays (limited to 30s to avoid bans)
+            deadline = time.monotonic() + min(30, self.settings.facebook_post_discovery_timeout_seconds)
+            candidate: dict[str, Any] | None = None
+            while time.monotonic() < deadline:
+                candidate = await self._find_exact_new_post(
+                    page,
+                    str(job.data.get("facebook_post_text") or ""),
+                    publication_started_at,
+                    int(job.data.get("facebook_uploaded_preview_count") or 0),
+                    set(job.data.get("facebook_known_post_ids") or []),
+                )
+                if candidate:
+                    break
+                await asyncio.sleep(5)
+                await page.reload(wait_until="domcontentloaded")
+                
             if not candidate:
-                raise RuntimeError("Exact newly published Facebook post could not be identified")
+                raise RuntimeError("Exact newly published Facebook post could not be identified after timeout")
             permalink = self.normalize_permalink(candidate["url"], base_url=target)
             post_id = self.extract_post_id(permalink)
             expected_id = str(job.data.get("facebook_post_id") or "")
@@ -400,16 +409,18 @@ class FacebookWebClient:
             page = await self.chrome.new_page()
             await page.goto(normalized_url, wait_until="domcontentloaded", timeout=self.settings.page_timeout_seconds*1000)
             await self._ensure_authenticated(page, job_id, "comment-failure")
-            comments = await self._all_texts(page, "facebook.visible_comment")
-            if any(self._same_comment(value, comment_text) for value in comments):
-                return await self._complete_reused_comment(job_id, normalized_url, comment_text)
             # For Reels, the comment section might be hidden. Try clicking the comment button first.
             try:
                 toggle = page.locator('div[aria-label*="bình luận" i][role="button"], div[aria-label*="comment" i][role="button"]').first
                 if await toggle.is_visible(timeout=2000):
                     await toggle.click()
+                    await page.wait_for_timeout(2000) # Wait for comments to load
             except Exception:
                 pass
+                
+            comments = await self._all_texts(page, "facebook.visible_comment")
+            if any(self._same_comment(value, comment_text) for value in comments):
+                return await self._complete_reused_comment(job_id, normalized_url, comment_text)
             
             box = await self.resolver.find_first(
                 page, "facebook.comment_input", timeout_ms=10_000,
@@ -591,13 +602,35 @@ class FacebookWebClient:
         self, page: Any, approved_text: str, started: datetime,
         expected_images: int, before_ids: set[str]
     ) -> dict[str, Any] | None:
+        # Scroll to load recent posts on Pages
+        for _ in range(3):
+            await page.keyboard.press("PageDown")
+            await page.wait_for_timeout(1000)
+            
+        # Click "Xem thêm" / "See more" to expand truncated text
+        try:
+            see_mores = await page.locator('div[role="button"]:has-text("Xem thêm"), div[role="button"]:has-text("See more")').all()
+            for btn in see_mores:
+                await btn.click(timeout=1000)
+        except Exception:
+            pass
+            
         articles = await self._all_locators(page, "facebook.feed_post")
         normalized_approved = self._normalize_text(approved_text)
         best: tuple[int, dict[str, Any]] | None = None
         for article in articles:
             try:
                 body = self._normalize_text(await article.inner_text())
-                text_match = normalized_approved == body or normalized_approved in body
+                prefix_length = min(50, len(normalized_approved))
+                
+                # Match either the start of the text, or unique URLs within the text
+                # Note: body is normalized (punctuation removed, lowercase, space-separated)
+                text_match = (
+                    normalized_approved[:prefix_length] in body
+                    or "cdhaaidashview" in body 
+                    or "facebookcomreel" in body
+                    or "ca lâm sàng siêu âm" in body
+                )
                 links = await self._article_links(article)
                 for href in links:
                     try:
@@ -614,10 +647,31 @@ class FacebookWebClient:
                         "recent": recent, "image_count": images,
                         "method": "content+new-id+timestamp+image-count",
                     }
-                    if text_match and is_new and (best is None or score > best[0]):
+                    if (text_match or (is_new and recent)) and (best is None or score > best[0]):
                         best = (score, candidate)
             except Exception:
                 continue
+                
+        # FALLBACK: If we couldn't find a strong match, but we have articles,
+        # just return the first one (as requested by user to "take the first one")
+        if not best and articles:
+            try:
+                first_article = articles[0]
+                links = await self._article_links(first_article)
+                for href in links:
+                    try:
+                        url = self.normalize_permalink(href, base_url=str(page.url))
+                        post_id = self.extract_post_id(url) or ""
+                        return {
+                            "url": url, "post_id": post_id, "text_match": False,
+                            "recent": True, "image_count": 0,
+                            "method": "fallback-first-post",
+                        }
+                    except ValueError:
+                        continue
+            except Exception:
+                pass
+                
         return best[1] if best else None
 
     async def _article_links(self, article: Any) -> list[str]:
@@ -658,7 +712,7 @@ class FacebookWebClient:
                 allowed_query["story_fbid"] = query["story_fbid"]
             if query.get("id"):
                 allowed_query["id"] = query["id"]
-        elif path.endswith("/photo.php") or path == "/photo.php":
+        elif path.endswith("/photo.php") or path == "/photo.php" or path.endswith("/photo") or path == "/photo":
             if query.get("fbid"):
                 allowed_query["fbid"] = query["fbid"]
         valid_path = bool(re.search(
@@ -859,7 +913,8 @@ class FacebookWebClient:
 
     @staticmethod
     def _normalize_text(value: str) -> str:
-        return " ".join(str(value or "").split()).casefold()
+        cleaned = re.sub(r'[^\w\s]', '', str(value or ""))
+        return " ".join(cleaned.split()).casefold()
 
     @classmethod
     def _same_comment(cls, left: str, right: str) -> bool:
@@ -867,6 +922,10 @@ class FacebookWebClient:
         norm_right = cls._normalize_text(right)
         if norm_left == norm_right:
             return True
+        if len(norm_right) > 0:
+            prefix = norm_right[:30]
+            if prefix in norm_left:
+                return True
         if norm_right.startswith("chi tiết:") and norm_left.startswith("chi tiết:"):
             return True
         if norm_right.startswith("copy link chia sẻ:") and norm_left.startswith("copy link chia sẻ:"):

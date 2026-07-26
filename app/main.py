@@ -201,7 +201,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.review_job:
         try:
             decision = ReviewService(settings, repository).review(args.review_job)
-            if decision.action in {"retry_gemini", "retry_cdha"}:
+            if decision.action in {"retry_gemini", "retry_cdha", "retry_ollama"}:
                 return asyncio.run(
                     _run_review_retry(args.review_job, decision.action, settings, repository)
                 )
@@ -367,6 +367,7 @@ def _run_retry_job(job_id: str, settings: Settings, repository: JobRepository) -
     _retry_map = {
         WorkflowStatus.DOWNLOADREEL_FAILED: "download",
         WorkflowStatus.GEMINI_FAILED: "gemini",
+        WorkflowStatus.AI_FAILED: "ai",
         WorkflowStatus.NEEDS_GEMINI_LOGIN: "gemini",
         WorkflowStatus.CDHA_FAILED: "cdha",
         WorkflowStatus.NEEDS_CDHA_LOGIN: "cdha",
@@ -483,7 +484,7 @@ async def _run_phase3_command(
             return 0 if result.success else 1
 
         if args.process_cdha and job.status in {
-            WorkflowStatus.DOWNLOADED, WorkflowStatus.GEMINI_FAILED, WorkflowStatus.NEEDS_GEMINI_LOGIN,
+            WorkflowStatus.DOWNLOADED, WorkflowStatus.GEMINI_FAILED, WorkflowStatus.AI_FAILED, WorkflowStatus.NEEDS_GEMINI_LOGIN,
         }:
             generated = await gemini.generate_clinical_factors(
                 caption=str(job.data.get("caption") or ""),
@@ -537,13 +538,28 @@ async def _run_review_retry(
         job = repository.get_job(job_id)
         if job is None:
             raise LookupError(f"Job not found: {job_id}")
-        if action == "retry_gemini":
-            generated = await gemini.generate_clinical_factors(
-                caption=str(job.data.get("caption") or ""),
-                comments=list(job.data.get("comments") or []),
-                job_id=job_id,
-            )
-            if not generated.success:
+        if action in {"retry_gemini", "retry_ollama"}:
+            # retry_ollama: re-run local Ollama AI, then fall through to CDHA
+            # retry_gemini: legacy path kept for backwards compat
+            if action == "retry_gemini":
+                generated = await gemini.generate_clinical_factors(
+                    caption=str(job.data.get("caption") or ""),
+                    comments=list(job.data.get("comments") or []),
+                    job_id=job_id,
+                )
+            else:
+                # Retry local Ollama via CDHAPipeline helper
+                from app.workflows.cdha_pipeline import CDHAPipeline
+                pipeline = CDHAPipeline(settings, repository, chrome=chrome)
+                ai_result = await pipeline._step_ai(job_id)
+                if not ai_result.success:
+                    print(json.dumps(ai_result.to_dict(), ensure_ascii=False, indent=2))
+                    return 1
+                # _step_ai already chains into _step_cdha and _step_screenshots;
+                # display the updated review and exit so the user can re-decide.
+                ReviewService(settings, repository).display(job_id)
+                return 0
+            if action == "retry_gemini" and not generated.success:
                 return 1
             job = repository.get_job(job_id)
         video_path = job.data.get("video_path")

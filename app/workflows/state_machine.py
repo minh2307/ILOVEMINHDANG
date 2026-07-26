@@ -10,7 +10,7 @@ class WorkflowStateMachine:
         WorkflowStatus.DOWNLOADREEL_RUNNING: frozenset(
             {WorkflowStatus.DOWNLOADED, WorkflowStatus.DOWNLOADREEL_FAILED}
         ),
-        WorkflowStatus.DOWNLOADED: frozenset({WorkflowStatus.GEMINI_OPENING}),
+        WorkflowStatus.DOWNLOADED: frozenset({WorkflowStatus.GEMINI_OPENING, WorkflowStatus.AI_ANALYZING}),
         WorkflowStatus.GEMINI_OPENING: frozenset(
             {
                 WorkflowStatus.NEEDS_GEMINI_LOGIN,
@@ -23,6 +23,9 @@ class WorkflowStateMachine:
         ),
         WorkflowStatus.GEMINI_GENERATING: frozenset(
             {WorkflowStatus.CLINICAL_FACTORS_GENERATED, WorkflowStatus.GEMINI_FAILED}
+        ),
+        WorkflowStatus.AI_ANALYZING: frozenset(
+            {WorkflowStatus.CLINICAL_FACTORS_GENERATED, WorkflowStatus.AI_FAILED}
         ),
         WorkflowStatus.CLINICAL_FACTORS_GENERATED: frozenset({WorkflowStatus.CDHA_OPENING}),
         WorkflowStatus.CDHA_OPENING: frozenset(
@@ -52,6 +55,7 @@ class WorkflowStateMachine:
                 WorkflowStatus.REJECTED,
                 WorkflowStatus.CDHA_OPENING,
                 WorkflowStatus.GEMINI_OPENING,
+                WorkflowStatus.AI_ANALYZING,
                 WorkflowStatus.RETRY_PENDING,
             }
         ),
@@ -87,6 +91,7 @@ class WorkflowStateMachine:
         WorkflowStatus.COMMENT_ADDED: frozenset({WorkflowStatus.COMPLETED}),
         WorkflowStatus.DOWNLOADREEL_FAILED: frozenset({WorkflowStatus.RETRY_PENDING}),
         WorkflowStatus.GEMINI_FAILED: frozenset({WorkflowStatus.RETRY_PENDING}),
+        WorkflowStatus.AI_FAILED: frozenset({WorkflowStatus.RETRY_PENDING}),
         WorkflowStatus.CDHA_FAILED: frozenset({WorkflowStatus.RETRY_PENDING}),
         WorkflowStatus.FACEBOOK_PUBLISH_FAILED: frozenset({WorkflowStatus.RETRY_PENDING}),
         WorkflowStatus.POST_URL_EXTRACTION_FAILED: frozenset({WorkflowStatus.RETRY_PENDING}),
@@ -96,6 +101,7 @@ class WorkflowStateMachine:
             {
                 WorkflowStatus.DOWNLOADREEL_RUNNING,
                 WorkflowStatus.GEMINI_OPENING,
+                WorkflowStatus.AI_ANALYZING,
                 WorkflowStatus.CDHA_OPENING,
                 WorkflowStatus.FACEBOOK_PREPARING,
                 WorkflowStatus.POST_URL_EXTRACTING,

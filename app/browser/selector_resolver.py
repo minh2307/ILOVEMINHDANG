@@ -72,7 +72,7 @@ class SelectorResolver:
                 )
                 self.logger.debug(
                     "Resolved selector",
-                    extra={"selector_key": key, "selector": description, "url": safe_browser_url(str(page.url))},
+                    extra={"selector_key": key, "selector": description, "url": safe_browser_url(str(page.url)) if hasattr(page, "url") else "(FrameLocator)"},
                 )
                 return locator
             except Exception as exc:
@@ -82,8 +82,8 @@ class SelectorResolver:
                 if is_terminal_browser_condition(mapped):
                     raise mapped from exc
                 failures.append(f"{description}: {type(exc).__name__}")
-        title = _PRIVACY.mask(await page.title())
-        safe_url = safe_browser_url(str(page.url))
+        title = _PRIVACY.mask(await page.title()) if hasattr(page, "title") else "(FrameLocator)"
+        safe_url = safe_browser_url(str(page.url)) if hasattr(page, "url") else "(FrameLocator)"
         diagnostic_paths: tuple[Path, Path] | None = None
         if diagnostics_dir is not None:
             diagnostic_paths = await self._save_failure_diagnostics(
@@ -206,12 +206,15 @@ class SelectorResolver:
         screenshot = (output_dir / f"selector-{safe_key}.png").resolve()
         metadata = (output_dir / f"selector-{safe_key}.json").resolve()
         try:
-            await page.screenshot(path=str(screenshot), full_page=True)
+            if hasattr(page, "screenshot"):
+                await page.screenshot(path=str(screenshot), full_page=True)
+            else:
+                screenshot.write_text("Screenshot not available for FrameLocator")
             metadata.write_text(
                 json.dumps(
                     {
-                        "current_url": safe_browser_url(str(page.url)),
-                        "page_title": _PRIVACY.mask(await page.title()),
+                        "current_url": safe_browser_url(str(page.url)) if hasattr(page, "url") else "(FrameLocator)",
+                        "page_title": _PRIVACY.mask(await page.title()) if hasattr(page, "title") else "(FrameLocator)",
                         "selector_key": key,
                         "attempted_selectors": [self._describe(item) for item in self.candidates(key)],
                         "failures": failures,
@@ -225,13 +228,16 @@ class SelectorResolver:
             artifact = metadata
             if self.save_html:
                 artifact = (output_dir / f"selector-{safe_key}.html").resolve()
-                artifact.write_text(await page.content(), encoding="utf-8")
+                if hasattr(page, "content"):
+                    artifact.write_text(await page.content(), encoding="utf-8")
+                else:
+                    artifact.write_text("HTML content not available for FrameLocator", encoding="utf-8")
             for path in (screenshot, metadata, artifact):
                 path.chmod(0o600)
             return screenshot, artifact
         except Exception as exc:
             self.logger.error(
                 "Unable to save selector diagnostics",
-                extra={"selector_key": key, "url": safe_browser_url(str(page.url)), "error_type": type(exc).__name__},
+                extra={"selector_key": key, "url": safe_browser_url(str(page.url)) if hasattr(page, "url") else "(FrameLocator)", "error_type": type(exc).__name__},
             )
             return None

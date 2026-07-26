@@ -160,10 +160,11 @@ class CDHAPipeline:
             return await self._step_download(job_id)
 
         if status in {
-            WorkflowStatus.DOWNLOADED, WorkflowStatus.GEMINI_FAILED,
-            WorkflowStatus.NEEDS_GEMINI_LOGIN, WorkflowStatus.GEMINI_OPENING,
+            WorkflowStatus.DOWNLOADED, WorkflowStatus.AI_FAILED,
+            WorkflowStatus.GEMINI_FAILED, WorkflowStatus.NEEDS_GEMINI_LOGIN,
+            WorkflowStatus.GEMINI_OPENING, WorkflowStatus.AI_ANALYZING,
         }:
-            return await self._step_gemini(job_id)
+            return await self._step_ai(job_id)
 
         if status in {
             WorkflowStatus.CLINICAL_FACTORS_GENERATED, WorkflowStatus.CDHA_FAILED,
@@ -230,10 +231,10 @@ class CDHAPipeline:
             if not r.success:
                 return r
         if self.repository.get_job(job_id).status in {
-            WorkflowStatus.DOWNLOADED, WorkflowStatus.GEMINI_FAILED,
-            WorkflowStatus.NEEDS_GEMINI_LOGIN, WorkflowStatus.GEMINI_OPENING,
+            WorkflowStatus.DOWNLOADED, WorkflowStatus.AI_FAILED, WorkflowStatus.GEMINI_FAILED,
+            WorkflowStatus.NEEDS_GEMINI_LOGIN, WorkflowStatus.GEMINI_OPENING, WorkflowStatus.AI_ANALYZING,
         }:
-            r = await self._step_gemini(job_id)
+            r = await self._step_ai(job_id)
             if not r.success:
                 return r
         if self.repository.get_job(job_id).status in {
@@ -279,37 +280,108 @@ class CDHAPipeline:
                 error=result.error or "DownloadReel failed",
                 pending="Retry with: python main.py --retry-job " + job_id,
             )
-        return await self._step_gemini(job_id)
+        return await self._step_ai(job_id)
 
-    async def _step_gemini(self, job_id: str) -> PipelineResult:
-        """Delegate to existing GeminiWebClient through ChromeManager."""
-        from app.browser.gemini_client import GeminiWebClient
-        chrome = await self._get_chrome()
-        resolver = SelectorResolver(self.settings.selectors_path)
-        gemini = GeminiWebClient(self.settings, self.repository, chrome, resolver=resolver)
+    async def _step_ai(self, job_id: str) -> PipelineResult:
+        """Run local AI analysis (vision or text-only) using Ollama."""
+        from app.ai.provider_factory import build_analyzer
+        from app.ai.models import ClinicalAnalysisRequest
+        from app.ai.exceptions import AIProviderError
+        from app.services.frame_extraction_service import FrameExtractionService
+
         job = self.repository.get_job(job_id)
         if job is None:
             return PipelineResult(False, job_id, "UNKNOWN", error="Job not found")
-        
-        # Idempotency check: if clinical factors already generated, skip Gemini
+
+        # Idempotency check
         if job.data.get("clinical_factors_path"):
             cf_path = Path(job.data.get("clinical_factors_path", ""))
             if cf_path.is_file() and cf_path.read_text().strip():
-                self.logger.info("Gemini clinical factors already exist, skipping Gemini step.", extra={"job_id": job_id})
+                self.logger.info("Clinical factors already exist, skipping AI step.", extra={"job_id": job_id})
                 return await self._step_cdha(job_id)
-        
-        result = await gemini.generate_clinical_factors(
-            caption=str(job.data.get("caption") or ""),
-            comments=list(job.data.get("comments") or []),
-            job_id=job_id,
+
+        self.repository.transition(
+            job_id, WorkflowStatus.AI_ANALYZING,
+            details={"provider": "ollama", "model": self.settings.ollama_model},
+            data_patch={"ai_error": None}
         )
-        if not result.success:
+
+        try:
+            # 1. Extract frames if needed
+            video_path_str = job.data.get("video_path")
+            frame_paths = []
+            if video_path_str:
+                extractor = FrameExtractionService(
+                    job_data_dir=self.settings.job_data_dir,
+                    interval_seconds=self.settings.frame_extraction_interval_seconds,
+                    max_frames=self.settings.frame_extraction_max_frames,
+                    width=self.settings.frame_extraction_width,
+                    jpeg_quality=self.settings.frame_jpeg_quality,
+                    similarity_threshold=self.settings.frame_similarity_threshold,
+                    enabled=self.settings.frame_extraction_enabled,
+                )
+                try:
+                    frame_paths = extractor.extract(job_id=job_id, video_path=Path(video_path_str))
+                except Exception as exc:
+                    self.logger.warning("Frame extraction failed; will fall back to text-only if possible", exc_info=exc)
+
+            # 2. Build request
+            request = ClinicalAnalysisRequest(
+                job_id=job_id,
+                video_path=video_path_str,
+                frame_paths=frame_paths,
+                caption=str(job.data.get("caption") or ""),
+                comments=list(job.data.get("comments") or []),
+                prompt_version=self.settings.ollama_prompt_version,
+            )
+
+            # 3. Analyze
+            analyzer = build_analyzer(self.settings, logger=self.logger)
+            result = await analyzer.analyze(request)
+
+            if not result.success:
+                raise RuntimeError(result.error or "AI analysis validation failed")
+
+            # 4. Save to repository and transition
+            self.repository.transition(
+                job_id,
+                WorkflowStatus.CLINICAL_FACTORS_GENERATED,
+                details={
+                    "analysis_mode": result.analysis_mode,
+                    "clinical_factors_path": result.masked_output_path,
+                },
+                data_patch={
+                    "clinical_factors_normalized_path": result.normalized_output_path,
+                    "clinical_factors_path": result.masked_output_path,
+                    "clinical_factors": result.clinical_factors_text,
+                    "clinical_factors_missing_fields": result.missing_fields,
+                    "clinical_factors_warnings": result.validation_warnings,
+                    "ai_completed_at": datetime.now(UTC).isoformat(),
+                    "ai_error": None,
+                    "ai_analysis_mode": result.analysis_mode,
+                    "ai_visual_analysis_performed": result.visual_analysis_performed,
+                    "ai_findings": [f.description for f in result.findings] if result.findings else [],
+                    "ai_impression": result.impression,
+                    "ai_differential_diagnosis": result.differential_diagnosis,
+                },
+            )
+            return await self._step_cdha(job_id)
+
+        except Exception as exc:
+            from app.error_events import safe_error_message
+            error = safe_error_message(exc)
+            self.repository.transition(
+                job_id,
+                WorkflowStatus.AI_FAILED,
+                details={"error": error},
+                data_patch={"ai_error": error, "ai_completed_at": datetime.now(UTC).isoformat()},
+            )
+            self.logger.error("AI step failed", extra={"job_id": job_id, "error": error})
             return self._make_pipeline_result(
                 job_id, False,
-                error=result.error or "Gemini step failed",
-                pending="Complete login and retry: python main.py --retry-job " + job_id,
+                error=error,
+                pending="Check Ollama and retry: python main.py --retry-job " + job_id,
             )
-        return await self._step_cdha(job_id)
 
     async def _step_cdha(self, job_id: str) -> PipelineResult:
         """Delegate to existing CDHAWebClient through ChromeManager."""
@@ -344,7 +416,7 @@ class CDHAPipeline:
         return await self._step_screenshots(job_id)
 
     async def _step_screenshots(self, job_id: str) -> PipelineResult:
-        """Screenshots are captured inside CDHAWebClient; move to review."""
+        """Screenshots are captured inside CDHAWebClient; move to interactive review."""
         job = self.repository.get_job(job_id)
         if job is None:
             return PipelineResult(False, job_id, "UNKNOWN", error="Job not found")
@@ -354,11 +426,52 @@ class CDHAPipeline:
             self.repository.transition(job_id, WorkflowStatus.SCREENSHOTS_CAPTURED)
         if self.repository.get_job(job_id).status is WorkflowStatus.SCREENSHOTS_CAPTURED:
             self.repository.transition(job_id, WorkflowStatus.WAITING_FOR_REVIEW)
-        ReviewService(self.settings, self.repository).display(job_id)
-        return self._make_pipeline_result(
-            job_id, False,
-            pending="Run: python main.py --review-job " + job_id,
-        )
+
+        # Enter interactive review loop — user can act immediately without a separate command
+        review_svc = ReviewService(self.settings, self.repository)
+        while True:
+            try:
+                decision = review_svc.review(job_id)
+            except (ValueError, EOFError) as exc:
+                # Non-interactive environment (piped stdin / CI) — fall back to pending
+                self.logger.warning(
+                    "Interactive review not available (%s); leaving job in WAITING_FOR_REVIEW.", exc
+                )
+                return self._make_pipeline_result(
+                    job_id, False,
+                    pending="Run: python main.py --review-job " + job_id,
+                )
+
+            if decision.action == "approved":
+                # Chrome is still open — continue directly to Facebook
+                return await self._step_facebook(job_id)
+
+            if decision.action == "rejected":
+                return self._make_pipeline_result(job_id, False, error="Job rejected during review")
+
+            if decision.action == "retry_cdha":
+                # Chrome is still open — retry CDHA inline
+                return await self._step_cdha(job_id)
+
+            if decision.action == "retry_ollama":
+                # Retry AI then CDHA (Chrome stays open for CDHA)
+                return await self._step_ai(job_id)
+
+            if decision.action == "show_screenshot_folder":
+                # Folder was opened; loop back to show menu again
+                continue
+
+            if decision.action == "resume_later":
+                return self._make_pipeline_result(
+                    job_id, False,
+                    pending="Run: python main.py --review-job " + job_id,
+                )
+
+            # Unknown action — treat as resume later
+            return self._make_pipeline_result(
+                job_id, False,
+                pending="Run: python main.py --review-job " + job_id,
+            )
 
     async def _step_facebook(self, job_id: str) -> PipelineResult:
         """Delegate Phase 4 Facebook workflow through FacebookPublisherAdapter."""
@@ -455,8 +568,8 @@ class CDHAPipeline:
     async def _route_retry(self, job_id: str, retry_step: str) -> PipelineResult:
         if retry_step in {"download", ""}:
             return await self._step_download(job_id)
-        if retry_step == "gemini":
-            return await self._step_gemini(job_id)
+        if retry_step in {"gemini", "ai", "ai_analyzing", "ai_analysis"}:
+            return await self._step_ai(job_id)
         if retry_step in {"cdha", "cdha_opening"}:
             return await self._step_cdha(job_id)
         if retry_step == "facebook_prepare":
@@ -599,7 +712,7 @@ class CDHAPipeline:
         status = job.status
         sequence = [
             (WorkflowStatus.DOWNLOADED, "download"),
-            (WorkflowStatus.CLINICAL_FACTORS_GENERATED, "gemini"),
+            (WorkflowStatus.CLINICAL_FACTORS_GENERATED, "ai_analysis"),
             (WorkflowStatus.CDHA_ANALYZED, "cdha"),
             (WorkflowStatus.SCREENSHOTS_CAPTURED, "screenshots"),
             (WorkflowStatus.APPROVED, "review"),

@@ -40,11 +40,11 @@ Rules:
 - Remove names, account names, phone numbers, email addresses, addresses,
   patient IDs, medical record numbers, and other identifying information.
 - Clearly mark uncertain information.
-- Use Vietnamese.
+- MUST use Vietnamese (Tiếng Việt) for all outputs. DO NOT output Chinese (中文).
 - Return plain text only.
 - Do not use Markdown tables.
 - Do not include an introduction or conclusion.
-- If information is unavailable, write “Không được cung cấp”.
+- If information is unavailable for a field, omit that heading entirely.
 - Keep the result concise enough for direct insertion into CDHA Clinical
   Factors.
 
@@ -187,13 +187,6 @@ class ClinicalFactorsService:
             failures.append("Response contains prompt-injection or instruction-like content")
 
         normalized_lines = [line.casefold() for line in normalized.splitlines()]
-        missing = [
-            heading
-            for heading in REQUIRED_HEADINGS
-            if not any(line.startswith(heading.casefold()) for line in normalized_lines)
-        ]
-        if missing:
-            failures.append("Response is missing required Clinical Factors headings")
         if self._contains_markdown_table(normalized):
             failures.append("Markdown tables are not allowed")
         first_heading = min(
@@ -215,8 +208,6 @@ class ClinicalFactorsService:
             )
         if self._contains_unsupported_diagnosis(normalized, source_text):
             failures.append("Response states an unsupported definite diagnosis")
-        if "không được cung cấp" not in lowered:
-            warnings.append("Missing information may not be explicitly marked")
 
         return ClinicalFactorsResult(
             success=not failures,

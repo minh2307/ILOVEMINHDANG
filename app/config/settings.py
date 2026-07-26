@@ -107,6 +107,24 @@ class Settings:
     facebook_test_target_url: str
     allow_production_target_in_test_mode: bool
     test_mode_disable_comment: bool
+    # Ollama / local AI engine
+    ollama_base_url: str
+    ollama_model: str
+    ollama_timeout_seconds: int
+    ollama_keep_alive: str
+    ollama_temperature: float
+    ollama_max_retries: int
+    ollama_prompt_version: str
+    ollama_prompt_max_chars: int
+    ollama_comment_total_max_chars: int
+    save_raw_ollama_response: bool
+    # Frame extraction
+    frame_extraction_enabled: bool
+    frame_extraction_interval_seconds: int
+    frame_extraction_max_frames: int
+    frame_extraction_width: int
+    frame_jpeg_quality: int
+    frame_similarity_threshold: float
 
     @classmethod
     def from_env(cls, env_file: Path | None = None) -> "Settings":
@@ -189,7 +207,7 @@ class Settings:
             retry_multiplier=_float_env("RETRY_MULTIPLIER", 2.0, 1.0),
             retry_max_delay_seconds=_float_env("RETRY_MAX_DELAY_SECONDS", 8.0, 0.0),
             retry_jitter_seconds=_float_env("RETRY_JITTER_SECONDS", 0.25, 0.0),
-            save_diagnostic_html=_bool_env("SAVE_DIAGNOSTIC_HTML", False),
+            save_diagnostic_html=_bool_env("SAVE_DIAGNOSTIC_HTML", True),
             save_raw_gemini_prompt=_bool_env("SAVE_RAW_GEMINI_PROMPT", False),
             save_raw_gemini_response=_bool_env("SAVE_RAW_GEMINI_RESPONSE", False),
             diagnostic_directory=_path_env("DIAGNOSTIC_DIRECTORY", "data/diagnostics"),
@@ -199,6 +217,24 @@ class Settings:
                 "ALLOW_PRODUCTION_TARGET_IN_TEST_MODE", False
             ),
             test_mode_disable_comment=_bool_env("TEST_MODE_DISABLE_COMMENT", True),
+            # Ollama / local AI engine
+            ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip(),
+            ollama_model=os.getenv("OLLAMA_MODEL", "").strip(),
+            ollama_timeout_seconds=_int_env("OLLAMA_TIMEOUT_SECONDS", 300),
+            ollama_keep_alive=os.getenv("OLLAMA_KEEP_ALIVE", "10m").strip(),
+            ollama_temperature=_float_env("OLLAMA_TEMPERATURE", 0.1, 0.0),
+            ollama_max_retries=_int_env("OLLAMA_MAX_RETRIES", 2),
+            ollama_prompt_version=os.getenv("OLLAMA_PROMPT_VERSION", "ollama-clinical-v1").strip(),
+            ollama_prompt_max_chars=_int_env("OLLAMA_PROMPT_MAX_CHARS", 30_000),
+            ollama_comment_total_max_chars=_int_env("OLLAMA_COMMENT_TOTAL_MAX_CHARS", 15_000),
+            save_raw_ollama_response=_bool_env("SAVE_RAW_OLLAMA_RESPONSE", False),
+            # Frame extraction
+            frame_extraction_enabled=_bool_env("FRAME_EXTRACTION_ENABLED", True),
+            frame_extraction_interval_seconds=_int_env("FRAME_EXTRACTION_INTERVAL_SECONDS", 2),
+            frame_extraction_max_frames=_int_env("FRAME_EXTRACTION_MAX_FRAMES", 12),
+            frame_extraction_width=_int_env("FRAME_EXTRACTION_WIDTH", 1024),
+            frame_jpeg_quality=_int_env("FRAME_JPEG_QUALITY", 85),
+            frame_similarity_threshold=_float_env("FRAME_SIMILARITY_THRESHOLD", 5.0, 0.0),
         )
 
     def ensure_runtime_directories(self) -> None:

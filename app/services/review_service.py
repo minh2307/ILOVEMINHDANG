@@ -91,21 +91,27 @@ class ReviewService:
             self.repository.transition(
                 job_id,
                 WorkflowStatus.RETRY_PENDING,
-                details={"review_decision": "clinical_factors_edited", "retry_step": "cdha"},
+                details={"review_decision": "clinical_factors_edited"},
+                data_patch={"retry_step": "cdha"},
             )
             return ReviewDecision("retry_cdha")
         if choice == "4":
             self.repository.transition(
                 job_id,
                 WorkflowStatus.RETRY_PENDING,
-                details={"review_decision": "retry_gemini", "retry_step": "gemini"},
+                details={"review_decision": "retry_ollama"},
+                data_patch={
+                    "retry_step": "ai_analysis",
+                    "clinical_factors_path": None
+                },
             )
-            return ReviewDecision("retry_gemini")
+            return ReviewDecision("retry_ollama")
         if choice == "5":
             self.repository.transition(
                 job_id,
                 WorkflowStatus.RETRY_PENDING,
-                details={"review_decision": "retry_cdha", "retry_step": "cdha"},
+                details={"review_decision": "retry_cdha"},
+                data_patch={"retry_step": "cdha"},
             )
             return ReviewDecision("retry_cdha")
         if choice == "6":
@@ -154,8 +160,8 @@ class ReviewService:
         print(f"Comments used (masked, showing {len(comments)}):")
         for comment in comments:
             print(f"  - {comment}")
-        print(f"Gemini input risk: {data.get('gemini_input_risk_level') or 'LOW'}")
-        print(f"Injection signals: {data.get('gemini_input_suspicious_patterns') or []}")
+        print(f"Ollama input risk: {data.get('ai_input_risk_level') or data.get('gemini_input_risk_level') or 'LOW'}")
+        print(f"Injection signals: {data.get('ai_input_suspicious_patterns') or data.get('gemini_input_suspicious_patterns') or []}")
         print(f"Clinical Factors path: {data.get('clinical_factors_path') or ''}")
         print("Clinical Factors (masked):")
         print(factors or "Không được cung cấp")
@@ -166,6 +172,11 @@ class ReviewService:
         print(f"Key Findings: {result.get('key_findings') or []}")
         print(f"Impression: {result.get('impression') or ''}")
         print(f"Warnings: {result.get('warnings') or data.get('cdha_warnings') or []}")
+        print("--- Ollama Diagnosis ---")
+        print(f"AI Findings: {data.get('ai_findings') or []}")
+        print(f"AI Impression: {data.get('ai_impression') or []}")
+        print(f"AI Differential Diagnosis: {data.get('ai_differential_diagnosis') or []}")
+        print("------------------------")
         print(f"Screenshots: {data.get('screenshot_paths') or []}")
         print(f"Final post text: {data.get('facebook_post_text') or '(generated after this review)'}")
         print(f"Content fingerprint: {data.get('facebook_content_hash') or '(computed before Facebook preparation)'}")
@@ -175,7 +186,7 @@ class ReviewService:
         print("\n[1] Approve for later Facebook publishing")
         print("[2] Reject")
         print("[3] Edit Clinical Factors")
-        print("[4] Retry Gemini")
+        print("[4] Retry Ollama")
         print("[5] Retry CDHA")
         print("[6] Open screenshot folder")
         print("[7] Stop and resume later")

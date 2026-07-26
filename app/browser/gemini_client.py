@@ -238,7 +238,7 @@ class GeminiWebClient:
             return False
         if await self.resolver.exists(page, "gemini.security_markers", timeout_ms=800):
             return False
-        return await self.resolver.exists(page, "gemini.authenticated_marker", timeout_ms=1_500)
+        return await self.resolver.exists(page, "gemini.authenticated_marker", timeout_ms=10_000)
 
     async def _wait_for_newest_final_response(
         self, page: Any, *, previous_response: str = ""

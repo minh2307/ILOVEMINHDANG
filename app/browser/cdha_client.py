@@ -201,6 +201,25 @@ class CDHAWebClient:
                 warnings=extracted.warnings,
             )
             self._write_json_atomic(json_path, extracted.to_dict())
+            
+            # --- Auto-share logic ---
+            try:
+                share_btn = await self.resolver.find_first(
+                    page, "cdha.share_button", timeout_ms=3_000
+                )
+                await share_btn.click()
+                
+                consult_btn = await self.resolver.find_first(
+                    page, "cdha.consultation", timeout_ms=3_000
+                )
+                await consult_btn.click()
+                
+                # Give it a moment to process the share request
+                await page.wait_for_timeout(1000)
+                self.logger.info("Successfully clicked Share -> Consultation")
+            except Exception as e:
+                self.logger.warning(f"Could not click Share -> Consultation: {e}")
+            
             self.repository.transition(
                 job_id,
                 WorkflowStatus.CDHA_ANALYZED,
@@ -362,14 +381,19 @@ class CDHAWebClient:
             )
         return tuple(selectors)
 
-    async def _resolve_upload_frame(self, page: Any, *, timeout_ms: int = 2_000) -> Any:
+    async def _resolve_upload_frame(
+        self, page: Any, *, timeout_ms: int = 2_000, visible: bool = True
+    ) -> Any:
         failures: list[str] = []
         selectors = self._css_candidates("cdha.upload_frame")
         per_selector_timeout = max(250, timeout_ms // len(selectors))
         for selector in selectors:
             try:
                 locator = page.locator(selector).first
-                await locator.wait_for(state="attached", timeout=per_selector_timeout)
+                await locator.wait_for(
+                    state="visible" if visible else "attached",
+                    timeout=per_selector_timeout,
+                )
                 return page.frame_locator(selector)
             except Exception as exc:
                 mapped = map_playwright_error(
@@ -394,7 +418,9 @@ class CDHAWebClient:
     async def _resolve_upload_file_input(
         self, page: Any, *, timeout_ms: int = 2_000
     ) -> Any:
-        frame = await self._resolve_upload_frame(page, timeout_ms=timeout_ms)
+        frame = await self._resolve_upload_frame(
+            page, timeout_ms=timeout_ms, visible=True
+        )
         try:
             return await self.resolver.find_first(
                 frame,
@@ -473,20 +499,28 @@ class CDHAWebClient:
             result_text = await self._optional_text(page, "cdha.result_container")
             if result_text:
                 return "complete"
-        if await self.resolver.exists(page, "cdha.upload_complete", timeout_ms=400):
+        try:
+            frame = await self._resolve_upload_frame(page, timeout_ms=1000, visible=False)
+        except Exception:
+            frame = page
+        if await self.resolver.exists(frame, "cdha.upload_complete", timeout_ms=400):
             return "complete"
-        if await self.resolver.exists(page, "cdha.upload_started", timeout_ms=400):
+        if await self.resolver.exists(frame, "cdha.upload_started", timeout_ms=400):
             return "in_progress"
-        filename = await self._optional_text(page, "cdha.upload_filename")
+        filename = await self._optional_text(frame, "cdha.upload_filename")
         if filename and video.name.casefold() in filename.casefold():
             return "uncertain"
         return "not_started"
 
     async def _wait_for_upload_acknowledgement(self, page: Any) -> None:
         deadline = time.monotonic() + self.settings.page_timeout_seconds
+        try:
+            frame = await self._resolve_upload_frame(page, timeout_ms=1000, visible=False)
+        except Exception:
+            frame = page
         while time.monotonic() < deadline:
-            if await self.resolver.exists(page, "cdha.upload_error", timeout_ms=400):
-                message = await self._optional_text(page, "cdha.upload_error")
+            if await self.resolver.exists(frame, "cdha.upload_error", timeout_ms=400):
+                message = await self._optional_text(frame, "cdha.upload_error")
                 raise CDHAUploadError(
                     f"CDHA upload failed: {message or 'file rejected'}",
                     phase="CDHA_UPLOADING",
@@ -495,9 +529,9 @@ class CDHAWebClient:
                 )
             if await self._view_url_value(page):
                 return
-            if await self.resolver.exists(page, "cdha.upload_started", timeout_ms=400):
+            if await self.resolver.exists(frame, "cdha.upload_started", timeout_ms=400):
                 return
-            if await self.resolver.exists(page, "cdha.upload_complete", timeout_ms=400):
+            if await self.resolver.exists(frame, "cdha.upload_complete", timeout_ms=400):
                 return
             await asyncio.sleep(min(0.5, self.settings.cdha_poll_interval_seconds))
         raise CDHAUploadError(
@@ -524,14 +558,15 @@ class CDHAWebClient:
                 details={"upload_state": state},
             )
         await file_input.set_input_files(str(video))
-        await self._wait_for_upload_acknowledgement(page)
+        # We no longer wait for upload acknowledgement here because CDHA uses a 2-step process
+        # where the file is processed locally first, then uploaded when we click btnComplete.
 
     async def _complete_upload(self, page: Any) -> None:
         if await self._view_url_value(page):
             return
         frame = await self._resolve_upload_frame(page, timeout_ms=5_000)
         button = await self.resolver.find_first(
-            frame, "cdha.upload_complete_button", timeout_ms=10_000
+            frame, "cdha.upload_complete_button", timeout_ms=90_000
         )
         if hasattr(button, "is_enabled") and not await button.is_enabled():
             raise CDHAUploadError(
@@ -554,21 +589,25 @@ class CDHAWebClient:
     async def _wait_for_upload(self, page: Any) -> None:
         deadline = time.monotonic() + self.settings.upload_timeout_seconds
         upload_started = False
+        try:
+            frame = await self._resolve_upload_frame(page, timeout_ms=1000, visible=False)
+        except Exception:
+            frame = page
         while time.monotonic() < deadline:
             if await self._view_url_value(page):
                 self.logger.info("CDHA upload completed; view URL is available")
                 return
-            if await self.resolver.exists(page, "cdha.upload_error", timeout_ms=500):
-                message = await self._optional_text(page, "cdha.upload_error")
+            if await self.resolver.exists(frame, "cdha.upload_error", timeout_ms=500):
+                message = await self._optional_text(frame, "cdha.upload_error")
                 raise CDHAUploadError(
                     f"CDHA upload failed: {message or 'file rejected'}",
                     retryable=False,
                     phase="CDHA_UPLOADING",
                     operation="wait_for_upload_completion",
                 )
-            if await self.resolver.exists(page, "cdha.upload_started", timeout_ms=500):
+            if await self.resolver.exists(frame, "cdha.upload_started", timeout_ms=500):
                 upload_started = True
-            if await self.resolver.exists(page, "cdha.upload_complete", timeout_ms=500):
+            if await self.resolver.exists(frame, "cdha.upload_complete", timeout_ms=500):
                 return
             await asyncio.sleep(min(1.0, self.settings.cdha_poll_interval_seconds))
         suffix = " after starting" if upload_started else " (upload start was not detected)"
