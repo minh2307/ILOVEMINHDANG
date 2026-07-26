@@ -1,0 +1,27 @@
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local Data and Logs
+downloads/
+*.log
+downloader.log
+download_log.json
+done_files.txt
+metadata.json
+
+# Credentials and Config
+.env
+cookies.txt
+
+# Chrome debug profiles
+chrome_debug_profile/
+
+promt.md
