@@ -1,0 +1,330 @@
+gemini:
+  login_markers:
+    - css: 'a[href*="accounts.google.com"]'
+    - role: button
+      name: Sign in
+    - role: button
+      name: Đăng nhập
+  security_markers:
+    - text: Verify it’s you
+    - text: Xác minh danh tính
+    - text: Two-Step Verification
+    - text: Xác minh 2 bước
+    - text: CAPTCHA
+  authenticated_marker:
+    - css: '[contenteditable="true"][role="textbox"]'
+    - css: 'textarea'
+  new_chat:
+    - role: button
+      name: New chat
+    - role: button
+      name: Cuộc trò chuyện mới
+    - css: 'a[aria-label*="New chat"]'
+  prompt_input:
+    - role: textbox
+      name: Enter a prompt here
+    - role: textbox
+      name: Nhập câu lệnh tại đây
+    - css: 'textarea'
+    - css: '[contenteditable="true"][role="textbox"]'
+    - css: 'div[contenteditable="true"]'
+  send_button:
+    - role: button
+      name: Send message
+      exact: true
+    - role: button
+      name: Gửi tin nhắn
+      exact: true
+    - css: 'button[aria-label*="Send"]'
+    - css: 'button[aria-label*="Gửi"]'
+  response:
+    - css: '[data-message-author-role="model"]'
+    - css: 'message-content'
+    - css: '.model-response-text'
+  stop_button:
+    - role: button
+      name: Stop response
+    - role: button
+      name: Dừng phản hồi
+  error_message:
+    - text: Something went wrong
+    - text: Đã xảy ra lỗi
+
+cdha:
+  upload_zone:
+    - css: "#uploadZone"
+  upload_frame:
+    - css: "iframe#iframeContent"
+  upload_file_input:
+    - css: "input[type=\"file\"][accept*=\"video\"]"
+    - css: "input[type=\"file\"]"
+  upload_complete_button:
+    - css: "#btnComplete"
+  view_url_input:
+    - css: "#urlInput"
+  upload_filename:
+    - css: "[data-upload-filename]"
+    - css: ".upload-file-name"
+  login_markers:
+    - css: 'input[type="password"]'
+    - role: button
+      name: Đăng nhập
+    - role: button
+      name: Login
+  security_markers:
+    - text: Two-factor authentication
+    - text: Xác thực hai yếu tố
+    - text: CAPTCHA
+    - text: Security checkpoint
+  authenticated_marker:
+    - css: 'input[type="file"]'
+    - text: Bắt đầu phân tích
+  modality_marker:
+    - text: Ultrasound Video
+    - text: Siêu âm video
+  video_input:
+    - css: 'input[type="file"][accept*="video"]'
+    - css: 'input[type="file"]'
+  upload_started:
+    - text: Đang tải lên
+    - text: Uploading
+    - css: '[role="progressbar"]'
+  upload_complete:
+    - text: Tải lên hoàn tất
+    - text: Upload complete
+    - css: '[data-upload-status="complete"]'
+  upload_error:
+    - text: Tải lên thất bại
+    - text: Upload failed
+    - text: Unsupported file
+  clinical_factors:
+    - label: Clinical Factors
+    - label: Ghi chú lâm sàng
+    - role: textbox
+      name: Clinical Factors
+    - role: textbox
+      name: Ghi chú lâm sàng
+    - css: 'textarea[placeholder*="Clinical"]'
+    - css: 'textarea[placeholder*="lâm sàng"]'
+  analyze_button:
+    - css: '#btn'
+    - role: button
+      name: Bắt đầu phân tích
+      exact: false
+    - role: button
+      name: Start Analysis
+      exact: false
+  analysis_started:
+    - text: Đang phân tích
+    - text: Analyzing
+    - css: '[data-analysis-status="running"]'
+    - css: '#queueStatus'
+  analysis_complete:
+    - text: Kết quả phân tích
+    - text: Analysis Result
+    - css: '[data-analysis-status="complete"]'
+    - css: '#divResult'
+  error_message:
+    - css: '[role="alert"]'
+    - text: Phân tích thất bại
+    - text: Analysis failed
+  result_container:
+    - css: '[data-testid="analysis-result"]'
+    - css: '#analysis-result'
+    - text: Kết quả phân tích
+    - css: '#divResult'
+  triage_key_findings:
+    - css: '[data-testid="triage-key-findings"]'
+    - text: Phân loại
+  triage:
+    - css: '[data-testid="triage"]'
+    - text: Phân loại
+  confidence:
+    - css: '[data-testid="confidence"]'
+    - text: Độ tin cậy
+  key_findings:
+    - css: '[data-testid="key-findings"]'
+    - text: "Key findings:"
+    - text: Key findings
+    - text: Phát hiện chính
+  impression:
+    - css: '[data-testid="impression"]'
+    - text: "Impression:"
+    - text: Impression
+    - text: Nhận định
+  detailed_analysis:
+    - css: '[data-testid="detailed-analysis"]'
+    - text: Phân tích chi tiết
+    - text: Chi tiết phân tích
+    - text: Chi tiết phân tích.
+  annotated_frames:
+    - css: '[data-testid="annotated-frames"]'
+    - text: Khung hình chú thích
+  marked_regions:
+    - css: '[data-testid="marked-regions"]'
+    - text: Vùng được đánh dấu
+    - text: Vùng đánh dấu
+  final_result:
+    - css: '[data-testid="final-result"]'
+    - css: '[data-testid="analysis-result"]'
+    - text: Kết quả
+  clinical_notes:
+    - text: Ghi chú lâm sàng
+    - text: Ghi chú
+  share_button:
+    - text: Chia sẻ
+    - text: Share
+    - role: button
+      name: Chia sẻ
+      exact: false
+    - role: button
+      name: Share
+      exact: false
+  consultation:
+    - text: Hội chẩn
+    - text: Consultation
+  consultation_result:
+    - css: '[data-testid="consultation-result"]'
+    - text: Hội chẩn
+  private_ui:
+    - css: '[data-testid="account-menu"]'
+    - css: '[data-testid="balance"]'
+    - css: 'nav'
+
+facebook:
+  login_indicators:
+    - css: 'input[name="email"]'
+    - css: 'input[name="pass"]'
+    - role: button
+      name: Log in
+    - role: button
+      name: Đăng nhập
+  checkpoint_indicators:
+    - text: Security Check
+    - text: Kiểm tra bảo mật
+    - text: Two-factor authentication
+    - text: Xác thực hai yếu tố
+    - text: CAPTCHA
+    - css: 'form[action*="checkpoint"]'
+  authenticated_marker:
+    - css: '[aria-label="Facebook"]'
+    - css: '[role="navigation"]'
+    - css: 'a[href*="/me/"]'
+  target_access_denied:
+    - text: This content isn't available
+    - text: Nội dung này hiện không hiển thị
+    - text: You don't have permission
+    - text: Bạn không có quyền
+    - text: Page not found
+  create_post_entry:
+    - role: button
+      name: Tạo bài viết
+    - role: button
+      name: Create post
+    - text: Bạn đang nghĩ gì?
+    - text: Bạn đang nghĩ gì
+    - text: What's on your mind
+    - css: "span:has-text(\"Bạn đang nghĩ gì\")"
+    - css: "span:has-text(\"What's on your mind\")"
+    - css: '[data-pagelet^="GroupInlineComposer"] [role="button"]'
+  composer_dialog:
+    - role: dialog
+    - css: 'div[role="dialog"]'
+  composer_textbox:
+    - role: textbox
+      name: Bạn đang nghĩ gì?
+    - role: textbox
+      name: What's on your mind?
+    - css: 'div[role="dialog"] div[role="textbox"][contenteditable="true"]'
+  media_button:
+    - role: button
+      name: Ảnh/video
+    - role: button
+      name: Photo/video
+    - css: 'div[role="dialog"] [aria-label*="ảnh/video" i]'
+    - css: 'div[role="dialog"] [aria-label*="photo/video" i]'
+  file_input:
+    - css: 'div[role="dialog"] input[type="file"][accept*="image"]'
+    - css: 'div[role="dialog"] input[type="file"]'
+  uploaded_preview:
+    - css: 'div[role="dialog"] img[src^="blob:"]'
+    - css: 'div[role="dialog"] [data-visualcompletion="media-vc-image"] img'
+    - css: 'div[role="dialog"] img[alt]'
+  upload_progress:
+    - css: 'div[role="dialog"] [role="progressbar"]'
+    - text: Uploading
+    - text: Đang tải lên
+  upload_error:
+    - css: 'div[role="dialog"] [role="alert"]'
+    - text: Couldn't upload
+    - text: Không thể tải lên
+  publish_button:
+    - role: button
+      name: Đăng
+      exact: true
+    - role: button
+      name: Post
+      exact: true
+    - role: button
+      name: Tiếp
+      exact: true
+    - role: button
+      name: Next
+      exact: true
+    - css: 'div[role="dialog"] div[role="button"]:has-text("Đăng")'
+    - css: 'div[role="dialog"] div[role="button"]:has-text("Post")'
+    - css: 'div[role="dialog"] div[role="button"]:has-text("Tiếp")'
+    - css: 'div[role="dialog"] div[role="button"]:has-text("Next")'
+    - css: 'div[role="dialog"] [data-testid="react-composer-post-button"]'
+    - css: 'div[role="dialog"] [data-testid="comet-post-button"]'
+  post_button:
+    - role: button
+      name: Đăng
+      exact: true
+    - role: button
+      name: Post
+      exact: true
+  publish_success:
+    - text: Bài viết của bạn đã được đăng
+    - text: Your post has been published
+    - text: Xem bài viết
+      exact: true
+    - text: View post
+      exact: true
+  feed_post:
+    - role: article
+    - css: 'div[role="article"]'
+  post_text:
+    - css: '[data-ad-preview="message"]'
+    - css: 'div[dir="auto"]'
+  post_timestamp_link:
+    - css: 'a[href*="/posts/"]'
+    - css: 'a[href*="/permalink/"]'
+    - css: 'a[href*="story_fbid="]'
+    - css: 'a[href*="/groups/"][href*="/posts/"]'
+    - css: 'a[href*="photo.php?fbid="]'
+    - css: 'a[href*="/reel/"]'
+  post_image:
+    - css: 'img[src]'
+  comment_input:
+    - role: textbox
+      name: Viết bình luận
+    - role: textbox
+      name: Write a comment
+    - css: 'div[role="textbox"][contenteditable="true"][aria-label*="bình luận" i]'
+    - css: 'div[role="textbox"][contenteditable="true"][aria-label*="comment" i]'
+  comment_submit:
+    - role: button
+      name: Đăng bình luận
+    - role: button
+      name: Bình luận
+      exact: true
+    - role: button
+      name: Comment
+      exact: true
+  visible_comment:
+    - css: 'div[role="article"]'
+    - css: '[aria-label*="Comment by" i]'
+  error_banner:
+    - text: Something went wrong
+    - text: Đã xảy ra lỗi

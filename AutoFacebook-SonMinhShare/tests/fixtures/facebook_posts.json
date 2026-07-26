@@ -1,0 +1,102 @@
+[
+  {
+    "id": "1001",
+    "message": "🤖 Hôm nay chúng tôi ra mắt robot Robo-Learn phiên bản 2.0!\n\nRobot có khả năng nhận diện hình ảnh và học từ môi trường xung quanh.\nĐây là bước đột phá lớn trong lĩnh vực robotics giáo dục.\n\nXem thêm tại: https://robolearnai.com/launch",
+    "created_time": "2024-03-15T08:00:00+0000",
+    "permalink_url": "https://www.facebook.com/robolearnai/posts/1001",
+    "attachments": {
+      "data": [
+        {"type": "photo", "media": {"image": {"src": "https://example.com/img1.jpg"}}}
+      ]
+    },
+    "status_type": "added_photos",
+    "full_picture": "https://example.com/img1.jpg",
+    "has_video": false,
+    "crawl_method": "GRAPH_API",
+    "crawled_at": "2024-03-20T10:00:00Z",
+    "crawl_status": "SUCCESS",
+    "error_message": ""
+  },
+  {
+    "id": "1002",
+    "message": "Workshop Robotics cho trẻ em cuối tuần này!\n\nĐịa điểm: TP.HCM\nThời gian: Thứ 7, 9h-12h\nHọc phí: Miễn phí cho 20 suất đầu tiên.\n\n#robotics #trẻem #STEM",
+    "created_time": "2024-04-01T07:30:00+0000",
+    "permalink_url": "https://www.facebook.com/robolearnai/posts/1002",
+    "attachments": null,
+    "status_type": "mobile_status_update",
+    "full_picture": "",
+    "has_video": false,
+    "crawl_method": "GRAPH_API",
+    "crawled_at": "2024-04-05T10:00:00Z",
+    "crawl_status": "SUCCESS",
+    "error_message": ""
+  },
+  {
+    "id": "1003",
+    "message": "",
+    "created_time": "2024-04-10T09:00:00+0000",
+    "permalink_url": "https://www.facebook.com/robolearnai/videos/1003",
+    "attachments": {
+      "data": [
+        {"type": "video_inline", "url": "https://www.facebook.com/robolearnai/videos/1003"}
+      ]
+    },
+    "status_type": "added_video",
+    "full_picture": "",
+    "has_video": true,
+    "crawl_method": "GRAPH_API",
+    "crawled_at": "2024-04-12T10:00:00Z",
+    "crawl_status": "SUCCESS",
+    "error_message": ""
+  },
+  {
+    "id": "1004",
+    "message": "Chia sẻ bài viết thú vị về AI trong giáo dục",
+    "created_time": "2024-04-20T06:00:00+0000",
+    "permalink_url": "https://www.facebook.com/robolearnai/posts/1004",
+    "attachments": {
+      "data": [
+        {"type": "share", "url": "https://vnexpress.net/ai-giao-duc-2024.html", "unshimmed_url": "https://vnexpress.net/ai-giao-duc-2024.html"}
+      ]
+    },
+    "status_type": "shared_story",
+    "full_picture": "",
+    "has_video": false,
+    "crawl_method": "GRAPH_API",
+    "crawled_at": "2024-04-22T10:00:00Z",
+    "crawl_status": "SUCCESS",
+    "error_message": ""
+  },
+  {
+    "id": "1005",
+    "message": "",
+    "created_time": "",
+    "permalink_url": "",
+    "attachments": null,
+    "status_type": "",
+    "full_picture": "",
+    "has_video": false,
+    "crawl_method": "GRAPH_API",
+    "crawled_at": "2024-04-22T10:00:00Z",
+    "crawl_status": "PARTIAL",
+    "error_message": "PARSING_ERROR: empty post"
+  },
+  {
+    "id": "1006",
+    "message": "Khai giảng khóa học Lập trình Robot cho học sinh THPT\n\nKhóa học kéo dài 8 tuần, mỗi tuần 2 buổi.\nHọc viên sẽ được thực hành với robot Robo-Learn thực tế.\nĐăng ký ngay hôm nay để nhận ưu đãi sớm!",
+    "created_time": "2024-05-01T08:00:00+0000",
+    "permalink_url": "https://www.facebook.com/robolearnai/posts/1006",
+    "attachments": {
+      "data": [
+        {"type": "photo", "media": {"image": {"src": "https://example.com/img6.jpg"}}}
+      ]
+    },
+    "status_type": "added_photos",
+    "full_picture": "https://example.com/img6.jpg",
+    "has_video": false,
+    "crawl_method": "BROWSER",
+    "crawled_at": "2024-05-05T10:00:00Z",
+    "crawl_status": "SUCCESS",
+    "error_message": ""
+  }
+]

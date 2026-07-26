@@ -1,0 +1,8 @@
+playwright>=1.50,<2
+PyYAML>=6.0,<7
+python-dotenv>=1.0,<2
+pytest>=8.0,<10
+pytest-asyncio>=0.24,<2
+rich>=13.0,<16
+yt-dlp>=2025.1
+Pillow>=10.0,<13

@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Secrets
+.env
+.env.*
+!.env.example
+*cookies*.txt
+*Cookies*.txt
+*cookies*.json
+*Cookies*.json
+
+# Runtime and clinical/user data
+runtime/chrome_profiles/
+data/
+logs/
+screenshots/
+downloads/
+*.sqlite3
+*.sqlite3-*
+*.db
+*.mp4
+*.mov
+*.avi
+*.webm
+
+# Browser profiles wherever legacy projects keep them
+chrome_profile/
+chrome_debug_profile/
+**/chrome_profile/
+**/chrome_debug_profile/
+
+# Local output and editor files
+output/
+*.log
+.DS_Store
+*.swp
+*.swo
+.~lock.*

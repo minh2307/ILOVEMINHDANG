@@ -1,0 +1,72 @@
+[
+{
+    "domain": ".cdha.ai",
+    "expirationDate": 1819553504.294291,
+    "hostOnly": false,
+    "httpOnly": false,
+    "name": "_ga",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": false,
+    "session": false,
+    "storeId": "0",
+    "value": "GA1.1.132629129.1778915191",
+    "id": 1
+},
+{
+    "domain": ".cdha.ai",
+    "expirationDate": 1819553504.293466,
+    "hostOnly": false,
+    "httpOnly": false,
+    "name": "_ga_VFJR3F0RCE",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": false,
+    "session": false,
+    "storeId": "0",
+    "value": "GS2.1.s1784993504$o59$g0$t1784993504$j60$l0$h0",
+    "id": 2
+},
+{
+    "domain": "cdha.ai",
+    "expirationDate": 1785597340.910089,
+    "hostOnly": true,
+    "httpOnly": true,
+    "name": "CDHASESSID",
+    "path": "/",
+    "sameSite": "lax",
+    "secure": true,
+    "session": false,
+    "storeId": "0",
+    "value": "1ac2bb1c17954243cf0f3850331faac4",
+    "id": 3
+},
+{
+    "domain": "cdha.ai",
+    "expirationDate": 1787124025.314046,
+    "hostOnly": true,
+    "httpOnly": false,
+    "name": "dash_modality",
+    "path": "/",
+    "sameSite": "lax",
+    "secure": false,
+    "session": false,
+    "storeId": "0",
+    "value": "us_video",
+    "id": 4
+},
+{
+    "domain": "cdha.ai",
+    "expirationDate": 1787540011.270463,
+    "hostOnly": true,
+    "httpOnly": false,
+    "name": "membership_ref_code",
+    "path": "/",
+    "sameSite": "lax",
+    "secure": true,
+    "session": false,
+    "storeId": "0",
+    "value": "CD2ED52966",
+    "id": 5
+}
+]
