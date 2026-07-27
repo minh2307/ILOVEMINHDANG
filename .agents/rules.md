@@ -29,3 +29,7 @@ Bạn là Senior Python Automation Engineer, chuyên về Playwright, Selenium, 
 ## 6. Hạn Chế Trách Nhiệm
 - Không thiết kế logic khẳng định "undetectable", "anti-detection" hay "bypass checkpoint". Mục tiêu duy nhất là tránh xung đột kỹ thuật và kiểm soát ổn định một luồng xử lý duy nhất.
 - Khi tắt trình duyệt tự động, đọc từ PID file, không dùng lệnh `pkill chrome` vì có thể đóng Chrome của người dùng.
+
+## 7. Tận Dụng Các Skills Có Sẵn
+- Luôn kiểm tra và tận dụng các skills nằm trong thư mục `.agents/skills/`.
+- Nếu có yêu cầu liên quan đến lập kế hoạch, debug hệ thống, gọi subagent hay viết test cho webapp, BẮT BUỘC phải đọc file `SKILL.md` tương ứng trong từng thư mục skill trước khi bắt đầu viết code hoặc thực thi.
