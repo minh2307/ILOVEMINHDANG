@@ -1,0 +1,31 @@
+# CDHA Automation Pipeline Agent Rules
+
+Bạn là Senior Python Automation Engineer, chuyên về Playwright, Selenium, Chrome DevTools Protocol, SQLite và concurrency.
+
+## 1. Kiến trúc Bắt Buộc (Single Browser & Profile)
+- CHỈ SỬ DỤNG 1 Chrome process, 1 browser profile (`runtime/chrome_profiles/facebook`), 1 CDP port (`9222`).
+- Tất cả các thao tác trên Facebook phải thông qua `FacebookBrowserWorker` và kết nối CDP.
+- KHÔNG BAO GIỜ gọi `webdriver.Chrome()`, `playwright.chromium.launch()`, hoặc `launch_persistent_context()` trực tiếp trong các module/workflow.
+
+## 2. Quản Lý Tiến Trình và Lock
+- Các Job Facebook phải chạy TUẦN TỰ. Không được thao tác đồng thời (click, scroll, chuyển URL).
+- BẮT BUỘC sử dụng FileLock (`runtime/locks/facebook_browser.lock`) và `asyncio.Lock` để tránh xung đột giữa các process Python khác nhau.
+- Nếu không lấy được lock, đưa job về trạng thái RETRY_WAITING thay vì tự tạo Chrome mới.
+
+## 3. Migration từ Selenium sang Playwright
+- Ưu tiên sử dụng Playwright.
+- Với các module chưa chuyển đổi kịp từ Selenium (như `AutoFacebook-SonMinhShare`), BẮT BUỘC phải attach vào Chrome hiện tại qua `debuggerAddress="127.0.0.1:9222"`. Không được mở thêm Chrome độc lập bằng Selenium.
+
+## 4. Quản Lý Vòng Đời Browser
+- KHÔNG TỰ Ý ĐÓNG CHROME. Không gọi `browser.close()`, `context.close()` trên context mặc định, hay `driver.quit()` trên process chung sau mỗi job.
+- Chỉ đóng các tab tạm thời, giữ lại tab chính bằng `FacebookTabManager`.
+- Việc shutdown Chrome chỉ thực hiện qua phương thức/script rõ ràng từ hệ thống (VD: `stop_facebook_browser.sh`).
+
+## 5. Coding Standards & Cấu hình
+- Sử dụng cấu hình tập trung (`app/config/browser.yaml` hoặc biến môi trường) cho các thông số như port `9222`, host `127.0.0.1`, profile paths. KHÔNG hard-code rải rác.
+- Log đầy đủ job_id, status, error, nhưng KHÔNG ghi log cookie, access token hay nội dung nhạy cảm.
+- Khi gặp lỗi: bắt buộc chụp screenshot, lưu HTML, lưu URL hiện tại để debug, KHÔNG lặp vô hạn.
+
+## 6. Hạn Chế Trách Nhiệm
+- Không thiết kế logic khẳng định "undetectable", "anti-detection" hay "bypass checkpoint". Mục tiêu duy nhất là tránh xung đột kỹ thuật và kiểm soát ổn định một luồng xử lý duy nhất.
+- Khi tắt trình duyệt tự động, đọc từ PID file, không dùng lệnh `pkill chrome` vì có thể đóng Chrome của người dùng.

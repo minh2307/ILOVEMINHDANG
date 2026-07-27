@@ -602,75 +602,115 @@ class FacebookWebClient:
         self, page: Any, approved_text: str, started: datetime,
         expected_images: int, before_ids: set[str]
     ) -> dict[str, Any] | None:
-        # Scroll to load recent posts on Pages
-        for _ in range(3):
-            await page.keyboard.press("PageDown")
-            await page.wait_for_timeout(1000)
-            
-        # Click "Xem thêm" / "See more" to expand truncated text
+        # Scroll slightly to trigger feed loading, but not too much to skip the first post
+        await page.mouse.wheel(0, 500)
+        await page.wait_for_timeout(1500)
+
+        # 1. Expand all "Xem thêm" / "See more" buttons currently visible on the page
         try:
             see_mores = await page.locator('div[role="button"]:has-text("Xem thêm"), div[role="button"]:has-text("See more")').all()
             for btn in see_mores:
-                await btn.click(timeout=1000)
+                try:
+                    if await btn.is_visible():
+                        await btn.click(timeout=1000)
+                        await page.wait_for_timeout(500)
+                except Exception:
+                    continue
         except Exception:
             pass
-            
-        articles = await self._all_locators(page, "facebook.feed_post")
+
         normalized_approved = self._normalize_text(approved_text)
         best: tuple[int, dict[str, Any]] | None = None
-        for article in articles:
+        
+        # 2. Find all post links directly
+        link_locators = await page.locator('a[href*="/posts/"], a[href*="/permalink/"], a[href*="/reel/"], a[href*="story_fbid="], a[href*="/videos/"]').all()
+        seen_urls = set()
+        
+        for loc in link_locators:
             try:
-                body = self._normalize_text(await article.inner_text())
+                href = await loc.get_attribute("href")
+                if not href or href == "/reel/?s=tab":
+                    continue
+                    
+                try:
+                    url = self.normalize_permalink(href, base_url=str(page.url))
+                except ValueError:
+                    continue
+                    
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                
+                post_id = self.extract_post_id(url) or ""
+                is_new = not post_id or post_id not in before_ids
+
+                # Read text around the link by going up the DOM tree 8 levels
+                body_raw = await loc.evaluate("""el => {
+                    let p = el.parentElement;
+                    let lastValid = p;
+                    for(let k=0; k<8; k++) {
+                        if(!p) break;
+                        lastValid = p;
+                        p = p.parentElement;
+                    }
+                    return lastValid ? lastValid.innerText : '';
+                }""")
+                
+                body = self._normalize_text(body_raw)
                 prefix_length = min(50, len(normalized_approved))
                 
-                # Match either the start of the text, or unique URLs within the text
-                # Note: body is normalized (punctuation removed, lowercase, space-separated)
                 text_match = (
                     normalized_approved[:prefix_length] in body
                     or "cdhaaidashview" in body 
                     or "facebookcomreel" in body
                     or "ca lâm sàng siêu âm" in body
                 )
-                links = await self._article_links(article)
-                for href in links:
-                    try:
-                        url = self.normalize_permalink(href, base_url=str(page.url))
-                    except ValueError:
-                        continue
-                    post_id = self.extract_post_id(url) or ""
-                    is_new = not post_id or post_id not in before_ids
-                    images = await article.locator("img[src]").count()
-                    recent = await self._article_is_recent(article, started)
-                    score = 4 * text_match + 2 * is_new + int(recent) + int(images == expected_images)
-                    candidate = {
-                        "url": url, "post_id": post_id, "text_match": text_match,
-                        "recent": recent, "image_count": images,
-                        "method": "content+new-id+timestamp+image-count",
-                    }
-                    if (text_match or (is_new and recent)) and (best is None or score > best[0]):
-                        best = (score, candidate)
+                
+                # Try to count images in this container (approximation)
+                images = 0
+                try:
+                    images = await loc.evaluate("""el => {
+                        let p = el.parentElement;
+                        let lastValid = p;
+                        for(let k=0; k<8; k++) { if(!p) break; lastValid = p; p = p.parentElement; }
+                        return lastValid ? lastValid.querySelectorAll('img[src]').length : 0;
+                    }""")
+                except Exception:
+                    pass
+                
+                # Check if it's recent (by looking for timestamp strings in the text like "Vừa xong", "1 phút")
+                # FB often shows timestamp right above the content
+                recent = False
+                if any(t in body for t in ["vừa xong", "1 phút", "2 phút", "3 phút", "4 phút", "5 phút", "just now", "1 min", "2 mins", "3 mins"]):
+                    recent = True
+                # If we cannot reliably find timestamp, we fall back to assuming it's recent if it's the first few posts
+                
+                score = 4 * text_match + 2 * is_new + int(recent) + int(images == expected_images)
+                candidate = {
+                    "url": url, "post_id": post_id, "text_match": text_match,
+                    "recent": recent, "image_count": images,
+                    "method": "content+new-id+timestamp+image-count (robust link scan)",
+                }
+                
+                if (text_match or (is_new and recent)) and (best is None or score > best[0]):
+                    best = (score, candidate)
+                    
+                # If strong match found, return immediately
+                if best and best[1].get("text_match"):
+                    return best[1]
+                    
             except Exception:
                 continue
                 
-        # FALLBACK: If we couldn't find a strong match, but we have articles,
-        # just return the first one (as requested by user to "take the first one")
-        if not best and articles:
-            try:
-                first_article = articles[0]
-                links = await self._article_links(first_article)
-                for href in links:
-                    try:
-                        url = self.normalize_permalink(href, base_url=str(page.url))
-                        post_id = self.extract_post_id(url) or ""
-                        return {
-                            "url": url, "post_id": post_id, "text_match": False,
-                            "recent": True, "image_count": 0,
-                            "method": "fallback-first-post",
-                        }
-                    except ValueError:
-                        continue
-            except Exception:
-                pass
+        # FALLBACK: If we couldn't find a strong match, but we have seen some links
+        if not best and seen_urls:
+            first_url = list(seen_urls)[0]
+            post_id = self.extract_post_id(first_url) or ""
+            return {
+                "url": first_url, "post_id": post_id, "text_match": False,
+                "recent": True, "image_count": 0,
+                "method": "fallback-first-post (robust link scan)",
+            }
                 
         return best[1] if best else None
 

@@ -304,6 +304,12 @@ facebook:
   feed_post:
     - role: article
     - css: 'div[role="article"]'
+    # Facebook Page owner view — posts appear in a right-column list layout
+    - css: 'div[data-pagelet*="ProfileTimeline"] div[role="article"]'
+    - css: 'div[data-pagelet*="Page"] div[role="article"]'
+    - css: 'div[data-pagelet*="Timeline"] div[role="article"]'
+    # Fallback: any element containing a post timestamp link
+    - css: 'div:has(> a[href*="/posts/"]), div:has(> a[href*="/permalink/"]), div:has(> a[href*="/reel/"])'
   post_text:
     - css: '[data-ad-preview="message"]'
     - css: 'div[dir="auto"]'
