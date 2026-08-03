@@ -1,0 +1,1 @@
+"""Authoritative persisted enumerations."""

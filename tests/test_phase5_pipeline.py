@@ -317,7 +317,7 @@ def test_list_resumable_jobs_shows_actionable_states(tmp_path: Path) -> None:
     rows = repo.list_resumable_jobs()
     assert any(r["job_id"] == job.job_id for r in rows)
     entry = next(r for r in rows if r["job_id"] == job.job_id)
-    assert "review-job" in entry["recommended_command"]
+    assert "review --job-id" in entry["recommended_command"]
 
 
 def test_completed_jobs_excluded_from_resumable(tmp_path: Path) -> None:

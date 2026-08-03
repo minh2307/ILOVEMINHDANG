@@ -6,6 +6,10 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 from app.config.settings import Settings
+from app.domain.models.cdha_clinical_summary import (
+    CDHAClinicalSummary,
+    ClinicalSummaryValidationError,
+)
 from app.services.privacy_service import PrivacyService
 
 
@@ -51,19 +55,18 @@ class PostContentService:
         operator_text: str | None = None,
         cdha_view_url: str = "",
     ) -> str:
+        summary = self.validate_clinical_summary(
+            key_findings=key_findings,
+            impression=impression,
+            cdha_view_url=cdha_view_url,
+        )
         if operator_text is not None:
             text = operator_text.strip()
         else:
-            findings = [str(item).strip() for item in key_findings if str(item).strip()]
-            if not findings:
-                raise PostContentValidationError(
-                    "CDHA Key Findings are missing; manual post editing is required"
-                )
-            if not str(impression or "").strip():
-                raise PostContentValidationError(
-                    "CDHA Impression is missing; manual post editing is required"
-                )
+            findings = [self._normalize_measurement_display(item) for item in summary.key_findings]
+            display_impression = self._normalize_measurement_display(summary.impression)
             bullets = "\n".join(f"• {item}" for item in findings)
+            hashtags = " ".join(self.settings.facebook_post_hashtags)
             text = f"""📌 CA LÂM SÀNG SIÊU ÂM
 
 Video được phân tích bằng công cụ hỗ trợ chẩn đoán hình ảnh CDHA.AI.
@@ -72,21 +75,114 @@ Video được phân tích bằng công cụ hỗ trợ chẩn đoán hình ản
 {bullets}
 
 📝 Nhận định:
-{str(impression).strip()}
+{display_impression}
 
-⚠️ Nội dung được sử dụng cho mục đích tham khảo, chia sẻ và trao đổi
-chuyên môn. Kết quả không thay thế việc thăm khám hoặc chẩn đoán trực tiếp
-của bác sĩ có chuyên môn.
+⚠️ Nội dung được sử dụng cho mục đích tham khảo, chia sẻ và trao đổi chuyên môn.
+Kết quả không thay thế việc thăm khám hoặc chẩn đoán trực tiếp của bác sĩ có chuyên môn.
 
 Nguồn video:
 {source_url.strip()}
 
 Nguồn phân tích:
-{cdha_view_url}&ref=CD2ED52966
+{summary.analysis_url}
 
-#CDHA #SieuAm #ChanDoanHinhAnh #MedicalAI #HoiChan"""
-        self.validate_post_text(text, source_url=source_url, cdha_view_url=cdha_view_url)
+{hashtags}"""
+        self.validate_publish_ready(
+            text,
+            source_url=source_url,
+            cdha_view_url=summary.analysis_url,
+            key_findings=summary.key_findings,
+            impression=summary.impression,
+        )
         return text
+
+    def validate_publish_ready(
+        self,
+        text: str,
+        *,
+        source_url: str,
+        cdha_view_url: str,
+        key_findings: list[str],
+        impression: str | None,
+    ) -> CDHAClinicalSummary:
+        self.validate_post_text(text, source_url=source_url, cdha_view_url=cdha_view_url)
+        summary = self.validate_clinical_summary(
+            key_findings=key_findings,
+            impression=impression,
+            cdha_view_url=cdha_view_url,
+        )
+        parsed_source = urlsplit(str(source_url or "").strip())
+        if (
+            parsed_source.scheme != "https"
+            or (parsed_source.hostname or "").casefold()
+            not in {"facebook.com", "www.facebook.com", "m.facebook.com"}
+        ):
+            raise PostContentValidationError("An exact HTTPS Facebook source URL is required")
+        value = str(text or "").strip()
+        required_fragments = (
+            "📌 CA LÂM SÀNG SIÊU ÂM",
+            "🔍 Ghi nhận chính:",
+            "📝 Nhận định:",
+            "⚠️ Nội dung được sử dụng cho mục đích tham khảo, chia sẻ và trao đổi chuyên môn.",
+            "Kết quả không thay thế việc thăm khám hoặc chẩn đoán trực tiếp của bác sĩ có chuyên môn.",
+            "Nguồn video:",
+            "Nguồn phân tích:",
+            source_url.strip(),
+            summary.analysis_url,
+        )
+        missing = [fragment for fragment in required_fragments if not fragment or fragment not in value]
+        if missing:
+            raise PostContentValidationError(
+                "Facebook post is missing required clinical sections or exact source URLs"
+            )
+        findings_block = self._section(
+            value, "🔍 Ghi nhận chính:", "📝 Nhận định:"
+        )
+        impression_block = self._section(
+            value, "📝 Nhận định:", "⚠️ Nội dung"
+        )
+        if re.search(r"(?im)^\s*[•*-]?\s*(?:key\s*findings?|impression)\s*:?\s*$", findings_block):
+            raise PostContentValidationError("CDHA Key Findings contain a field label instead of content")
+        if re.search(r"(?im)^\s*(?:key\s*findings?|impression)\s*:?\s*$", impression_block):
+            raise PostContentValidationError("CDHA Impression contains a field label instead of content")
+        for finding in summary.key_findings:
+            if self._normalize_measurement_display(finding) not in findings_block:
+                raise PostContentValidationError(
+                    "Facebook findings do not match the validated CDHA result"
+                )
+        if self._normalize_measurement_display(summary.impression) not in impression_block:
+            raise PostContentValidationError(
+                "Facebook impression does not match the validated CDHA result"
+            )
+        return summary
+
+    def validate_clinical_summary(
+        self,
+        *,
+        key_findings: list[str],
+        impression: str | None,
+        cdha_view_url: str,
+    ) -> CDHAClinicalSummary:
+        try:
+            summary = CDHAClinicalSummary.from_values(
+                key_findings=key_findings,
+                impression=impression,
+                analysis_url=cdha_view_url,
+            )
+        except ClinicalSummaryValidationError as exc:
+            raise PostContentValidationError(str(exc)) from exc
+        clinical_text = "\n".join((*summary.key_findings, summary.impression))
+        if self.privacy.contains_obvious_identifier(clinical_text):
+            raise PostContentValidationError("CDHA clinical summary contains identifying information")
+        if re.search(r"(?i)\b(?:chắc chắn|khẳng định|100\s*%)\b", clinical_text):
+            raise PostContentValidationError("CDHA clinical summary contains an absolute claim")
+        if not re.search(
+            r"[ăâđêôơưáàảãạéèẻẽẹíìỉĩịóòỏõọúùủũụýỳỷỹỵ]",
+            clinical_text,
+            re.IGNORECASE,
+        ):
+            raise PostContentValidationError("CDHA clinical summary must be written in Vietnamese")
+        return summary
 
     def validate_post_text(self, text: str, *, source_url: str = "", cdha_view_url: str = "") -> None:
         value = str(text or "").strip()
@@ -101,6 +197,24 @@ Nguồn phân tích:
             raise PostContentValidationError("Facebook post content contains a local file path")
         if re.search(r"(?i)\b(?:password|authorization|bearer|access[_ -]?token)\s*[:=]", value):
             raise PostContentValidationError("Facebook post content contains credential-like data")
+
+    @staticmethod
+    def _section(value: str, start: str, end: str) -> str:
+        try:
+            return value.split(start, 1)[1].split(end, 1)[0].strip()
+        except IndexError as exc:
+            raise PostContentValidationError(
+                f"Facebook post section is missing: {start}"
+            ) from exc
+
+    @staticmethod
+    def _normalize_measurement_display(value: str) -> str:
+        return re.sub(
+            r"(?<=\d)\.(?=\d+\s*(?:mm|cm|m|ml|mL|l|%)(?:\b|\s|[.,;)]|$))",
+            ",",
+            str(value or "").strip(),
+            flags=re.IGNORECASE,
+        )
 
     def select_screenshots(
         self, job_id: str, selected_names: list[str] | None = None

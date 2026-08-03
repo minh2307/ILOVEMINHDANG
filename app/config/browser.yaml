@@ -1,0 +1,5 @@
+# Deprecated compatibility marker only.
+# Runtime code does not load values from this file.
+authoritative_source: app.config.settings.Settings
+configuration_command: python main.py config
+deprecated: true

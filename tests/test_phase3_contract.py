@@ -6,6 +6,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from app.browser.cdha_client import CDHAWebClient
 from app.browser.gemini_client import GeminiWebClient
 from app.browser.selector_resolver import SelectorResolver
@@ -60,6 +62,14 @@ def waiting_job(repository: JobRepository) -> str:
         WorkflowStatus.WAITING_FOR_REVIEW,
     ):
         repository.transition(job.job_id, status)
+    repository.update_data(job.job_id, {
+        "cdha_result": {
+            "key_findings": ["Ghi nhận tổn thương giảm âm."],
+            "impression": "Hình ảnh gợi ý tổn thương, cần đối chiếu lâm sàng.",
+            "analysis_url": "https://cdha.ai/dash?view=phase3-result",
+        },
+        "cdha_view_url": "https://cdha.ai/dash?view=phase3-result",
+    })
     return job.job_id
 
 
@@ -163,6 +173,26 @@ def test_review_approve_only_marks_job_for_later_phase(tmp_path: Path) -> None:
     assert decision.action == "approved"
     assert repository.get_job(job_id).status is WorkflowStatus.APPROVED
     assert all("FACEBOOK" not in event.to_status.value for event in repository.list_events(job_id))
+
+
+def test_review_cannot_approve_label_only_cdha_summary(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path)
+    repository = JobRepository(settings.database_path)
+    repository.initialize()
+    job_id = waiting_job(repository)
+    repository.update_data(job_id, {
+        "cdha_result": {
+            "key_findings": ["Key findings:"],
+            "impression": "Impression:",
+        }
+    })
+
+    with pytest.raises(ValueError, match="Key Findings"):
+        ReviewService(settings, repository).review(
+            job_id, choice_provider=lambda _: "1"
+        )
+
+    assert repository.get_job(job_id).status is WorkflowStatus.WAITING_FOR_REVIEW
 
 
 def test_review_edit_masks_and_queues_valid_cdha_retry(tmp_path: Path) -> None:

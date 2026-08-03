@@ -163,7 +163,41 @@ class OllamaOutputParser:
         if isinstance(cf_raw, dict):
             cf_text = self._dict_to_cf_text(cf_raw)
         elif isinstance(cf_raw, str):
-            cf_text = cf_raw.strip()
+            # Clean up string if the model output plain text with placeholders
+            cleaned_lines = []
+            raw_lines = cf_raw.strip().splitlines()
+            for line in raw_lines:
+                clean_line = line.strip()
+                if not clean_line:
+                    cleaned_lines.append(line)
+                    continue
+                if clean_line.startswith("<") and clean_line.endswith(">"):
+                    continue
+                lowered = clean_line.casefold()
+                if lowered in ("không được cung cấp", "null", "none", "không rõ", "không có", "n/a", "không"):
+                    continue
+                cleaned_lines.append(line)
+
+            # Remove empty headers (lines ending with ':' and followed by empty/EOF)
+            final_lines = []
+            for i, line in enumerate(cleaned_lines):
+                if line.strip().endswith(":"):
+                    # Check if there is a non-empty line after this header before the next header
+                    has_content = False
+                    for j in range(i + 1, len(cleaned_lines)):
+                        next_clean = cleaned_lines[j].strip()
+                        if not next_clean:
+                            continue
+                        if next_clean.endswith(":"):
+                            break
+                        has_content = True
+                        break
+                    if not has_content:
+                        continue
+                final_lines.append(line)
+
+            # Strip multiple empty lines
+            cf_text = re.sub(r'\n{3,}', '\n\n', "\n".join(final_lines)).strip()
         else:
             cf_text = ""
             failures.append("clinical_factors field must be a string or object")
@@ -232,7 +266,38 @@ class OllamaOutputParser:
             if marker in lowered:
                 failures.append(f"Output contains injection-like content: {marker!r}")
 
-        cf_text = text[:_MAX_FIELD_CHARS] if len(text) > _MAX_FIELD_CHARS else text
+        cleaned_lines = []
+        raw_lines = text.strip().splitlines()
+        for line in raw_lines:
+            clean_line = line.strip()
+            if not clean_line:
+                cleaned_lines.append(line)
+                continue
+            if clean_line.startswith("<") and clean_line.endswith(">"):
+                continue
+            lowered = clean_line.casefold()
+            if lowered in ("không được cung cấp", "null", "none", "không rõ", "không có", "n/a", "không"):
+                continue
+            cleaned_lines.append(line)
+
+        final_lines = []
+        for i, line in enumerate(cleaned_lines):
+            if line.strip().endswith(":"):
+                has_content = False
+                for j in range(i + 1, len(cleaned_lines)):
+                    next_clean = cleaned_lines[j].strip()
+                    if not next_clean:
+                        continue
+                    if next_clean.endswith(":"):
+                        break
+                    has_content = True
+                    break
+                if not has_content:
+                    continue
+            final_lines.append(line)
+
+        filtered_text = re.sub(r'\n{3,}', '\n\n', "\n".join(final_lines)).strip()
+        cf_text = filtered_text[:_MAX_FIELD_CHARS] if len(filtered_text) > _MAX_FIELD_CHARS else filtered_text
 
         return ClinicalAnalysisResult(
             success=not failures,
@@ -286,21 +351,34 @@ class OllamaOutputParser:
             if raw_value is None:
                 continue
             value = str(raw_value).strip()
+
+            # Skip empty, null, or placeholder values
+            lowered = value.casefold()
             if (
                 not value
-                or value.casefold() == "không được cung cấp"
-                or value.casefold() == "null"
+                or lowered in ("không được cung cấp", "null", "none", "không rõ", "không có", "n/a", "không")
+                or (value.startswith("<") and value.endswith(">"))
             ):
                 continue
+
             lines.append(f"{label}:\n{value}")
         return "\n\n".join(lines)
 
     @staticmethod
     def _str_list(value: Any) -> list[str]:
         if isinstance(value, list):
-            return [str(item) for item in value if item]
+            result = []
+            for item in value:
+                if not item:
+                    continue
+                s = str(item).strip()
+                if s and not (s.startswith("<") and s.endswith(">")):
+                    result.append(s)
+            return result
         if isinstance(value, str) and value.strip():
-            return [value.strip()]
+            s = value.strip()
+            if not (s.startswith("<") and s.endswith(">")):
+                return [s]
         return []
 
     @staticmethod

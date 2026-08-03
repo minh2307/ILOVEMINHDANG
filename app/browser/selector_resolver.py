@@ -113,11 +113,30 @@ class SelectorResolver:
         )
 
     async def exists(self, page: Any, key: str, *, timeout_ms: int = 1_000) -> bool:
-        try:
-            await self.find_first(page, key, timeout_ms=timeout_ms)
-            return True
-        except SelectorResolutionError:
-            return False
+        """Bounded presence probe; absence is expected and must not emit an error."""
+        candidates = self.candidates(key)
+        per_selector_timeout = max(50, timeout_ms // max(1, len(candidates)))
+        for candidate in candidates:
+            locator = self._locator(page, candidate).first
+            try:
+                await locator.wait_for(state="visible", timeout=per_selector_timeout)
+                return True
+            except Exception as exc:
+                mapped = map_playwright_error(
+                    exc, phase="SELECTOR_PROBE", operation=f"probe:{key}"
+                )
+                if is_terminal_browser_condition(mapped):
+                    raise mapped from exc
+        self.logger.debug(
+            "Selector probe found no match",
+            extra={
+                "selector_key": key,
+                "selectors_tested": [self._describe(item) for item in candidates],
+                "url": safe_browser_url(str(page.url)) if hasattr(page, "url") else "(FrameLocator)",
+                "elapsed_budget_ms": timeout_ms,
+            },
+        )
+        return False
 
     async def click_first(
         self,

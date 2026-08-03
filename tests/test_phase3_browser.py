@@ -283,6 +283,51 @@ def test_cdha_result_extraction_from_synthetic_html(tmp_path: Path) -> None:
     assert result.warnings == []
 
 
+class NestedResultLocator:
+    def __init__(self, heading: str, nested_text: str) -> None:
+        self.heading = heading
+        self.nested_text = nested_text
+
+    async def inner_text(self) -> str:
+        return self.heading
+
+    async def evaluate(self, *_: Any) -> str:
+        return self.nested_text
+
+
+class NestedResultResolver:
+    async def find_first(self, page: Any, key: str, **_: Any) -> Any:
+        values = {
+            "cdha.result_container": "Key findings:\nTổn thương giảm âm\nImpression:\nCần đối chiếu",
+            "cdha.key_findings": "Key findings:\n• Tổn thương giảm âm\n• Bờ không đều",
+            "cdha.impression": "Impression:\nHình ảnh gợi ý tổn thương, cần đối chiếu.",
+        }
+        if key not in values:
+            raise SelectorResolutionError(key)
+        heading = "Key findings:" if key == "cdha.key_findings" else "Impression:"
+        if key == "cdha.result_container":
+            heading = values[key]
+        return NestedResultLocator(heading, values[key])
+
+
+class NestedResultPage:
+    url = "https://cdha.ai/dash?view=nested-result"
+
+
+def test_cdha_result_extraction_reads_nested_value_instead_of_heading(tmp_path: Path) -> None:
+    client = CDHAWebClient(
+        make_settings(tmp_path), object(), object(), resolver=NestedResultResolver()
+    )
+
+    result = asyncio.run(client.extract_result(NestedResultPage(), "job"))
+
+    assert result.key_findings == ["Tổn thương giảm âm", "Bờ không đều"]
+    assert result.impression == "Hình ảnh gợi ý tổn thương, cần đối chiếu."
+    assert result.analysis_url == NestedResultPage.url
+    assert result.raw_key_findings.startswith("Key findings:")
+    assert result.raw_impression.startswith("Impression:")
+
+
 def test_missing_cdha_result_fields_add_warnings(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     client = CDHAWebClient(
@@ -304,6 +349,9 @@ def test_cdha_result_model_serializes_paths() -> None:
         success=True,
         job_id="job",
         key_findings=["finding"],
+        analysis_url="https://cdha.ai/dash?view=result",
+        raw_key_findings="Key findings:\nfinding",
+        raw_impression="Impression:\nvalue",
         result_json_path=Path("result.json"),
         screenshot_paths=[Path("01.png")],
     )
@@ -312,6 +360,8 @@ def test_cdha_result_model_serializes_paths() -> None:
     assert payload["result_json_path"] == "result.json"
     assert payload["screenshot_paths"] == ["01.png"]
     assert payload["key_findings"] == ["finding"]
+    assert payload["analysis_url"] == "https://cdha.ai/dash?view=result"
+    assert payload["raw_key_findings"] == "Key findings:\nfinding"
 
 
 class MissingScreenshotResolver:

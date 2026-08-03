@@ -11,6 +11,7 @@ from typing import Any
 from app.browser.chrome_manager import ChromeManager
 from app.browser.selector_resolver import SelectorResolutionError, SelectorResolver
 from app.config.settings import Settings
+from app.domain.models.cdha_clinical_summary import CDHAClinicalSummary
 from app.models.results import CDHAAnalysisResult
 from app.models.workflow import WorkflowStatus
 from app.repositories.job_repository import JobRepository
@@ -172,6 +173,15 @@ class CDHAWebClient:
                 
                 await page.goto(view_url)
                 extracted = await self.extract_result(page, job_id, started_at)
+            summary = CDHAClinicalSummary.from_values(
+                key_findings=extracted.key_findings,
+                impression=extracted.impression,
+                analysis_url=extracted.analysis_url or str(page.url),
+                source_language=extracted.source_language,
+                raw_key_findings=extracted.raw_key_findings,
+                raw_impression=extracted.raw_impression,
+            )
+            original_view_url = summary.analysis_url
             raw_text_path = (job_dir / "cdha-result-raw.txt").resolve()
             html_path: Path | None = None
             json_path = (job_dir / "cdha-result.json").resolve()
@@ -190,6 +200,10 @@ class CDHAWebClient:
                 confidence=extracted.confidence,
                 key_findings=extracted.key_findings,
                 impression=extracted.impression,
+                analysis_url=original_view_url,
+                source_language=summary.source_language,
+                raw_key_findings=summary.raw_key_findings,
+                raw_impression=summary.raw_impression,
                 detailed_analysis=extracted.detailed_analysis,
                 marked_regions=extracted.marked_regions,
                 raw_text=extracted.raw_text,
@@ -201,7 +215,6 @@ class CDHAWebClient:
                 warnings=extracted.warnings,
             )
             self._write_json_atomic(json_path, extracted.to_dict())
-            
             # --- Auto-share logic ---
             try:
                 share_btn = await self.resolver.find_first(
@@ -230,7 +243,7 @@ class CDHAWebClient:
                     "cdha_result_raw_path": str(raw_text_path),
                     "cdha_result_html_path": str(html_path) if html_path else None,
                     "cdha_diagnostic_screenshot_path": str(diagnostic_path),
-                    "cdha_view_url": page.url,
+                    "cdha_view_url": original_view_url,
                     "clinical_factors_path": str(masked_factors_path),
                     "clinical_factors": factors,
                     "cdha_completed_at": completed_at,
@@ -253,6 +266,10 @@ class CDHAWebClient:
                 confidence=extracted.confidence,
                 key_findings=extracted.key_findings,
                 impression=extracted.impression,
+                analysis_url=original_view_url,
+                source_language=extracted.source_language,
+                raw_key_findings=extracted.raw_key_findings,
+                raw_impression=extracted.raw_impression,
                 detailed_analysis=extracted.detailed_analysis,
                 marked_regions=extracted.marked_regions,
                 raw_text=extracted.raw_text,
@@ -662,7 +679,7 @@ class CDHAWebClient:
         triage = await self._field(page, "cdha.triage", "triage", warnings)
         confidence = await self._field(page, "cdha.confidence", "confidence", warnings)
         findings_text = await self._field(page, "cdha.key_findings", "key_findings", warnings)
-        impression = await self._field(page, "cdha.impression", "impression", warnings)
+        impression_text = await self._field(page, "cdha.impression", "impression", warnings)
         detailed = await self._field(
             page, "cdha.detailed_analysis", "detailed_analysis", warnings
         )
@@ -672,8 +689,11 @@ class CDHAWebClient:
             job_id=job_id,
             triage=triage,
             confidence=confidence,
-            key_findings=self._split_lines(findings_text),
-            impression=impression,
+            key_findings=CDHAClinicalSummary.normalize_key_findings(findings_text or ""),
+            impression=CDHAClinicalSummary.normalize_impression_text(impression_text or "") or None,
+            analysis_url=str(getattr(page, "url", "") or ""),
+            raw_key_findings=findings_text,
+            raw_impression=impression_text,
             detailed_analysis=detailed,
             marked_regions=self._split_lines(regions_text),
             raw_text=raw_text,
@@ -684,11 +704,49 @@ class CDHAWebClient:
     async def _field(
         self, page: Any, selector_key: str, field_name: str, warnings: list[str]
     ) -> str | None:
-        value = await self._optional_text(page, selector_key)
+        try:
+            locator = await self.resolver.find_first(page, selector_key, timeout_ms=1_200)
+            value = await self._field_locator_text(locator)
+        except (SelectorResolutionError, KeyError, AttributeError):
+            value = None
         if not value:
             warnings.append(f"CDHA result field could not be extracted: {field_name}")
             return None
         return value
+
+    @staticmethod
+    async def _field_locator_text(locator: Any) -> str | None:
+        direct = (await locator.inner_text()).strip()
+        try:
+            contextual = await locator.evaluate(
+                r"""element => {
+                    const text = node => (node?.innerText || node?.textContent || '').trim();
+                    const own = text(element);
+                    const normalized = own.toLocaleLowerCase().replace(/[:\s]+$/g, '');
+                    const labels = new Set([
+                        'key findings', 'findings', 'phát hiện chính', 'ghi nhận chính',
+                        'impression', 'nhận định', 'kết luận', 'triage', 'phân loại',
+                        'confidence', 'độ tin cậy', 'phân tích chi tiết',
+                        'detailed analysis', 'marked regions', 'vùng được đánh dấu'
+                    ]);
+                    if (!labels.has(normalized)) return own;
+                    const values = [];
+                    let sibling = element.nextElementSibling;
+                    while (sibling) {
+                        if (/^H[1-6]$/.test(sibling.tagName)) break;
+                        const value = text(sibling);
+                        if (value) values.push(value);
+                        sibling = sibling.nextElementSibling;
+                    }
+                    if (values.length) return own + '\n' + values.join('\n');
+                    const parent = element.parentElement;
+                    const parentText = text(parent);
+                    return parentText && parentText !== own ? parentText : own;
+                }"""
+            )
+            return str(contextual or direct).strip() or None
+        except (AttributeError, TypeError):
+            return direct or None
 
     async def _optional_text(self, page: Any, selector_key: str) -> str | None:
         try:

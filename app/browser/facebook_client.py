@@ -12,6 +12,9 @@ from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from app.browser.chrome_manager import ChromeManager
+from app.browser.facebook_page_state import (
+    FacebookDetectionResult, FacebookPageState, FacebookStateDetector,
+)
 from app.browser.selector_resolver import SelectorResolutionError, SelectorResolver
 from app.config.settings import Settings
 from app.error_events import safe_browser_url
@@ -30,6 +33,10 @@ class FacebookManualActionRequired(RuntimeError):
     pass
 
 
+class FacebookTransientError(RuntimeError):
+    pass
+
+
 class FacebookPublicationUncertain(RuntimeError):
     pass
 
@@ -45,6 +52,7 @@ class FacebookWebClient:
         *,
         resolver: SelectorResolver | None = None,
         content: PostContentService | None = None,
+        state_detector: FacebookStateDetector | None = None,
         confirmation_provider: Callable[[str], str] = input,
         edit_provider: Callable[[], str] | None = None,
         screenshot_selection_provider: Callable[[str], str] = input,
@@ -56,6 +64,10 @@ class FacebookWebClient:
         self.chrome = chrome
         self.resolver = resolver or SelectorResolver(settings.selectors_path, save_html=settings.save_diagnostic_html)
         self.content = content or PostContentService(settings)
+        self.state_detector = state_detector or FacebookStateDetector(
+            timeout_seconds=settings.facebook_state_detection_timeout_seconds,
+            probe_timeout_ms=settings.facebook_selector_probe_timeout_ms,
+        )
         self.confirmation_provider = confirmation_provider
         self.edit_provider = edit_provider or self._read_multiline_edit
         self.screenshot_selection_provider = screenshot_selection_provider
@@ -160,6 +172,7 @@ class FacebookWebClient:
         target = str(job.data.get("facebook_target_url") or "")
         post_text = str(job.data.get("facebook_post_text") or "")
         images = [Path(path) for path in job.data.get("facebook_image_paths") or []]
+        self._validate_publish_ready(job, post_text)
         page = self._pages.get(job_id)
         if page is None or getattr(page, "is_closed", lambda: False)():
             page, _ = await self._prepare_composer(
@@ -175,10 +188,7 @@ class FacebookWebClient:
                 )
             elif choice == "3":
                 edited = self.edit_provider().strip()
-                cdha_view_url = str(job.data.get("cdha_view_url") or "")
-                self.content.validate_post_text(
-                    edited, source_url=self._source_url(job_id), cdha_view_url=cdha_view_url
-                )
+                self._validate_publish_ready(job, edited)
                 path = self.content.write_text_atomic(
                     self._job_dir(job_id) / "facebook_post.txt", edited
                 )
@@ -256,6 +266,7 @@ class FacebookWebClient:
                 "facebook_known_post_ids": sorted(before_ids),
             },
         )
+        publish_clicked = False
         try:
             button = await self.resolver.find_first(
                 page, "facebook.publish_button", timeout_ms=10_000,
@@ -263,6 +274,7 @@ class FacebookWebClient:
                 context=f"job_id={job_id} state=FACEBOOK_PUBLISHING action=publish_exact_button",
             )
             await button.click()
+            publish_clicked = True
             
             # Handle two-step publish flow (Tiếp -> Đăng)
             try:
@@ -308,11 +320,23 @@ class FacebookWebClient:
             paths = await self._save_diagnostics(page, job_id, "publish-verification-failure")
             current = self._require_job(job_id)
             if current.status is WorkflowStatus.FACEBOOK_PUBLISHING:
+                target_status = (
+                    WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN
+                    if publish_clicked
+                    else WorkflowStatus.FACEBOOK_PUBLISH_FAILED
+                )
                 self.repository.transition(
-                    job_id, WorkflowStatus.FACEBOOK_PUBLISH_FAILED,
-                    details={"error": str(exc)},
+                    job_id,
+                    target_status,
+                    event_type=(
+                        "FACEBOOK_PUBLICATION_RECONCILIATION_REQUIRED"
+                        if publish_clicked
+                        else "JOB_STATE_CHANGED"
+                    ),
+                    details={"error": str(exc), "publish_clicked": publish_clicked},
                     data_patch={
                         "facebook_error": str(exc),
+                        "facebook_publication_uncertain": publish_clicked,
                         "facebook_diagnostic_screenshot_path": str(paths[0]),
                     },
                 )
@@ -320,6 +344,65 @@ class FacebookWebClient:
                 False, job_id, target,
                 diagnostic_screenshot_path=str(paths[0]), error=str(exc),
             )
+
+    async def reconcile_interrupted_publication(self, *, job_id: str) -> FacebookPublishResult:
+        """Verify a post after a crash without ever clicking Publish again."""
+        job = self._require_job(job_id)
+        if job.status is not WorkflowStatus.FACEBOOK_PUBLISHING:
+            raise ValueError(f"Publication reconciliation requires FACEBOOK_PUBLISHING; got {job.status.value}")
+        target = str(job.data.get("facebook_target_url") or "")
+        text = str(job.data.get("facebook_post_text") or "")
+        images = [Path(path) for path in job.data.get("facebook_image_paths") or []]
+        before_ids = set(job.data.get("facebook_known_post_ids") or [])
+        raw_started = str(job.data.get("facebook_publication_started_at") or "")
+        started = datetime.fromisoformat(raw_started.replace("Z", "+00:00")) if raw_started else datetime.now(UTC)
+        page: Any = None
+        try:
+            page = await self.chrome.new_page()
+            await page.goto(
+                target, wait_until="domcontentloaded",
+                timeout=self.settings.facebook_navigation_timeout_ms,
+            )
+            await self._ensure_authenticated(page, job_id, "publication-reconciliation")
+            result, signals = await self._verify_publication(
+                page, job_id, text, images, started, before_ids
+            )
+            if result.success and result.post_url:
+                self.repository.transition(
+                    job_id, WorkflowStatus.FACEBOOK_PUBLISHED,
+                    event_type="FACEBOOK_PUBLICATION_RECONCILED",
+                    details={"verification_signals": signals, "publish_clicked": False},
+                    data_patch={
+                        "facebook_publication_verified": True,
+                        "facebook_publication_uncertain": False,
+                        "facebook_post_id": result.post_id,
+                        "facebook_post_url_candidate": result.post_url,
+                        "facebook_post_url": result.post_url,
+                    },
+                )
+                return result
+            self.repository.transition(
+                job_id, WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+                event_type="FACEBOOK_PUBLICATION_RECONCILIATION_REQUIRED",
+                details={"verification_signals": signals, "publish_clicked": False},
+                data_patch={"facebook_publication_uncertain": True},
+            )
+            return result
+        except Exception as exc:
+            current = self._require_job(job_id)
+            if current.status is WorkflowStatus.FACEBOOK_PUBLISHING:
+                self.repository.transition(
+                    job_id, WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+                    event_type="FACEBOOK_PUBLICATION_RECONCILIATION_REQUIRED",
+                    details={"error_type": type(exc).__name__, "publish_clicked": False},
+                    data_patch={"facebook_publication_uncertain": True},
+                )
+            return FacebookPublishResult(False, job_id, target, error=str(exc))
+        finally:
+            if page is not None and not page.is_closed():
+                close = getattr(page, "close", None)
+                if close is not None:
+                    await close()
 
     async def extract_new_post_permalink(
         self, *, job_id: str, publication_started_at: datetime
@@ -464,15 +547,27 @@ class FacebookWebClient:
                 )
             return FacebookCommentResult(False, job_id, normalized_url, comment_text=comment_text, error=str(exc))
 
-    async def is_authenticated(self, page: Any) -> bool:
-        url = str(getattr(page, "url", "")).casefold()
-        if any(value in url for value in ("/login", "/checkpoint", "two_factor")):
-            return False
+    async def detect_page_state(self, page: Any) -> FacebookDetectionResult:
+        if hasattr(page, "locator") or not isinstance(self.state_detector, FacebookStateDetector):
+            return await self.state_detector.detect(page)
+        # Compatibility for lightweight unit fakes; real Playwright pages always use
+        # the structured detector above.
         if await self.resolver.exists(page, "facebook.login_indicators", timeout_ms=700):
-            return False
-        if await self.resolver.exists(page, "facebook.checkpoint_indicators", timeout_ms=700):
-            return False
-        return await self.resolver.exists(page, "facebook.authenticated_marker", timeout_ms=1_500)
+            state = FacebookPageState.LOGIN_REQUIRED
+        elif await self.resolver.exists(page, "facebook.checkpoint_indicators", timeout_ms=700):
+            state = FacebookPageState.CHECKPOINT
+        elif await self.resolver.exists(page, "facebook.authenticated_marker", timeout_ms=1_500):
+            state = FacebookPageState.LOGGED_IN
+        else:
+            state = FacebookPageState.UNKNOWN
+        title = await page.title() if hasattr(page, "title") else ""
+        return FacebookDetectionResult(
+            state=state, probes=(), url=safe_browser_url(str(getattr(page, "url", ""))),
+            title=title, frames=(), has_dialog=False, elapsed_ms=0,
+        )
+
+    async def is_authenticated(self, page: Any) -> bool:
+        return (await self.detect_page_state(page)).state is FacebookPageState.LOGGED_IN
 
     async def _prepare_composer(
         self, target: str, post_text: str, images: list[Path], job_id: str, diagnostics: Path
@@ -522,20 +617,75 @@ class FacebookWebClient:
         return page, uploaded
 
     async def _ensure_authenticated(self, page: Any, job_id: str, diagnostic_name: str) -> None:
-        if await self.is_authenticated(page):
+        detection = await self.detect_page_state(page)
+        state = detection.state
+        self.repository.record_event(job_id, details={
+            "event_type": "FACEBOOK_STATE_DETECTED",
+            "detected_state": state.value,
+            "url": detection.url,
+            "elapsed_ms": detection.elapsed_ms,
+        })
+        if state is FacebookPageState.LOGGED_IN:
             return
-        await self._save_diagnostics(page, job_id, diagnostic_name)
-        try:
-            await self.chrome.wait_for_manual_action(
-                "Complete Facebook login, 2FA, CAPTCHA, checkpoint, or account verification manually. No challenge will be bypassed.",
-                lambda: self.is_authenticated(page),
+
+        data_patch: dict[str, Any] = {"facebook_page_state": state.value}
+        if state is FacebookPageState.UNKNOWN and self.settings.facebook_save_debug_artifacts:
+            folder = await self.state_detector.save_unknown_artifacts(
+                page, detection,
+                root=self.settings.project_root / "runtime" / "debug" / "facebook",
+                job_id=job_id,
+                browser_profile=str(self.settings.chrome_profile_dir),
+                browser_port=9222,
             )
-        except Exception as exc:
+            data_patch.update({
+                "facebook_debug_screenshot_path": str(folder / "screenshot.png"),
+                "facebook_debug_html_path": str(folder / "page.html"),
+                "facebook_debug_metadata_path": str(folder / "metadata.json"),
+            })
+
+        current = self._require_job(job_id)
+        auth_states = {
+            FacebookPageState.LOGIN_REQUIRED,
+            FacebookPageState.SESSION_EXPIRED,
+            FacebookPageState.CHECKPOINT,
+            FacebookPageState.TWO_FACTOR,
+            FacebookPageState.CONSENT_DIALOG,
+        }
+        if state in auth_states:
+            event_type = (
+                "FACEBOOK_CHECKPOINT_DETECTED"
+                if state in {FacebookPageState.CHECKPOINT, FacebookPageState.TWO_FACTOR}
+                else "FACEBOOK_AUTH_REQUIRED"
+            )
+            if current.status is WorkflowStatus.FACEBOOK_PREPARING:
+                self.repository.transition(
+                    job_id, WorkflowStatus.WAITING_FOR_AUTH_REVIEW,
+                    event_type=event_type,
+                    details={"detected_state": state.value},
+                    data_patch=data_patch,
+                )
             raise FacebookManualActionRequired(
-                "Facebook authentication was not verified; job remains resumable"
-            ) from exc
-        if not await self.is_authenticated(page):
-            raise FacebookManualActionRequired("Facebook authentication was not verified; job remains resumable")
+                f"Facebook requires manual authentication review: {state.value}"
+            )
+        if state is FacebookPageState.ACCOUNT_DISABLED:
+            if current.status is WorkflowStatus.FACEBOOK_PREPARING:
+                self.repository.transition(
+                    job_id, WorkflowStatus.BLOCKED,
+                    event_type="FACEBOOK_ACCOUNT_DISABLED",
+                    details={"severity": "critical"},
+                    data_patch=data_patch,
+                )
+            raise FacebookManualActionRequired("Facebook account is disabled; automatic retry is blocked")
+
+        event_type = "FACEBOOK_UNKNOWN_PAGE" if state is FacebookPageState.UNKNOWN else "PLAYWRIGHT_RETRY_SCHEDULED"
+        if current.status is WorkflowStatus.FACEBOOK_PREPARING:
+            self.repository.transition(
+                job_id, WorkflowStatus.RETRYABLE,
+                event_type=event_type,
+                details={"detected_state": state.value},
+                data_patch=data_patch,
+            )
+        raise FacebookTransientError(f"Transient Facebook page state: {state.value}")
 
     async def _wait_for_uploads(self, page: Any, expected: int) -> int:
         deadline = time.monotonic() + self.settings.facebook_upload_timeout_seconds
@@ -602,116 +752,35 @@ class FacebookWebClient:
         self, page: Any, approved_text: str, started: datetime,
         expected_images: int, before_ids: set[str]
     ) -> dict[str, Any] | None:
-        # Scroll slightly to trigger feed loading, but not too much to skip the first post
-        await page.mouse.wheel(0, 500)
-        await page.wait_for_timeout(1500)
-
-        # 1. Expand all "Xem thêm" / "See more" buttons currently visible on the page
-        try:
-            see_mores = await page.locator('div[role="button"]:has-text("Xem thêm"), div[role="button"]:has-text("See more")').all()
-            for btn in see_mores:
-                try:
-                    if await btn.is_visible():
-                        await btn.click(timeout=1000)
-                        await page.wait_for_timeout(500)
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
+        articles = await self._all_locators(page, "facebook.feed_post")
         normalized_approved = self._normalize_text(approved_text)
         best: tuple[int, dict[str, Any]] | None = None
-        
-        # 2. Find all post links directly
-        link_locators = await page.locator('a[href*="/posts/"], a[href*="/permalink/"], a[href*="/reel/"], a[href*="story_fbid="], a[href*="/videos/"]').all()
-        seen_urls = set()
-        
-        for loc in link_locators:
+        for article in articles:
             try:
-                href = await loc.get_attribute("href")
-                if not href or href == "/reel/?s=tab":
-                    continue
-                    
-                try:
-                    url = self.normalize_permalink(href, base_url=str(page.url))
-                except ValueError:
-                    continue
-                    
-                if url in seen_urls:
-                    continue
-                seen_urls.add(url)
-                
-                post_id = self.extract_post_id(url) or ""
-                is_new = not post_id or post_id not in before_ids
-
-                # Read text around the link by going up the DOM tree 8 levels
-                body_raw = await loc.evaluate("""el => {
-                    let p = el.parentElement;
-                    let lastValid = p;
-                    for(let k=0; k<8; k++) {
-                        if(!p) break;
-                        lastValid = p;
-                        p = p.parentElement;
+                body = self._normalize_text(await article.inner_text())
+                # Use lenient matching to account for "Xem thêm" (See more) truncation
+                prefix = normalized_approved[:50]
+                text_match = normalized_approved in body or prefix in body
+                links = await self._article_links(article)
+                for href in links:
+                    try:
+                        url = self.normalize_permalink(href, base_url=str(page.url))
+                    except ValueError:
+                        continue
+                    post_id = self.extract_post_id(url) or ""
+                    is_new = not post_id or post_id not in before_ids
+                    images = await article.locator("img[src]").count()
+                    recent = await self._article_is_recent(article, started)
+                    score = 4 * text_match + 2 * is_new + int(recent) + int(images == expected_images)
+                    candidate = {
+                        "url": url, "post_id": post_id, "text_match": text_match,
+                        "recent": recent, "image_count": images,
+                        "method": "content+new-id+timestamp+image-count",
                     }
-                    return lastValid ? lastValid.innerText : '';
-                }""")
-                
-                body = self._normalize_text(body_raw)
-                prefix_length = min(50, len(normalized_approved))
-                
-                text_match = (
-                    normalized_approved[:prefix_length] in body
-                    or "cdhaaidashview" in body 
-                    or "facebookcomreel" in body
-                    or "ca lâm sàng siêu âm" in body
-                )
-                
-                # Try to count images in this container (approximation)
-                images = 0
-                try:
-                    images = await loc.evaluate("""el => {
-                        let p = el.parentElement;
-                        let lastValid = p;
-                        for(let k=0; k<8; k++) { if(!p) break; lastValid = p; p = p.parentElement; }
-                        return lastValid ? lastValid.querySelectorAll('img[src]').length : 0;
-                    }""")
-                except Exception:
-                    pass
-                
-                # Check if it's recent (by looking for timestamp strings in the text like "Vừa xong", "1 phút")
-                # FB often shows timestamp right above the content
-                recent = False
-                if any(t in body for t in ["vừa xong", "1 phút", "2 phút", "3 phút", "4 phút", "5 phút", "just now", "1 min", "2 mins", "3 mins"]):
-                    recent = True
-                # If we cannot reliably find timestamp, we fall back to assuming it's recent if it's the first few posts
-                
-                score = 4 * text_match + 2 * is_new + int(recent) + int(images == expected_images)
-                candidate = {
-                    "url": url, "post_id": post_id, "text_match": text_match,
-                    "recent": recent, "image_count": images,
-                    "method": "content+new-id+timestamp+image-count (robust link scan)",
-                }
-                
-                if (text_match or (is_new and recent)) and (best is None or score > best[0]):
-                    best = (score, candidate)
-                    
-                # If strong match found, return immediately
-                if best and best[1].get("text_match"):
-                    return best[1]
-                    
+                    if text_match and is_new and (best is None or score > best[0]):
+                        best = (score, candidate)
             except Exception:
                 continue
-                
-        # FALLBACK: If we couldn't find a strong match, but we have seen some links
-        if not best and seen_urls:
-            first_url = list(seen_urls)[0]
-            post_id = self.extract_post_id(first_url) or ""
-            return {
-                "url": first_url, "post_id": post_id, "text_match": False,
-                "recent": True, "image_count": 0,
-                "method": "fallback-first-post (robust link scan)",
-            }
-                
         return best[1] if best else None
 
     async def _article_links(self, article: Any) -> list[str]:
@@ -931,6 +1000,18 @@ class FacebookWebClient:
     def _source_url(self, job_id: str) -> str:
         job = self._require_job(job_id)
         return job.source_url
+
+    def _validate_publish_ready(self, job: Any, post_text: str) -> None:
+        cdha = job.data.get("cdha_result") or {}
+        self.content.validate_publish_ready(
+            post_text,
+            source_url=job.source_url,
+            cdha_view_url=str(
+                cdha.get("analysis_url") or job.data.get("cdha_view_url") or ""
+            ),
+            key_findings=list(cdha.get("key_findings") or []),
+            impression=cdha.get("impression"),
+        )
 
     def _require_job(self, job_id: str) -> Any:
         job = self.repository.get_job(job_id)

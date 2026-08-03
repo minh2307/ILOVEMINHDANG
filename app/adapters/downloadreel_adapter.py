@@ -9,6 +9,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,9 @@ class DownloadReelAdapter:
         self.settings = settings
         self.repository = repository
         self._downloader = downloader
+        self._download_authentication_method = (
+            "injected_test_double" if downloader is not None else "not_checked"
+        )
         self.logger = logger or logging.getLogger("cdha_pipeline.downloadreel")
 
     def _get_downloader(self) -> Callable[[str], Any]:
@@ -61,8 +65,27 @@ class DownloadReelAdapter:
         legacy_dir = str(self.settings.downloadreel_dir)
         if legacy_dir not in sys.path:
             sys.path.insert(0, legacy_dir)
+        inspection = self.settings.inspect_facebook_cookie()
+        self._download_authentication_method = inspection.authentication_method
+        cookie_path = inspection.path if inspection.valid else None
+        self.logger.info(
+            "Facebook Reel cookie configuration",
+            extra={
+                "component": "downloadreel",
+                "event": "COOKIE_CONFIGURATION",
+                "details": {
+                    "path": str(inspection.path),
+                    "status": inspection.status,
+                    "authentication_method": inspection.authentication_method,
+                },
+            },
+        )
         module = importlib.import_module("fb_downloader")
-        self._downloader = module.process_and_download_reel
+        self._downloader = partial(
+            module.process_and_download_reel,
+            scrape_browser_metadata=False,
+            cookie_path=cookie_path,
+        )
         return self._downloader
 
     async def process(self, reel_url: str, job_id: str) -> DownloadResult:
@@ -120,6 +143,7 @@ class DownloadReelAdapter:
                     "error": error,
                     "download_started_at": started_at,
                     "download_completed_at": completed_at,
+                    "download_authentication_method": self._download_authentication_method,
                 },
             )
             self.logger.error("DownloadReel step failed", extra={"job_id": job_id, "error": error})
@@ -309,8 +333,7 @@ class DownloadReelAdapter:
                 digest.update(block)
         return digest.hexdigest()
 
-    @staticmethod
-    def _result_data(result: DownloadResult, started_at: str, completed_at: str) -> dict[str, Any]:
+    def _result_data(self, result: DownloadResult, started_at: str, completed_at: str) -> dict[str, Any]:
         return {
             "source_url": result.source_url,
             "normalized_source_url": result.normalized_source_url,
@@ -325,6 +348,7 @@ class DownloadReelAdapter:
             "download_completed_at": completed_at,
             "error": None,
             "reused_download": result.reused,
+            "download_authentication_method": self._download_authentication_method,
         }
 
     @staticmethod

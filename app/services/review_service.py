@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 import subprocess
 from typing import Callable
@@ -9,6 +10,7 @@ from app.config.settings import Settings
 from app.models.workflow import WorkflowStatus
 from app.repositories.job_repository import JobRepository
 from app.services.clinical_factors_service import ClinicalFactorsService
+from app.services.post_content_service import PostContentService
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +27,7 @@ class ReviewService:
         settings: Settings,
         repository: JobRepository,
         clinical_factors: ClinicalFactorsService | None = None,
+        post_content: PostContentService | None = None,
     ) -> None:
         self.settings = settings
         self.repository = repository
@@ -35,6 +38,7 @@ class ReviewService:
             max_total_comment_chars=settings.gemini_comment_total_max_chars,
             max_prompt_chars=settings.gemini_prompt_max_chars,
         )
+        self.post_content = post_content or PostContentService(settings)
 
     def review(
         self,
@@ -51,12 +55,27 @@ class ReviewService:
                 f"--review-job requires WAITING_FOR_REVIEW; got {job.status.value}"
             )
         self.display(job_id)
-        choice = choice_provider("Select [1-7]: ").strip()
+        if self.settings.auto_approve_review:
+            print("\n[AUTO-APPROVE] AUTO_APPROVE_REVIEW is enabled. Auto-accepting...")
+            choice = "1"
+        else:
+            choice = choice_provider("Select [1-7]: ").strip()
+
         if choice == "1":
+            cdha = job.data.get("cdha_result") or {}
+            summary = self.post_content.validate_clinical_summary(
+                key_findings=list(cdha.get("key_findings") or []),
+                impression=cdha.get("impression"),
+                cdha_view_url=str(
+                    cdha.get("analysis_url") or job.data.get("cdha_view_url") or ""
+                ),
+            )
             combined = "\n".join(
                 (
                     str(job.data.get("clinical_factors") or ""),
                     str(job.data.get("facebook_post_text") or ""),
+                    *summary.key_findings,
+                    summary.impression,
                 )
             )
             privacy_scan = self.clinical_factors.privacy.scan(combined)
@@ -66,6 +85,8 @@ class ReviewService:
                     "review_privacy_risk_level": privacy_scan.risk_level,
                     "review_privacy_categories": list(privacy_scan.detected_categories),
                     "review_media_pii_acknowledged": True,
+                    "review_clinical_summary_validated_at": datetime.now(UTC).isoformat(),
+                    "review_clinical_summary": summary.to_dict(),
                 },
             )
             self.repository.transition(

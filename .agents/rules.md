@@ -33,3 +33,74 @@ Bạn là Senior Python Automation Engineer, chuyên về Playwright, Selenium, 
 ## 7. Tận Dụng Các Skills Có Sẵn
 - Luôn kiểm tra và tận dụng các skills nằm trong thư mục `.agents/skills/`.
 - Nếu có yêu cầu liên quan đến lập kế hoạch, debug hệ thống, gọi subagent hay viết test cho webapp, BẮT BUỘC phải đọc file `SKILL.md` tương ứng trong từng thư mục skill trước khi bắt đầu viết code hoặc thực thi.
+
+## 8. Quản Lý Trạng Thái, Tiến Độ và Lịch Sử Thay Đổi
+
+### 8.1. Nguồn dữ liệu trạng thái
+
+* `runtime/automation.db` là nguồn dữ liệu chính xác duy nhất đối với trạng thái runtime của Job.
+* Không suy luận trạng thái Job chỉ dựa trên log console hoặc sự tồn tại của file đầu ra.
+* Các tài liệu Markdown chỉ dùng để quản lý tiến độ phát triển và không thay thế trạng thái trong SQLite.
+
+### 8.2. Trạng thái Job chuẩn
+
+Mọi Job phải sử dụng một trong các trạng thái sau:
+
+* `PENDING`
+* `QUEUED`
+* `LOCK_WAITING`
+* `RUNNING`
+* `RETRY_WAITING`
+* `SUCCEEDED`
+* `FAILED`
+* `CANCELLED`
+
+Không tự ý tạo thêm trạng thái mới nếu chưa cập nhật state machine và migration tương ứng.
+
+### 8.3. Ghi nhận sự kiện
+
+* Mỗi thay đổi trạng thái phải được ghi vào bảng `job_events`.
+* Event log phải theo cơ chế append-only, không sửa hoặc xóa lịch sử cũ.
+* Mỗi event phải có tối thiểu: `job_id`, `event_type`, `old_status`, `new_status`, `step`, `message` và `created_at`.
+* Không ghi cookie, access token, mật khẩu hoặc dữ liệu nhạy cảm vào event log.
+
+### 8.4. Checkpoint và khôi phục
+
+* Sau mỗi bước nghiệp vụ thành công phải tạo checkpoint.
+* Trước khi thực hiện một bước, phải kiểm tra checkpoint tương ứng.
+* Bước đã hoàn thành không được chạy lại, trừ khi workflow quy định rõ cơ chế force rerun.
+* Khi Worker khởi động lại sau crash, phải tiếp tục từ checkpoint gần nhất thay vì chạy lại toàn bộ Job.
+* Mọi thao tác có tác động bên ngoài phải được thiết kế idempotent hoặc có cơ chế kiểm tra trùng lặp.
+
+### 8.5. Quản lý Lock
+
+* Toàn bộ browser operation phải lấy lock theo cùng một thứ tự để tránh deadlock.
+* Lock file phải lưu metadata gồm PID, job ID, hostname và thời điểm lấy lock.
+* Không được tự ý xóa lock chỉ vì đã chờ quá timeout.
+* Trước khi thu hồi stale lock phải kiểm tra PID sở hữu lock còn hoạt động hay không.
+* Mọi thao tác thu hồi stale lock phải được ghi log và tạo `job_event`.
+* Nếu chưa thể lấy lock, Job phải chuyển sang `RETRY_WAITING` với `next_retry_at`, không được lặp vô hạn.
+
+### 8.6. Quản lý tài liệu dự án
+
+Sau khi hoàn thành một thay đổi đáng kể, agent phải:
+
+1. Cập nhật `docs/CHANGELOG.md` với phần đã hoàn thành.
+2. Cập nhật `docs/PROJECT_STATE.md` để phản ánh trạng thái hiện tại.
+3. Cập nhật `docs/ROADMAP.md`, đánh dấu task đã hoàn thành và ghi rõ bước tiếp theo.
+4. Tạo ADR trong `docs/decisions/` nếu có quyết định kiến trúc mới hoặc thay đổi quyết định cũ.
+
+Không ghi lại cùng một thông tin chi tiết ở nhiều tài liệu khác nhau. Mỗi tài liệu phải giữ đúng trách nhiệm của nó.
+
+### 8.7. Kết thúc phiên làm việc
+
+Trước khi kết thúc một phiên sửa đổi, agent phải cung cấp:
+
+* Các file đã thay đổi.
+* Những chức năng đã hoàn thành.
+* Test hoặc lệnh kiểm tra đã chạy.
+* Những vấn đề còn tồn tại.
+* Bước tiếp theo được đề xuất.
+* Các giả định hoặc rủi ro chưa được xác minh.
+
+Không được khẳng định công việc đã hoàn thành nếu chưa chạy test hoặc chưa có bằng chứng kiểm tra tương ứng.

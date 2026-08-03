@@ -12,7 +12,8 @@ import pytest
 from PIL import Image
 
 from app.adapters.facebook_adapter import FacebookPublisherAdapter
-from app.browser.facebook_client import FacebookWebClient
+from app.browser.facebook_client import FacebookManualActionRequired, FacebookWebClient
+from app.browser.facebook_page_state import FacebookPageState
 from app.config.settings import Settings
 from app.main import _run_phase4_command, build_parser
 from app.models.results import (
@@ -64,6 +65,7 @@ def approved_job(repository: JobRepository, *, job_id: str = "approved") -> str:
     repository.update_data(job.job_id, {
         "cdha_result": {"key_findings": ["Tổn thương giảm âm"], "impression": "Theo dõi tổn thương gan"},
         "cdha_result_json_path": "/protected/cdha-result.json",
+        "cdha_view_url": "https://cdha.ai/dash?view=fixture-result",
     })
     return job.job_id
 
@@ -72,6 +74,17 @@ def make_repo(settings: Settings) -> JobRepository:
     repo = JobRepository(settings.database_path)
     repo.initialize()
     return repo
+
+
+def valid_post_text(settings: Settings, repository: JobRepository, job_id: str) -> str:
+    job = repository.get_job(job_id)
+    cdha = job.data["cdha_result"]
+    return PostContentService(settings).build_post(
+        source_url=job.source_url,
+        key_findings=list(cdha["key_findings"]),
+        impression=str(cdha["impression"]),
+        cdha_view_url=str(job.data["cdha_view_url"]),
+    )
 
 
 def test_facebook_target_validation_and_normalization(tmp_path: Path) -> None:
@@ -104,11 +117,43 @@ def test_post_template_is_multiline_vietnamese_and_has_disclaimer(tmp_path: Path
         source_url="https://facebook.com/reel/1",
         key_findings=["Tổn thương giảm âm", "Bờ không đều"],
         impression="Cần đối chiếu lâm sàng",
+        cdha_view_url="https://cdha.ai/dash?view=result-1",
     )
     assert "📌 CA LÂM SÀNG SIÊU ÂM" in text
     assert "• Tổn thương giảm âm\n• Bờ không đều" in text
     assert "không thay thế việc thăm khám" in text
     assert "https://facebook.com/reel/1" in text
+    assert "https://cdha.ai/dash?view=result-1" in text
+    assert "&ref=CD2ED52966" not in text
+
+
+def test_post_rejects_label_only_summary_and_missing_analysis_url(tmp_path: Path) -> None:
+    service = PostContentService(make_settings(tmp_path))
+    with pytest.raises(PostContentValidationError, match="Key Findings"):
+        service.build_post(
+            source_url="https://facebook.com/reel/1",
+            key_findings=["Key findings:"],
+            impression="Impression:",
+            cdha_view_url="https://cdha.ai/dash?view=result-1",
+        )
+    with pytest.raises(PostContentValidationError, match="analysis URL"):
+        service.build_post(
+            source_url="https://facebook.com/reel/1",
+            key_findings=["Ghi nhận tổn thương 19.60 mm."],
+            impression="Hình ảnh gợi ý tổn thương.",
+        )
+
+
+def test_post_normalizes_measurement_decimal_without_changing_raw_summary(tmp_path: Path) -> None:
+    service = PostContentService(make_settings(tmp_path))
+    text = service.build_post(
+        source_url="https://facebook.com/reel/1",
+        key_findings=["Đường kính ghi nhận 19.60 mm."],
+        impression="Hình ảnh gợi ý tổn thương, cần đối chiếu.",
+        cdha_view_url="https://cdha.ai/dash?view=result-1",
+    )
+    assert "19,60 mm" in text
+    assert "19.60 mm" not in text
 
 
 def test_missing_findings_or_impression_requires_manual_edit(tmp_path: Path) -> None:
@@ -359,17 +404,79 @@ def test_final_manual_gate_cancel_does_not_click_and_publish_approval_does(tmp_p
     settings = make_settings(tmp_path); repo = make_repo(settings); job_id = approved_job(repo)
     resolver = FakeResolver(); client = PublishClient(settings, repo, FakeChrome(), resolver=resolver, confirmation_provider=lambda _: "2")
     image = make_png(tmp_path / "one.png")
-    asyncio.run(client.prepare_post(target_url=settings.facebook_target_url, post_text="Nội dung an toàn", image_paths=[image], job_id=job_id))
+    asyncio.run(client.prepare_post(target_url=settings.facebook_target_url, post_text=valid_post_text(settings, repo, job_id), image_paths=[image], job_id=job_id))
     cancelled = asyncio.run(client.publish_prepared_post(job_id=job_id))
     assert not cancelled.success and resolver.items["facebook.publish_button"].clicked == 0
     assert repo.get_job(job_id).status is WorkflowStatus.APPROVED
 
     job2 = approved_job(repo, job_id="approved2")
     resolver2 = FakeResolver(); client2 = PublishClient(settings, repo, FakeChrome(), resolver=resolver2, confirmation_provider=lambda _: "1")
-    asyncio.run(client2.prepare_post(target_url=settings.facebook_target_url, post_text="Nội dung khác", image_paths=[image], job_id=job2))
+    asyncio.run(client2.prepare_post(target_url=settings.facebook_target_url, post_text=valid_post_text(settings, repo, job2), image_paths=[image], job_id=job2))
     published = asyncio.run(client2.publish_prepared_post(job_id=job2))
     assert published.success and resolver2.items["facebook.publish_button"].clicked == 1
     assert repo.get_job(job2).status is WorkflowStatus.FACEBOOK_PUBLISHED
+
+
+def test_final_publish_guard_rejects_persisted_label_only_sections(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    repo = make_repo(settings)
+    job_id = approved_job(repo, job_id="invalid-clinical-summary")
+    resolver = FakeResolver()
+    client = PublishClient(
+        settings,
+        repo,
+        FakeChrome(),
+        resolver=resolver,
+        confirmation_provider=lambda _: "1",
+    )
+    image = make_png(tmp_path / "guard.png")
+    valid_text = PostContentService(settings).build_post(
+        source_url=repo.get_job(job_id).source_url,
+        key_findings=["Tổn thương giảm âm"],
+        impression="Hình ảnh gợi ý tổn thương, cần đối chiếu.",
+        cdha_view_url="https://cdha.ai/dash?view=fixture-result",
+    )
+    asyncio.run(client.prepare_post(
+        target_url=settings.facebook_target_url,
+        post_text=valid_text,
+        image_paths=[image],
+        job_id=job_id,
+    ))
+    repo.update_data(job_id, {
+        "facebook_post_text": "🔍 Ghi nhận chính:\n• Key findings:\n\n📝 Nhận định:\nImpression:"
+    })
+
+    with pytest.raises(PostContentValidationError):
+        asyncio.run(client.publish_prepared_post(job_id=job_id))
+
+    assert resolver.items["facebook.publish_button"].clicked == 0
+    assert repo.get_job(job_id).status is WorkflowStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW
+
+
+def test_crash_after_publish_reconciles_without_second_click(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    repo = make_repo(settings)
+    job_id = approved_job(repo, job_id="publish-crash")
+    image = make_png(tmp_path / "reconcile.png")
+    repo.transition(job_id, WorkflowStatus.FACEBOOK_PREPARING, data_patch={
+        "facebook_target_url": settings.facebook_target_url,
+        "facebook_post_text": "Nội dung đã đăng",
+        "facebook_image_paths": [str(image)],
+        "facebook_known_post_ids": ["old"],
+        "facebook_publication_started_at": datetime.now(UTC).isoformat(),
+    })
+    repo.transition(job_id, WorkflowStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW)
+    repo.transition(job_id, WorkflowStatus.FACEBOOK_PUBLISHING)
+    resolver = FakeResolver()
+    client = PublishClient(settings, repo, FakeChrome(), resolver=resolver)
+
+    result = asyncio.run(client.reconcile_interrupted_publication(job_id=job_id))
+
+    assert result.success
+    assert resolver.items["facebook.publish_button"].clicked == 0
+    persisted = repo.get_job(job_id)
+    assert persisted.status is WorkflowStatus.FACEBOOK_PUBLISHED
+    assert persisted.data["facebook_post_url"].endswith("/posts/new")
 
 
 def test_diagnostics_create_deterministic_metadata_and_screenshot(tmp_path: Path) -> None:
@@ -430,6 +537,30 @@ def test_login_and_access_denied_detection(tmp_path: Path) -> None:
     assert repo.get_job(job_id).status is WorkflowStatus.FACEBOOK_PUBLISH_FAILED
 
 
+class CheckpointDetector:
+    async def detect(self, page: Any):
+        return SimpleNamespace(
+            state=FacebookPageState.CHECKPOINT, probes=(), url=str(page.url),
+            title="Security Check", frames=(), has_dialog=False, elapsed_ms=1,
+        )
+
+
+def test_checkpoint_is_persisted_as_waiting_for_auth_review(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    repo = make_repo(settings)
+    job_id = approved_job(repo, job_id="checkpoint-job")
+    repo.transition(job_id, WorkflowStatus.FACEBOOK_PREPARING)
+    client = FacebookWebClient(
+        settings, repo, FakeChrome(), state_detector=CheckpointDetector()
+    )
+
+    with pytest.raises(FacebookManualActionRequired, match="checkpoint"):
+        asyncio.run(client._ensure_authenticated(FakePage(), job_id, "test"))
+
+    assert repo.get_job(job_id).status is WorkflowStatus.WAITING_FOR_AUTH_REVIEW
+    assert repo.list_events(job_id)[-1].event_type == "FACEBOOK_CHECKPOINT_DETECTED"
+
+
 class UploadResolver:
     def __init__(self, *, error: bool = False, progress: bool = False) -> None:
         self.error = error; self.progress = progress
@@ -488,6 +619,11 @@ def test_exact_new_post_identification_uses_content_new_id_time_and_images(tmp_p
     assert found["text_match"] and found["recent"] and found["image_count"] == 2
 
 
+class VerificationCrashClient(PublishClient):
+    async def _verify_publication(self, *args: Any, **kwargs: Any):
+        raise TimeoutError("verification crashed after publish click")
+
+
 class UncertainPublishClient(PublishClient):
     async def _verify_publication(self, *args: Any, **kwargs: Any):
         return FacebookPublishResult(False, kwargs.get("job_id", "j"), error="uncertain"), {
@@ -503,7 +639,7 @@ def test_uncertain_publication_blocks_automatic_retry(tmp_path: Path) -> None:
     )
     image = make_png(tmp_path / "uncertain.png")
     asyncio.run(client.prepare_post(
-        target_url=settings.facebook_target_url, post_text="Nội dung chưa chắc chắn",
+        target_url=settings.facebook_target_url, post_text=valid_post_text(settings, repo, job_id),
         image_paths=[image], job_id=job_id,
     ))
     result = asyncio.run(client.publish_prepared_post(job_id=job_id))
@@ -512,6 +648,31 @@ def test_uncertain_publication_blocks_automatic_retry(tmp_path: Path) -> None:
     assert WorkflowStatus.FACEBOOK_PREPARING not in WorkflowStateMachine.allowed_targets(
         WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN
     )
+
+
+def test_exception_after_publish_click_is_uncertain_not_failed(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    repo = make_repo(settings)
+    job_id = approved_job(repo, job_id="post-click-crash")
+    resolver = FakeResolver()
+    client = VerificationCrashClient(
+        settings,
+        repo,
+        FakeChrome(),
+        resolver=resolver,
+        confirmation_provider=lambda _: "1",
+    )
+    image = make_png(tmp_path / "post-click-crash.png")
+    asyncio.run(client.prepare_post(
+        target_url=settings.facebook_target_url,
+        post_text=valid_post_text(settings, repo, job_id),
+        image_paths=[image],
+        job_id=job_id,
+    ))
+    result = asyncio.run(client.publish_prepared_post(job_id=job_id))
+    assert not result.success
+    assert resolver.items["facebook.publish_button"].clicked == 1
+    assert repo.get_job(job_id).status is WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN
 
 
 def advance_to_post_url_extracted(repo: JobRepository, job_id: str) -> None:
@@ -543,7 +704,10 @@ def test_duplicate_comment_from_sqlite_is_reused_without_browser(tmp_path: Path)
 
 
 class ResumeClient:
-    def __init__(self, repo: JobRepository) -> None: self.repo = repo; self.calls: list[str] = []
+    def __init__(self, repo: JobRepository) -> None:
+        self.repo = repo
+        self.calls: list[str] = []
+        self.comment_post_urls: list[str] = []
     async def extract_new_post_permalink(self, *, job_id: str, publication_started_at: datetime):
         self.calls.append("extract")
         self.repo.transition(job_id, WorkflowStatus.POST_URL_EXTRACTING)
@@ -560,6 +724,7 @@ class ResumeClient:
         image_path: Path | None = None,
     ):
         self.calls.append("comment")
+        self.comment_post_urls.append(post_url)
         self.repo.transition(job_id, WorkflowStatus.COMMENT_ADDING)
         self.repo.transition(job_id, WorkflowStatus.COMMENT_ADDED)
         self.repo.transition(job_id, WorkflowStatus.COMPLETED)
@@ -584,6 +749,7 @@ def test_adapter_resume_from_published_and_extracted_without_republishing(tmp_pa
     client2 = ResumeClient(repo); adapter2 = FacebookPublisherAdapter(settings, repo, client2)
     result2 = asyncio.run(adapter2.complete(job_id=second))
     assert result2.success and client2.calls == ["comment"]
+    assert client2.comment_post_urls == ["https://www.facebook.com/posts/123"]
 
 
 def test_comment_failure_retry_path_does_not_include_republishing() -> None:
@@ -596,18 +762,21 @@ def test_comment_failure_retry_path_does_not_include_republishing() -> None:
 
 def test_manual_gate_edit_saves_exact_text_and_never_clicks(tmp_path: Path) -> None:
     settings = make_settings(tmp_path); repo = make_repo(settings); job_id = approved_job(repo)
+    original_text = valid_post_text(settings, repo, job_id)
+    edited_text = original_text + "\n#DaKiemTra"
     resolver = FakeResolver(); client = PublishClient(
         settings, repo, FakeChrome(), resolver=resolver,
         confirmation_provider=lambda _: "3",
-        edit_provider=lambda: "Nội dung chỉnh sửa\nGiữ Unicode tiếng Việt",
+        edit_provider=lambda: edited_text,
     )
     image = make_png(tmp_path / "edit.png")
     asyncio.run(client.prepare_post(
-        target_url=settings.facebook_target_url, post_text="Nội dung ban đầu",
+        target_url=settings.facebook_target_url, post_text=original_text,
         image_paths=[image], job_id=job_id,
     ))
     result = asyncio.run(client.publish_prepared_post(job_id=job_id))
     assert not result.success and resolver.items["facebook.publish_button"].clicked == 0
     job = repo.get_job(job_id)
     assert job.status is WorkflowStatus.APPROVED
-    assert Path(job.data["facebook_post_text_path"]).read_text(encoding="utf-8") == job.data["facebook_post_text"]
+    assert Path(job.data["facebook_post_text_path"]).read_text(encoding="utf-8") == edited_text
+    assert job.data["facebook_post_text"] == edited_text

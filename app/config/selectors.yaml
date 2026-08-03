@@ -154,11 +154,15 @@ cdha:
     - text: Độ tin cậy
   key_findings:
     - css: '[data-testid="key-findings"]'
+    - css: '[data-key="cdha.key_findings"]'
+    - css: '[data-field="key_findings"]'
     - text: "Key findings:"
     - text: Key findings
     - text: Phát hiện chính
   impression:
     - css: '[data-testid="impression"]'
+    - css: '[data-key="cdha.impression"]'
+    - css: '[data-field="impression"]'
     - text: "Impression:"
     - text: Impression
     - text: Nhận định
@@ -182,8 +186,15 @@ cdha:
     - text: Ghi chú lâm sàng
     - text: Ghi chú
   share_button:
+    - css: 'button:has-text("Chia sẻ ➔ Hội chẩn")'
+    - text: Chia sẻ hội chẩn
+    - text: Share consultation
+    - css: 'button:has-text("Chia sẻ")'
     - text: Chia sẻ
     - text: Share
+    - role: button
+      name: Chia sẻ hội chẩn
+      exact: false
     - role: button
       name: Chia sẻ
       exact: false
@@ -191,7 +202,10 @@ cdha:
       name: Share
       exact: false
   consultation:
-    - text: Hội chẩn
+    - css: 'button:has-text("Chia sẻ ➔ Hội chẩn")'
+    - text: Chia sẻ hội chẩn
+    - text: Share consultation
+    - css: 'button:has-text("Hội chẩn")'
     - text: Consultation
   consultation_result:
     - css: '[data-testid="consultation-result"]'

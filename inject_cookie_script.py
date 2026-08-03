@@ -1,18 +1,16 @@
 import asyncio
 from pathlib import Path
-from playwright.async_api import async_playwright
-
 import json
+
+from app.browser.facebook_browser_manager import FacebookBrowserManager
+from app.config.settings import PROJECT_ROOT
 
 
 async def inject_cookie():
-    profile_dir = "/media/nguyen-son-minh/p5/MinhDang/runtime/chrome_profiles/cdha_automation"
-    Path(profile_dir).mkdir(parents=True, exist_ok=True)
-    
     cookies = []
     
     # Check for Gemini JSON cookie
-    gemini_path = Path("/media/nguyen-son-minh/p5/MinhDang/Cookie_Gemini.txt")
+    gemini_path = PROJECT_ROOT / "Cookie_Gemini.txt"
     if gemini_path.exists():
         try:
             gemini_cookies = json.loads(gemini_path.read_text())
@@ -39,7 +37,7 @@ async def inject_cookie():
             print(f"Failed to parse Gemini cookies: {e}")
             
     # Check for CDHA JSON cookie
-    cdha_path = Path("/media/nguyen-son-minh/p5/MinhDang/Cookie_CDHA.txt")
+    cdha_path = PROJECT_ROOT / "Cookie_CDHA.txt"
     if cdha_path.exists():
         try:
             cdha_cookies = json.loads(cdha_path.read_text())
@@ -68,16 +66,11 @@ async def inject_cookie():
         print("No new cookies to inject.")
         return
 
-    print(f"Injecting {len(cookies)} cookies: {cookies[:2]}...")
-    async with async_playwright() as p:
-        context = await p.chromium.launch_persistent_context(
-            user_data_dir=profile_dir,
-            executable_path="/usr/bin/google-chrome",
-            headless=True
-        )
+    print(f"Injecting {len(cookies)} cookies into the shared Chrome session...")
+    async with FacebookBrowserManager() as manager:
+        context = manager.context
         await context.add_cookies(cookies)
-        print("Cookies injected successfully into Playwright profile!")
-        await context.close()
+        print("Cookies injected successfully into the shared Chrome profile.")
 
 if __name__ == "__main__":
     asyncio.run(inject_cookie())

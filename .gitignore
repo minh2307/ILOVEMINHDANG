@@ -19,6 +19,7 @@ env/
 *Cookies*.json
 
 # Browser Profiles & Playwright/Selenium
+runtime/
 runtime/chrome_profiles/
 chrome_profile/
 chrome_debug_profile/
@@ -73,3 +74,4 @@ node_modules/
 package-lock.json
 
 promt.md
+List_Facebook.txt

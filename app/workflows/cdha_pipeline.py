@@ -62,7 +62,7 @@ _RESUMABLE = frozenset({
 })
 
 
-class CDHAPipeline:
+class VerifiedWorkflowStages:
     """Resumable end-to-end orchestrator for the CDHA medical AI workflow."""
 
     def __init__(
@@ -78,6 +78,8 @@ class CDHAPipeline:
         yes: bool = False,
         confirmation_provider: Callable[[str], str] = input,
         logger: logging.Logger | None = None,
+        auto_continue: bool = True,
+        interactive_review: bool = True,
     ) -> None:
         self.settings = settings
         self.repository = repository
@@ -89,6 +91,8 @@ class CDHAPipeline:
         self.yes = yes
         self.confirmation_provider = confirmation_provider
         self.logger = logger or logging.getLogger("cdha_pipeline")
+        self.auto_continue = auto_continue
+        self.interactive_review = interactive_review
         self._cancelled = False
         self._setup_signal_handlers()
 
@@ -152,6 +156,19 @@ class CDHAPipeline:
                 pending="Inspect Facebook page, then contact operator for resolution",
             )
 
+        if status is WorkflowStatus.WAITING_FOR_AUTH_REVIEW:
+            return self._make_pipeline_result(
+                job_id, False,
+                error="Facebook requires manual authentication review",
+                pending="Complete login/checkpoint/2FA in the existing browser session, then resume",
+            )
+
+        if status is WorkflowStatus.BLOCKED:
+            return self._make_pipeline_result(
+                job_id, False, error="Job is blocked and will not retry automatically",
+                pending="Inspect the latest database event and resolve the blocking condition",
+            )
+
         # Route to correct resume point
         if status in {
             WorkflowStatus.CREATED, WorkflowStatus.DOWNLOADREEL_RUNNING,
@@ -180,19 +197,20 @@ class CDHAPipeline:
             self.repository.transition(job_id, WorkflowStatus.WAITING_FOR_REVIEW)
             return self._make_pipeline_result(
                 job_id, False,
-                pending="Run: python main.py --review-job " + job_id,
+                pending="Run: python main.py review --job-id " + job_id,
             )
 
         if status is WorkflowStatus.WAITING_FOR_REVIEW:
             return self._make_pipeline_result(
                 job_id, False,
-                pending="Run: python main.py --review-job " + job_id,
+                pending="Run: python main.py review --job-id " + job_id,
             )
 
         if status in {
             WorkflowStatus.APPROVED,
             WorkflowStatus.FACEBOOK_PUBLISH_FAILED,
             WorkflowStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW,
+            WorkflowStatus.FACEBOOK_PUBLISHING,
         }:
             return await self._step_facebook(job_id)
 
@@ -223,6 +241,9 @@ class CDHAPipeline:
         job = self.repository.get_job(job_id)
         if job is None:
             return PipelineResult(False, job_id, "UNKNOWN", error="Job not found")
+
+        if job.status is WorkflowStatus.FACEBOOK_PUBLISHING:
+            return await self.execute_facebook_reconciliation_stage(job_id)
         status = job.status
         # Steps before review
         if status in {WorkflowStatus.CREATED, WorkflowStatus.DOWNLOADREEL_FAILED,
@@ -248,7 +269,7 @@ class CDHAPipeline:
         # At review now
         return self._make_pipeline_result(
             job_id, False,
-            pending="Run: python main.py --review-job " + job_id,
+            pending="Run: python main.py review --job-id " + job_id,
         )
 
     async def continue_after_approval(self, *, job_id: str) -> PipelineResult:
@@ -262,6 +283,50 @@ class CDHAPipeline:
                 error=f"continue-after-approval requires APPROVED; got {job.status.value}",
             )
         return await self._step_facebook(job_id)
+
+    # Stable one-stage API used by the application orchestration layer. The
+    # historical private methods remain implementation details of this adapter.
+    async def execute_download_stage(self, job_id: str) -> PipelineResult:
+        return await self._step_download(job_id)
+
+    async def execute_ai_stage(self, job_id: str) -> PipelineResult:
+        return await self._step_ai(job_id)
+
+    async def execute_cdha_stage(self, job_id: str) -> PipelineResult:
+        return await self._step_cdha(job_id)
+
+    async def execute_screenshot_stage(self, job_id: str) -> PipelineResult:
+        return await self._step_screenshots(job_id)
+
+    async def execute_facebook_stage(self, job_id: str) -> PipelineResult:
+        return await self._step_facebook(job_id)
+
+    async def execute_permalink_stage(self, job_id: str) -> PipelineResult:
+        return await self._step_permalink(job_id)
+
+    async def execute_comment_stage(self, job_id: str) -> PipelineResult:
+        return await self._step_comment(job_id)
+
+    async def execute_facebook_reconciliation_stage(self, job_id: str) -> PipelineResult:
+        chrome = await self._get_chrome()
+        resolver = SelectorResolver(self.settings.selectors_path)
+        client = FacebookWebClient(
+            self.settings,
+            self.repository,
+            chrome,
+            resolver=resolver,
+            confirmation_provider=self.confirmation_provider,
+        )
+        adapter = FacebookPublisherAdapter(self.settings, self.repository, client)
+        reconciled = await adapter.reconcile_publication(job_id=job_id)
+        if not reconciled.success:
+            return self._make_pipeline_result(
+                job_id,
+                False,
+                error=reconciled.error or "Facebook publication outcome is uncertain",
+                pending="Inspect the existing Facebook session; do not publish again",
+            )
+        return self._make_pipeline_result(job_id, True)
 
     # ------------------------------------------------------------------
     # Private pipeline steps (each delegates to accepted adapters)
@@ -278,8 +343,10 @@ class CDHAPipeline:
             return self._make_pipeline_result(
                 job_id, False,
                 error=result.error or "DownloadReel failed",
-                pending="Retry with: python main.py --retry-job " + job_id,
+                pending="Retry with: python main.py retry --job-id " + job_id,
             )
+        if not self.auto_continue:
+            return self._make_pipeline_result(job_id, True)
         return await self._step_ai(job_id)
 
     async def _step_ai(self, job_id: str) -> PipelineResult:
@@ -298,6 +365,8 @@ class CDHAPipeline:
             cf_path = Path(job.data.get("clinical_factors_path", ""))
             if cf_path.is_file() and cf_path.read_text().strip():
                 self.logger.info("Clinical factors already exist, skipping AI step.", extra={"job_id": job_id})
+                if not self.auto_continue:
+                    return self._make_pipeline_result(job_id, True)
                 return await self._step_cdha(job_id)
 
         self.repository.transition(
@@ -365,6 +434,8 @@ class CDHAPipeline:
                     "ai_differential_diagnosis": result.differential_diagnosis,
                 },
             )
+            if not self.auto_continue:
+                return self._make_pipeline_result(job_id, True)
             return await self._step_cdha(job_id)
 
         except Exception as exc:
@@ -380,7 +451,7 @@ class CDHAPipeline:
             return self._make_pipeline_result(
                 job_id, False,
                 error=error,
-                pending="Check Ollama and retry: python main.py --retry-job " + job_id,
+                pending="Check Ollama and retry: python main.py retry --job-id " + job_id,
             )
 
     async def _step_cdha(self, job_id: str) -> PipelineResult:
@@ -411,8 +482,10 @@ class CDHAPipeline:
             return self._make_pipeline_result(
                 job_id, False,
                 error=result.error or "CDHA step failed",
-                pending="Retry: python main.py --retry-job " + job_id,
+                pending="Retry: python main.py retry --job-id " + job_id,
             )
+        if not self.auto_continue:
+            return self._make_pipeline_result(job_id, True)
         return await self._step_screenshots(job_id)
 
     async def _step_screenshots(self, job_id: str) -> PipelineResult:
@@ -427,6 +500,12 @@ class CDHAPipeline:
         if self.repository.get_job(job_id).status is WorkflowStatus.SCREENSHOTS_CAPTURED:
             self.repository.transition(job_id, WorkflowStatus.WAITING_FOR_REVIEW)
 
+        if not self.interactive_review:
+            return self._make_pipeline_result(
+                job_id, True,
+                pending="Run: python main.py review --job-id " + job_id,
+            )
+
         # Enter interactive review loop — user can act immediately without a separate command
         review_svc = ReviewService(self.settings, self.repository)
         while True:
@@ -439,7 +518,7 @@ class CDHAPipeline:
                 )
                 return self._make_pipeline_result(
                     job_id, False,
-                    pending="Run: python main.py --review-job " + job_id,
+                    pending="Run: python main.py review --job-id " + job_id,
                 )
 
             if decision.action == "approved":
@@ -464,13 +543,13 @@ class CDHAPipeline:
             if decision.action == "resume_later":
                 return self._make_pipeline_result(
                     job_id, False,
-                    pending="Run: python main.py --review-job " + job_id,
+                    pending="Run: python main.py review --job-id " + job_id,
                 )
 
             # Unknown action — treat as resume later
             return self._make_pipeline_result(
                 job_id, False,
-                pending="Run: python main.py --review-job " + job_id,
+                pending="Run: python main.py review --job-id " + job_id,
             )
 
     async def _step_facebook(self, job_id: str) -> PipelineResult:
@@ -497,13 +576,19 @@ class CDHAPipeline:
             return PipelineResult(False, job_id, "UNKNOWN", error="Job not found")
 
         # Prepare if not yet done
-        if job.status is WorkflowStatus.APPROVED:
+        if job.status in {
+            WorkflowStatus.APPROVED,
+            WorkflowStatus.FACEBOOK_PUBLISH_FAILED,
+            WorkflowStatus.RETRY_PENDING,
+        }:
             prepared = await adapter.prepare(job_id=job_id)
             if not prepared.success:
                 return self._make_pipeline_result(
                     job_id, False, error=prepared.error or "Facebook preparation failed",
-                    pending="Retry: python main.py --prepare-facebook-post " + job_id,
+                    pending="Retry: python main.py resume --job-id " + job_id,
                 )
+            if not self.auto_continue:
+                return self._make_pipeline_result(job_id, True)
 
         # Publish (requires operator confirmation inside publish_prepared_post)
         if self.repository.get_job(job_id).status is WorkflowStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW:
@@ -511,8 +596,11 @@ class CDHAPipeline:
             if not published.success:
                 return self._make_pipeline_result(
                     job_id, False, error=published.error or "Facebook publish failed",
-                    pending="Run: python main.py --publish-facebook " + job_id,
+                    pending="Run: python main.py confirm-publish --job-id " + job_id,
                 )
+
+            if not self.auto_continue:
+                return self._make_pipeline_result(job_id, True)
 
         return await self._step_permalink(job_id)
 
@@ -528,8 +616,10 @@ class CDHAPipeline:
         if not result.success:
             return self._make_pipeline_result(
                 job_id, False, error=result.error or "Permalink extraction failed",
-                pending="Retry: python main.py --extract-facebook-link " + job_id,
+                pending="Retry: python main.py resume --job-id " + job_id,
             )
+        if not self.auto_continue:
+            return self._make_pipeline_result(job_id, True)
         return await self._step_comment(job_id)
 
     async def _step_comment(self, job_id: str) -> PipelineResult:
@@ -561,7 +651,7 @@ class CDHAPipeline:
         if not result.success:
             return self._make_pipeline_result(
                 job_id, False, error=result.error or "Permalink comment failed",
-                pending="Retry: python main.py --comment-facebook-link " + job_id,
+                pending="Retry: python main.py resume --job-id " + job_id,
             )
         return self._make_pipeline_result(job_id, True)
 
@@ -735,10 +825,15 @@ class CDHAPipeline:
             loop = asyncio.get_event_loop()
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, self._handle_shutdown)
-        except Exception:
-            pass  # Not in async context yet; handlers added at launch
+        except (RuntimeError, NotImplementedError, ValueError):
+            self.logger.debug("Signal handlers are unavailable in this runtime")
 
     def _handle_shutdown(self) -> None:
         self._cancelled = True
         self.logger.warning("Shutdown signal received; pipeline will pause safely.")
-        print("\nWorkflow paused safely. Resume with: python main.py --resume-job <JOB_ID>")
+        print("\nWorkflow paused safely. Resume with: python main.py resume --job-id <JOB_ID>")
+
+
+# Backward-compatible class name for retained tests and legacy imports. The
+# official composition root imports ``VerifiedWorkflowStages`` directly.
+CDHAPipeline = VerifiedWorkflowStages

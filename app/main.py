@@ -16,10 +16,10 @@ from app.browser.gemini_client import GeminiWebClient
 from app.browser.facebook_client import FacebookWebClient
 from app.browser.selector_resolver import SelectorResolver
 from app.logging_setup import configure_logging
+from app.legacy_cli import resolve_legacy_command
 from app.models.workflow import WorkflowStatus
 from app.repositories.job_repository import JobRepository
 from app.services.review_service import ReviewService
-from app.workflows.cdha_pipeline import CDHAPipeline
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -74,14 +74,72 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Validate without performing external actions.")
     parser.add_argument("--yes", action="store_true",
                         help="Skip non-medical prompts. Never bypasses review or Facebook gate.")
+
+    commands = parser.add_subparsers(dest="command", title="official commands")
+    commands.add_parser(
+        "config", help="Inspect the authoritative runtime configuration safely."
+    )
+    create = commands.add_parser("create-job", help="Persist and queue a workflow job.")
+    create.add_argument("--url", required=True, help="Facebook Reel URL")
+    create.add_argument("--force", action="store_true", help="Create a new job despite a duplicate URL.")
+
+    status = commands.add_parser("status", help="Show one workflow job, events, and queue items.")
+    status.add_argument("--job-id", required=True)
+
+    resume = commands.add_parser("resume", help="Queue one resumable workflow job.")
+    resume.add_argument("--job-id", required=True)
+
+    retry = commands.add_parser("retry", help="Move a failed job to RETRY_PENDING and queue it.")
+    retry.add_argument("--job-id", required=True)
+
+    cancel = commands.add_parser("cancel", help="Cancel a workflow job safely.")
+    cancel.add_argument("--job-id", required=True)
+
+    review = commands.add_parser("review", help="Run the medical review gate, then queue approved work.")
+    review.add_argument("--job-id", required=True)
+
+    publish = commands.add_parser(
+        "confirm-publish", help="Explicitly confirm and queue the Facebook publish action."
+    )
+    publish.add_argument("--job-id", required=True)
+
+    worker = commands.add_parser("worker", help="Run the single official durable worker.")
+    worker.add_argument("--once", action="store_true", help="Process at most one queue item.")
+    worker.add_argument("--preflight-only", action="store_true")
+
+    orchestrator = commands.add_parser(
+        "orchestrator", help="Schedule eligible persisted workflow jobs."
+    )
+    orchestrator.add_argument("--once", action="store_true")
+    orchestrator.add_argument("--interval", type=float, default=5.0)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    settings = Settings.from_env()
+    try:
+        settings = Settings.from_env()
+    except ValueError as exc:
+        print(json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False))
+        return 2
     settings.ensure_runtime_directories()
     configure_logging(settings)
+
+    if args.command:
+        return _run_official_command(args, settings)
+
+    legacy = resolve_legacy_command(args)
+    if legacy is not None:
+        if legacy.error:
+            print(legacy.error, file=sys.stderr)
+            return 2
+        print(
+            f"Deprecated: {legacy.flag}; use `{legacy.official_syntax}`.",
+            file=sys.stderr,
+        )
+        official_args = build_parser().parse_args(list(legacy.official_argv))
+        return _run_official_command(official_args, settings)
+
     repository = JobRepository(settings.database_path)
     repository.initialize()
 
@@ -122,20 +180,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.cancel_job:
-        job = repository.get_job(args.cancel_job)
-        if job is None:
-            print(f"Job not found: {args.cancel_job}")
-            return 1
-        try:
-            repository.transition(
-                args.cancel_job, WorkflowStatus.CANCELLED,
-                details={"cancelled_by": "operator", "reason": "explicit cancel command"},
-            )
-            print(f"Job {args.cancel_job} cancelled. Artifacts are preserved.")
-            return 0
-        except Exception as exc:
-            print(json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False))
-            return 1
+        official = build_parser().parse_args(
+            ["cancel", "--job-id", args.cancel_job]
+        )
+        return _run_official_command(official, settings)
 
     if args.retry_job:
         return _run_retry_job(args.retry_job, settings, repository)
@@ -214,6 +262,179 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def _run_official_command(
+    args: argparse.Namespace, settings: Settings
+) -> int:
+    """Execute the supported post-convergence CLI without direct browser logic."""
+    from app.bootstrap import DependencyContainer
+
+    if args.command == "config":
+        payload = settings.sanitized_runtime_configuration()
+        payload["configuration_fingerprint"] = settings.configuration_fingerprint()
+        errors: list[str] = []
+        try:
+            settings.validate()
+            settings.inspect_facebook_cookie()
+        except ValueError as exc:
+            errors.append(str(exc))
+        payload["valid"] = not errors
+        payload["errors"] = errors
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0 if not errors else 1
+
+    if args.command == "create-job":
+        try:
+            container = DependencyContainer(settings)
+            result = asyncio.run(container.create_job.execute(args.url, force=args.force))
+            print(json.dumps({
+                "success": result.success,
+                "job_id": result.job_id,
+                "status": result.data.get("workflow_status"),
+                "reused": result.data.get("reused", False),
+                "queued": result.data.get("queued", False),
+            }, ensure_ascii=False, indent=2))
+            return 0 if result.success else 1
+        except (LookupError, ValueError) as exc:
+            print(json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False))
+            return 2
+
+    if args.command == "status":
+        container = DependencyContainer(settings)
+        result = asyncio.run(container.get_job_status.execute(args.job_id))
+        output = result.data if result.success else {
+            "job_id": result.job_id, "error": result.error,
+        }
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+        return 0 if result.success else 1
+
+    if args.command == "retry":
+        container = DependencyContainer(settings)
+        result = asyncio.run(
+            container.retry_job.execute(args.job_id, requested_by="cli")
+        )
+        print(json.dumps({
+            "success": result.success,
+            "job_id": result.job_id,
+            "status": result.data.get("workflow_status"),
+            "queued": result.data.get("queued", False),
+            "error": result.error,
+        }, ensure_ascii=False))
+        return 0 if result.success else 1
+
+    if args.command == "resume":
+        container = DependencyContainer(settings)
+        result = asyncio.run(container.resume_job.execute(args.job_id))
+        print(json.dumps({
+            "success": result.success,
+            "job_id": result.job_id,
+            "status": result.data.get("workflow_status"),
+            "queued": result.data.get("queued", False),
+            "error": result.error,
+        }, ensure_ascii=False))
+        return 0 if result.success else 1
+
+    if args.command == "cancel":
+        container = DependencyContainer(settings)
+        result = asyncio.run(container.cancel_job.execute(args.job_id))
+        print(json.dumps({
+            "success": result.success,
+            "job_id": result.job_id,
+            "status": result.data.get("workflow_status"),
+            "error": result.error,
+        }, ensure_ascii=False))
+        return 0 if result.success else 1
+
+    if args.command == "review":
+        container = DependencyContainer(settings)
+        try:
+            result = asyncio.run(container.review_job.execute(args.job_id))
+        except (LookupError, ValueError, EOFError) as exc:
+            print(json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False))
+            return 2
+        print(json.dumps({
+            "success": result.success,
+            "decision": result.data.get("decision"),
+            "status": result.data.get("workflow_status"),
+            "queued": result.data.get("queued", False),
+            "error": result.error,
+        }, ensure_ascii=False))
+        return int(result.data.get("exit_code", 0)) if result.success else 1
+
+    if args.command == "confirm-publish":
+        container = DependencyContainer(settings)
+        expected = container.confirm_publish.expected_phrase(args.job_id)
+        confirmation = input(
+            f"Type '{expected}' to authorize the final publish action: "
+        )
+        result = asyncio.run(
+            container.confirm_publish.execute(args.job_id, confirmation=confirmation)
+        )
+        print(json.dumps({
+            "success": result.success,
+            "job_id": result.job_id,
+            "queued": result.data.get("queued", False),
+            "error": result.error,
+        }, ensure_ascii=False))
+        return 0 if result.success else 1
+
+    if args.command == "worker":
+        from dataclasses import asdict
+        from app.config.facebook_browser import FacebookBrowserConfig
+        from app.preflight import PreflightError, run_preflight
+
+        try:
+            report = run_preflight(
+                settings, FacebookBrowserConfig.from_settings(settings)
+            )
+            print(json.dumps(asdict(report), ensure_ascii=False))
+            if args.preflight_only:
+                return 0
+            container = DependencyContainer(settings)
+            if args.once:
+                asyncio.run(container.worker.start_once())
+            else:
+                asyncio.run(container.worker.start())
+            return 0
+        except PreflightError as exc:
+            print(json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False))
+            return 2
+
+    if args.command == "orchestrator":
+        container = DependencyContainer(settings)
+
+        async def schedule() -> None:
+            while True:
+                count = await container.scheduler.schedule_once()
+                print(json.dumps({"scheduled": count}, ensure_ascii=False))
+                if args.once:
+                    return
+                await asyncio.sleep(max(0.1, args.interval))
+
+        asyncio.run(schedule())
+        return 0
+
+    raise AssertionError(f"Unhandled command: {args.command}")
+
+
+def _schedule_one(settings: Settings, job_id: str) -> int:
+    from app.bootstrap import DependencyContainer
+
+    try:
+        container = DependencyContainer(settings)
+        queued = asyncio.run(container.scheduler.schedule_job(job_id))
+        job = container.job_repository.get_job(job_id)
+        print(json.dumps({
+            "success": True,
+            "job_id": job_id,
+            "status": job.status.value if job else "UNKNOWN",
+            "queued": queued,
+        }, ensure_ascii=False))
+        return 0
+    except (LookupError, ValueError) as exc:
+        print(json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False))
+        return 2
+
+
 # ---------------------------------------------------------------------------
 # Phase 5 pipeline runner
 # ---------------------------------------------------------------------------
@@ -221,9 +442,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 async def _run_pipeline_command(
     args: argparse.Namespace, settings: Settings, repository: JobRepository
 ) -> int:
+    from app.workflows.cdha_pipeline import VerifiedWorkflowStages
+
     resolver = SelectorResolver(settings.selectors_path, save_html=settings.save_diagnostic_html)
     async with ChromeManager(settings) as chrome:
-        pipeline = CDHAPipeline(
+        pipeline = VerifiedWorkflowStages(
             settings, repository,
             chrome=chrome,
             force_download=args.force_download,
@@ -359,47 +582,19 @@ def _run_check_config(settings: Settings, repository: JobRepository) -> int:
 # ---------------------------------------------------------------------------
 
 def _run_retry_job(job_id: str, settings: Settings, repository: JobRepository) -> int:
-    job = repository.get_job(job_id)
-    if job is None:
-        print(f"Job not found: {job_id}")
-        return 1
-    # Map failed state to retry step
-    _retry_map = {
-        WorkflowStatus.DOWNLOADREEL_FAILED: "download",
-        WorkflowStatus.GEMINI_FAILED: "gemini",
-        WorkflowStatus.AI_FAILED: "ai",
-        WorkflowStatus.NEEDS_GEMINI_LOGIN: "gemini",
-        WorkflowStatus.CDHA_FAILED: "cdha",
-        WorkflowStatus.NEEDS_CDHA_LOGIN: "cdha",
-        WorkflowStatus.FACEBOOK_PUBLISH_FAILED: "facebook_prepare",
-        WorkflowStatus.POST_URL_EXTRACTION_FAILED: "facebook_permalink",
-        WorkflowStatus.COMMENT_FAILED: "facebook_comment",
-    }
-    if job.status not in _retry_map and job.status is not WorkflowStatus.RETRY_PENDING:
-        print(json.dumps({
-            "success": False,
-            "error": f"Job {job_id} is not in a retryable state: {job.status.value}",
-        }, ensure_ascii=False))
-        return 1
-    retry_step = _retry_map.get(job.status, job.data.get("retry_step", ""))
-    if job.status is not WorkflowStatus.RETRY_PENDING:
-        repository.transition(
-            job_id, WorkflowStatus.RETRY_PENDING,
-            details={"retry_step": retry_step, "triggered_by": "retry_command"},
-        )
-    try:
-        return asyncio.run(_run_retry_async(job_id, retry_step, settings, repository))
-    except (LookupError, ValueError, ProfileInUseError) as exc:
-        print(json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False))
-        return 2
+    del repository
+    official = build_parser().parse_args(["retry", "--job-id", job_id])
+    return _run_official_command(official, settings)
 
 
 async def _run_retry_async(
     job_id: str, retry_step: str, settings: Settings, repository: JobRepository
 ) -> int:
+    from app.workflows.cdha_pipeline import VerifiedWorkflowStages
+
     resolver = SelectorResolver(settings.selectors_path, save_html=settings.save_diagnostic_html)
     async with ChromeManager(settings) as chrome:
-        pipeline = CDHAPipeline(settings, repository, chrome=chrome)
+        pipeline = VerifiedWorkflowStages(settings, repository, chrome=chrome)
         result = await pipeline._route_retry(job_id, retry_step)
     print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
     return 0 if result.success else 1
@@ -548,9 +743,9 @@ async def _run_review_retry(
                     job_id=job_id,
                 )
             else:
-                # Retry local Ollama via CDHAPipeline helper
-                from app.workflows.cdha_pipeline import CDHAPipeline
-                pipeline = CDHAPipeline(settings, repository, chrome=chrome)
+                # Retained compatibility helper; official CLI uses RetryJobUseCase.
+                from app.workflows.cdha_pipeline import VerifiedWorkflowStages
+                pipeline = VerifiedWorkflowStages(settings, repository, chrome=chrome)
                 ai_result = await pipeline._step_ai(job_id)
                 if not ai_result.success:
                     print(json.dumps(ai_result.to_dict(), ensure_ascii=False, indent=2))

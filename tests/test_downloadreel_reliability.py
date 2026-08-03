@@ -25,7 +25,7 @@ from app.services.reel_normalization import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LEGACY_DIR = ROOT / "dowloadReelFB"
+LEGACY_DIR = ROOT / "app/infrastructure/legacy/dowloadReelFB"
 if str(LEGACY_DIR) not in sys.path:
     sys.path.insert(0, str(LEGACY_DIR))
 
@@ -220,6 +220,38 @@ def test_yt_dlp_no_metadata_is_a_failure(tmp_path: Path, monkeypatch: pytest.Mon
 
     assert result.status == "error"
     assert "no metadata" in result.error_msg
+
+
+def test_official_download_mode_does_not_wait_on_isolated_browser_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fb_downloader = importlib.import_module("fb_downloader")
+    video = tmp_path / "real-caption.mp4"
+    video.write_bytes(b"verified-video")
+    downloaded = fb_downloader.VideoInfo(
+        url="https://www.facebook.com/reel/123",
+        title="Can thiệp nang Baker dưới siêu âm.",
+        file_path=str(video),
+        status="done",
+        downloaded_at="2026-07-29T00:00:00+00:00",
+    )
+
+    monkeypatch.setattr(fb_downloader, "download_single", lambda *args, **kwargs: downloaded)
+    monkeypatch.setattr(
+        fb_downloader,
+        "ReelScraper",
+        lambda: (_ for _ in ()).throw(AssertionError("isolated queue must not be constructed")),
+    )
+
+    result = fb_downloader.process_and_download_reel(
+        downloaded.url, scrape_browser_metadata=False
+    )
+
+    sidecar = json.loads(video.with_suffix(".json").read_text(encoding="utf-8"))
+    assert result.status == "done"
+    assert sidecar["caption"] == downloaded.title
+    assert sidecar["comments"] == []
+    assert sidecar["metadata_extraction_status"] == "yt_dlp_caption_only"
 
 
 def test_no_output_file_is_not_marked_done(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

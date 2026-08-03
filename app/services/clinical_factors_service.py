@@ -187,6 +187,11 @@ class ClinicalFactorsService:
             failures.append("Response contains prompt-injection or instruction-like content")
 
         normalized_lines = [line.casefold() for line in normalized.splitlines()]
+        missing = [
+            heading
+            for heading in REQUIRED_HEADINGS
+            if not any(line.startswith(heading.casefold()) for line in normalized_lines)
+        ]
         if self._contains_markdown_table(normalized):
             failures.append("Markdown tables are not allowed")
         first_heading = min(

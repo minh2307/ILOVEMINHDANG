@@ -41,8 +41,9 @@ class FacebookPublisherAdapter:
             WorkflowStatus.RETRY_PENDING,
         }:
             raise ValueError(f"Facebook prepare requires APPROVED; got {job.status.value}")
-        if not self.settings.facebook_target_url:
-            raise ValueError("FACEBOOK_TARGET_URL is required")
+        target_url = self.settings.effective_facebook_target_url()
+        if not target_url:
+            raise ValueError("FACEBOOK_TARGET_URL or FACEBOOK_TEST_TARGET_URL is required")
         cdha = job.data.get("cdha_result") or {}
         post_text = self.content.build_post(
             source_url=job.source_url,
@@ -68,7 +69,7 @@ class FacebookPublisherAdapter:
             },
         )
         result = await self.client.prepare_post(
-            target_url=self.settings.facebook_target_url,
+            target_url=target_url,
             post_text=post_text,
             image_paths=images,
             job_id=job_id,
@@ -80,6 +81,9 @@ class FacebookPublisherAdapter:
 
     async def publish(self, *, job_id: str) -> FacebookPublishResult:
         return await self.client.publish_prepared_post(job_id=job_id)
+
+    async def reconcile_publication(self, *, job_id: str) -> FacebookPublishResult:
+        return await self.client.reconcile_interrupted_publication(job_id=job_id)
 
     async def extract_permalink(self, *, job_id: str) -> FacebookPermalinkResult:
         job = self._job(job_id)
@@ -103,12 +107,14 @@ class FacebookPublisherAdapter:
         self.repository.update_data(
             job_id, {"facebook_comment_text_path": str(comment_path), "facebook_comment_text": comment}
         )
-        if not self.settings.facebook_comment_enabled:
+        if not self.settings.facebook_comment_enabled or (
+            self.settings.test_mode and self.settings.test_mode_disable_comment
+        ):
             self.repository.transition(job_id, WorkflowStatus.COMMENT_ADDING)
             result = FacebookCommentResult(
-                True, job_id, job.source_url, comment_text=comment,
+                True, job_id, post_url, comment_text=comment,
                 posted_at=datetime.now(UTC),
-                warnings=["Facebook permalink comments are disabled by configuration"],
+                warnings=["Facebook permalink comments are disabled by configuration or test mode"],
                 reused=True,
             )
             self.repository.transition(
@@ -120,12 +126,18 @@ class FacebookPublisherAdapter:
             return result
         image_path = self.settings.job_data_dir / job_id / "screenshots" / "01-detailed-analysis.png"
         return await self.client.add_permalink_comment(
-            post_url=job.source_url, comment_text=comment, job_id=job_id, image_path=image_path
+            post_url=post_url, comment_text=comment, job_id=job_id, image_path=image_path
         )
 
     async def complete(self, *, job_id: str) -> FacebookWorkflowResult:
         job = self._job(job_id)
         warnings: list[str] = []
+        if job.status is WorkflowStatus.FACEBOOK_PUBLISHING:
+            reconciled = await self.reconcile_publication(job_id=job_id)
+            warnings.extend(reconciled.warnings)
+            if not reconciled.success:
+                return self._workflow_result(job_id, False, warnings, reconciled.error)
+            job = self._job(job_id)
         if job.status in {
             WorkflowStatus.APPROVED,
             WorkflowStatus.FACEBOOK_PUBLISH_FAILED,

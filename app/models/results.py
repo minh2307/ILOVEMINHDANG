@@ -97,6 +97,10 @@ class CDHAAnalysisResult:
     confidence: str | None = None
     key_findings: list[str] = field(default_factory=list)
     impression: str | None = None
+    analysis_url: str = ""
+    source_language: str | None = None
+    raw_key_findings: str | None = None
+    raw_impression: str | None = None
     detailed_analysis: str | None = None
     marked_regions: list[str] = field(default_factory=list)
     raw_text: str = ""
@@ -117,6 +121,10 @@ class CDHAAnalysisResult:
             "confidence": self.confidence,
             "key_findings": list(self.key_findings),
             "impression": self.impression,
+            "analysis_url": self.analysis_url,
+            "source_language": self.source_language,
+            "raw_key_findings": self.raw_key_findings,
+            "raw_impression": self.raw_impression,
             "detailed_analysis": self.detailed_analysis,
             "marked_regions": list(self.marked_regions),
             "raw_text": self.raw_text,
