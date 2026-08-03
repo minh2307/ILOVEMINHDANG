@@ -4,8 +4,13 @@ from app.application.services.facebook_job_dispatcher import FacebookJobDispatch
 from app.application.use_cases.cancel_job_use_case import CancelJobUseCase
 from app.application.use_cases.confirm_publish_use_case import ConfirmPublishUseCase
 from app.application.use_cases.get_job_status_use_case import GetJobStatusUseCase
+from app.application.use_cases.inspect_runtime_use_cases import (
+    InspectBrowserUseCase,
+    InspectQueueUseCase,
+)
 from app.application.use_cases.process_job_use_case import ProcessJobUseCase
 from app.application.use_cases.process_queued_job_use_case import ProcessQueuedJobUseCase
+from app.application.use_cases.reconcile_publish_use_case import ReconcilePublishUseCase
 from app.application.use_cases.resume_job_use_case import ResumeJobUseCase
 from app.application.use_cases.review_job_use_case import ReviewJobUseCase
 from app.application.use_cases.create_job_use_case import CreateJobUseCase
@@ -87,6 +92,10 @@ class DependencyContainer:
         self.get_job_status = GetJobStatusUseCase(
             self.job_repository, self.job_queue
         )
+        self.inspect_browser = InspectBrowserUseCase(
+            self.browser_manager, self.browser_lock
+        )
+        self.inspect_queue = InspectQueueUseCase(self.job_queue)
         self.review_job = ReviewJobUseCase(
             self.job_repository, self.scheduler, ReviewService(settings, self.job_repository).review
         )
@@ -94,6 +103,14 @@ class DependencyContainer:
         self.dispatcher = FacebookJobDispatcher(
             {JobType.PROCESS_WORKFLOW: self.process_queued_job}
         )
+
+        def current_workflow_stage(queue_job) -> str:
+            workflow_job_id = str(
+                queue_job.payload.get("workflow_job_id") or queue_job.job_id
+            )
+            workflow_job = self.job_repository.get_job(workflow_job_id)
+            return workflow_job.status.value if workflow_job else "RUNNING"
+
         self.worker = FacebookBrowserWorker(
             queue=self.job_queue,
             browser_lock=self.browser_lock,
@@ -106,7 +123,9 @@ class DependencyContainer:
             queue_lease_seconds=self.settings.job_lease_seconds,
             queue_heartbeat_seconds=self.settings.job_heartbeat_seconds,
             poll_interval_seconds=self.settings.worker_poll_interval_seconds,
+            stage_timeout_seconds=self.settings.worker_stage_timeout_seconds,
             close_resources=self.browser_manager.close,
+            stage_provider=current_workflow_stage,
             startup_diagnostics={
                 **self.settings.sanitized_runtime_configuration(),
                 "configuration_fingerprint": self.settings.configuration_fingerprint(),

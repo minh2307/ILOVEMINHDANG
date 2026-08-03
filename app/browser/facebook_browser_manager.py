@@ -17,8 +17,15 @@ from urllib.request import urlopen
 
 from app.config.facebook_browser import FacebookBrowserConfig
 from app.config.settings import Settings
+from app.domain.models.browser_health import BrowserHealth, BrowserHealthState
+from app.errors import (
+    BrowserContextClosedError,
+    BrowserDisconnectedError,
+    BrowserPageClosedError,
+    BrowserPageOwnershipError,
+)
 from app.infrastructure.browser.file_browser_lock import BrowserLockUnavailable, FileBrowserLock
-from app.error_events import safe_browser_url
+from app.error_events import safe_browser_url, safe_error_message
 from app.services.privacy_service import PrivacyService
 
 
@@ -66,6 +73,9 @@ class FacebookBrowserManager:
         self._owns_browser_lock = False
         self._privacy = PrivacyService()
         self._started_process: subprocess.Popen[bytes] | None = None
+        self._context_closed = False
+        self._browser_disconnected = False
+        self._owned_pages: dict[int, tuple[Any, str]] = {}
 
     async def __aenter__(self) -> "FacebookBrowserManager":
         await self.start()
@@ -282,9 +292,26 @@ class FacebookBrowserManager:
             if not self.browser.contexts:
                 raise FacebookBrowserError("Shared Chrome has no default browser context")
             self.context = self.browser.contexts[0]
-            timeout = int(getattr(self.settings, "page_timeout_seconds", 60) * 1000)
-            self.context.set_default_timeout(timeout)
-            self.context.set_default_navigation_timeout(timeout)
+            self._context_closed = False
+            self._browser_disconnected = False
+            if hasattr(self.browser, "on"):
+                self.browser.on(
+                    "disconnected",
+                    lambda: setattr(self, "_browser_disconnected", True),
+                )
+            if hasattr(self.context, "on"):
+                self.context.on(
+                    "close", lambda: setattr(self, "_context_closed", True)
+                )
+            action_timeout = int(
+                getattr(self.settings, "browser_action_timeout_seconds", 60) * 1000
+            )
+            navigation_timeout = int(
+                getattr(self.settings, "browser_navigation_timeout_seconds", 60)
+                * 1000
+            )
+            self.context.set_default_timeout(action_timeout)
+            self.context.set_default_navigation_timeout(navigation_timeout)
             from app.browser.facebook_tab_manager import FacebookTabManager
             self.tabs = FacebookTabManager(self.context)
             return self.context
@@ -293,8 +320,126 @@ class FacebookBrowserManager:
             raise
 
     async def new_page(self) -> Any:
+        return await self.acquire_page("compatibility:new_page")
+
+    async def acquire_page(self, purpose: str) -> Any:
         context = await self.start()
-        return await context.new_page()
+        await self.ensure_connected()
+        try:
+            page = await context.new_page()
+        except Exception as exc:
+            raise BrowserContextClosedError(
+                str(exc),
+                phase="BROWSER_SESSION",
+                operation="acquire_page",
+                details={"purpose": purpose},
+            ) from exc
+        self._owned_pages[id(page)] = (page, str(purpose))
+        return page
+
+    async def release_page(self, page: Any) -> bool:
+        owned = self._owned_pages.pop(id(page), None)
+        if owned is None or owned[0] is not page:
+            raise BrowserPageOwnershipError(
+                "Refusing to close a page not owned by the browser manager",
+                phase="BROWSER_SESSION",
+                operation="release_page",
+            )
+        try:
+            if bool(page.is_closed()):
+                return False
+            await page.close()
+            return True
+        except Exception as exc:
+            raise BrowserPageClosedError(
+                str(exc),
+                phase="BROWSER_SESSION",
+                operation="release_page",
+                details={"purpose": owned[1]},
+            ) from exc
+
+    async def get_health(self, page: Any | None = None) -> BrowserHealth:
+        browser_connected = False
+        if self.browser is not None and not self._browser_disconnected:
+            try:
+                connected = getattr(self.browser, "is_connected", None)
+                browser_connected = bool(
+                    connected() if callable(connected) else connected
+                )
+            except Exception:
+                browser_connected = False
+        if not browser_connected:
+            return BrowserHealth(
+                BrowserHealthState.DISCONNECTED,
+                browser_connected=False,
+                context_available=self.context is not None,
+                page_available=None if page is None else False,
+            )
+        if self.context is None or self._context_closed:
+            return BrowserHealth(
+                BrowserHealthState.CONTEXT_CLOSED,
+                browser_connected=True,
+                context_available=False,
+                page_available=None if page is None else False,
+            )
+        if page is not None:
+            try:
+                if bool(page.is_closed()):
+                    return BrowserHealth(
+                        BrowserHealthState.PAGE_CLOSED,
+                        browser_connected=True,
+                        context_available=True,
+                        page_available=False,
+                    )
+            except Exception:
+                return BrowserHealth(
+                    BrowserHealthState.UNKNOWN,
+                    browser_connected=True,
+                    context_available=True,
+                    page_available=None,
+                )
+        current_url = None
+        if page is not None:
+            try:
+                current_url = safe_browser_url(str(page.url))
+            except Exception:
+                current_url = None
+        return BrowserHealth(
+            BrowserHealthState.CONNECTED,
+            browser_connected=True,
+            context_available=True,
+            page_available=None if page is None else True,
+            current_url=current_url,
+        )
+
+    async def ensure_connected(self, page: Any | None = None) -> None:
+        health = await self.get_health(page)
+        if health.state is BrowserHealthState.CONNECTED:
+            return
+        metadata = {
+            "browser_health_state": health.state.value,
+            "current_url": health.current_url,
+        }
+        if health.state is BrowserHealthState.PAGE_CLOSED:
+            raise BrowserPageClosedError(
+                "Browser page is closed",
+                phase="BROWSER_SESSION",
+                operation="ensure_connected",
+                details=metadata,
+            )
+        if health.state is BrowserHealthState.CONTEXT_CLOSED:
+            raise BrowserContextClosedError(
+                "Shared browser context is closed",
+                phase="BROWSER_SESSION",
+                operation="ensure_connected",
+                details=metadata,
+            )
+        raise BrowserDisconnectedError(
+            "Shared browser connection is disconnected",
+            phase="BROWSER_SESSION",
+            operation="ensure_connected",
+            details=metadata,
+        )
 
     async def wait_for_manual_action(self, prompt: str, completion_check: Callable[[], Awaitable[bool]]) -> None:
         print(prompt)
@@ -302,31 +447,104 @@ class FacebookBrowserManager:
         if not await completion_check():
             raise FacebookBrowserError("Manual action was not completed or could not be verified")
 
-    async def save_diagnostics(self, page: Any, output_dir: Path, name: str) -> tuple[Path, Path]:
+    @classmethod
+    def _safe_diagnostic_details(cls, value: Any, *, key: str = "") -> Any:
+        blocked = {
+            "authorization", "access_token", "token", "password",
+            "cookie", "cookies", "storage_state",
+        }
+        if key.casefold() in blocked:
+            return "[REDACTED]"
+        if isinstance(value, dict):
+            return {
+                str(item_key): cls._safe_diagnostic_details(
+                    item_value, key=str(item_key)
+                )
+                for item_key, item_value in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [cls._safe_diagnostic_details(item) for item in value]
+        if isinstance(value, str):
+            return safe_error_message(value)
+        return value
+
+    async def save_diagnostics(
+        self,
+        page: Any,
+        output_dir: Path,
+        name: str,
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> tuple[Path, ...]:
         output_dir.mkdir(parents=True, exist_ok=True)
         screenshot = (output_dir / f"{name}.png").resolve()
         metadata = (output_dir / f"{name}.json").resolve()
-        await page.screenshot(path=str(screenshot), full_page=True)
-        metadata.write_text(json.dumps({"url": safe_browser_url(str(page.url)), "title": self._privacy.mask(await page.title())}, ensure_ascii=False, indent=2), encoding="utf-8")
-        artifact = metadata
-        if getattr(self.settings, "save_diagnostic_html", self.config.save_diagnostic_html):
-            artifact = (output_dir / f"{name}.html").resolve()
-            html = await page.content()
-            html = re.sub(
-                r'(?i)(\b(?:value|data-token|data-access-token)\s*=\s*)(["\']).*?\2',
-                r'\1"[REDACTED]"',
-                html,
-            )
-            artifact.write_text(self._privacy.mask(html), encoding="utf-8")
-        for path in {screenshot, metadata, artifact}:
+        health = await self.get_health(page)
+        page_url = health.current_url
+        if page_url is None:
+            try:
+                page_url = safe_browser_url(str(page.url))
+            except Exception:
+                page_url = None
+        payload: dict[str, Any] = {
+            "browser_health_state": health.state.value,
+            "url": page_url,
+            **self._safe_diagnostic_details(details or {}),
+        }
+        artifacts: list[Path] = []
+        page_closed = health.state is BrowserHealthState.PAGE_CLOSED
+        if not page_closed and hasattr(page, "is_closed"):
+            try:
+                page_closed = bool(page.is_closed())
+            except Exception:
+                page_closed = True
+        html_artifact: Path | None = None
+        if not page_closed:
+            try:
+                payload["title"] = self._privacy.mask(await page.title())
+                await page.screenshot(path=str(screenshot), full_page=True)
+                artifacts.append(screenshot)
+            except Exception as exc:
+                payload["capture_error"] = type(exc).__name__
+            if getattr(
+                self.settings, "save_diagnostic_html", self.config.save_diagnostic_html
+            ):
+                try:
+                    html_artifact = (output_dir / f"{name}.html").resolve()
+                    html = await page.content()
+                    html = re.sub(
+                        r'(?i)(\b(?:value|data-token|data-access-token)\s*=\s*)(["\']).*?\2',
+                        r'\1"[REDACTED]"',
+                        html,
+                    )
+                    html_artifact.write_text(
+                        self._privacy.mask(html), encoding="utf-8"
+                    )
+                    artifacts.append(html_artifact)
+                except Exception as exc:
+                    payload["html_capture_error"] = type(exc).__name__
+        metadata.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        all_artifacts = [*artifacts, metadata]
+        for path in set(all_artifacts):
             path.chmod(0o600)
-        return screenshot, artifact
+        if screenshot in artifacts:
+            return screenshot, html_artifact or metadata
+        return (metadata,)
 
     async def close(self) -> None:
         """Disconnect automation only. Never closes shared browser or default context."""
+        for page, _purpose in list(self._owned_pages.values()):
+            try:
+                await self.release_page(page)
+            except (BrowserPageClosedError, BrowserPageOwnershipError):
+                self._owned_pages.pop(id(page), None)
         self.tabs = None
         self.context = None
         self.browser = None
+        self._context_closed = False
+        self._browser_disconnected = False
         if self.playwright is not None:
             await self.playwright.stop()
             self.playwright = None
@@ -360,6 +578,10 @@ class FacebookBrowserManager:
             return value
         except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError, OSError):
             return None
+
+    def managed_pid(self) -> int | None:
+        """Return only a PID proven to own the canonical profile and CDP port."""
+        return self._read_managed_pid()
 
     @staticmethod
     def _looks_like_chrome_profile_conflict(exc: BaseException) -> bool:

@@ -65,6 +65,12 @@ cdha:
     - css: "input[type=\"file\"]"
   upload_complete_button:
     - css: "#btnComplete"
+    - role: button
+      name: Hoàn tất
+      exact: false
+    - role: button
+      name: Complete
+      exact: false
   view_url_input:
     - css: "#urlInput"
   upload_filename:
@@ -81,6 +87,18 @@ cdha:
     - text: Xác thực hai yếu tố
     - text: CAPTCHA
     - text: Security checkpoint
+  two_factor_markers:
+    - text: Two-factor authentication
+    - text: Xác thực hai yếu tố
+  checkpoint_markers:
+    - text: CAPTCHA
+    - text: Security checkpoint
+  permission_denied:
+    - text: Permission denied
+    - text: Không có quyền truy cập
+  session_expired:
+    - text: Session expired
+    - text: Phiên đăng nhập đã hết hạn
   authenticated_marker:
     - css: 'input[type="file"]'
     - text: Bắt đầu phân tích
@@ -129,6 +147,10 @@ cdha:
     - text: Analyzing
     - css: '[data-analysis-status="running"]'
     - css: '#queueStatus'
+  analysis_queued:
+    - text: Đang chờ phân tích
+    - text: Queued
+    - css: '[data-analysis-status="queued"]'
   analysis_complete:
     - text: Kết quả phân tích
     - text: Analysis Result

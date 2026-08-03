@@ -16,7 +16,12 @@ class JobQueuePort(Protocol):
         ...
 
     async def heartbeat(
-        self, job_id: str, *, worker_id: str, lease_seconds: float = 120.0
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: float = 120.0,
+        current_stage: str | None = None,
     ) -> bool:
         ...
 

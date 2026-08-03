@@ -85,6 +85,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = commands.add_parser("status", help="Show one workflow job, events, and queue items.")
     status.add_argument("--job-id", required=True)
+    commands.add_parser(
+        "inspect-browser",
+        help="Inspect managed browser, CDP, and lock health without launching Chrome.",
+    )
+    commands.add_parser(
+        "inspect-queue",
+        help="Inspect queue stages, leases, and heartbeat metadata safely.",
+    )
 
     resume = commands.add_parser("resume", help="Queue one resumable workflow job.")
     resume.add_argument("--job-id", required=True)
@@ -103,9 +111,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     publish.add_argument("--job-id", required=True)
 
+    reconcile = commands.add_parser(
+        "reconcile-publish", help="Reconcile an uncertain Facebook publication attempt."
+    )
+    reconcile.add_argument("--job-id", required=True)
+
+    pub_status = commands.add_parser(
+        "publication-status", help="Dump current Facebook publication attempt state."
+    )
+    pub_status.add_argument("--job-id", required=True)
+
     worker = commands.add_parser("worker", help="Run the single official durable worker.")
     worker.add_argument("--once", action="store_true", help="Process at most one queue item.")
     worker.add_argument("--preflight-only", action="store_true")
+
+    preflight = commands.add_parser(
+        "preflight", help="Run the authoritative readiness checks."
+    )
+    preflight.add_argument("--mode", choices=("quick", "full"), default="quick")
+    preflight.add_argument("--verbose", action="store_true")
 
     orchestrator = commands.add_parser(
         "orchestrator", help="Schedule eligible persisted workflow jobs."
@@ -122,6 +146,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as exc:
         print(json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False))
         return 2
+    if args.command == "preflight":
+        return _run_official_command(args, settings)
+
     settings.ensure_runtime_directories()
     configure_logging(settings)
 
@@ -268,6 +295,25 @@ def _run_official_command(
     """Execute the supported post-convergence CLI without direct browser logic."""
     from app.bootstrap import DependencyContainer
 
+    if args.command == "preflight":
+        from app.config.facebook_browser import FacebookBrowserConfig
+        from app.preflight import (
+            PreflightError,
+            format_preflight_report,
+            run_preflight,
+        )
+        try:
+            report = run_preflight(
+                settings,
+                FacebookBrowserConfig.from_settings(settings),
+                mode=args.mode,
+            )
+        except PreflightError as exc:
+            print(f"Invalid preflight command: {exc}", file=sys.stderr)
+            return 2
+        print(format_preflight_report(report, verbose=args.verbose))
+        return 1 if report.overall_status == "FAIL" else 0
+
     if args.command == "config":
         payload = settings.sanitized_runtime_configuration()
         payload["configuration_fingerprint"] = settings.configuration_fingerprint()
@@ -305,6 +351,18 @@ def _run_official_command(
             "job_id": result.job_id, "error": result.error,
         }
         print(json.dumps(output, ensure_ascii=False, indent=2))
+        return 0 if result.success else 1
+
+    if args.command == "inspect-browser":
+        container = DependencyContainer(settings)
+        result = asyncio.run(container.inspect_browser.execute())
+        print(json.dumps(result.data, ensure_ascii=False, indent=2))
+        return 0 if result.success else 1
+
+    if args.command == "inspect-queue":
+        container = DependencyContainer(settings)
+        result = asyncio.run(container.inspect_queue.execute())
+        print(json.dumps(result.data, ensure_ascii=False, indent=2))
         return 0 if result.success else 1
 
     if args.command == "retry":
@@ -377,16 +435,63 @@ def _run_official_command(
         }, ensure_ascii=False))
         return 0 if result.success else 1
 
+    if args.command == "reconcile-publish":
+        container = DependencyContainer(settings)
+        
+        async def run_reconcile():
+            from app.browser.chrome_manager import ChromeManager
+            from app.browser.selector_resolver import SelectorResolver
+            from app.browser.facebook_client import FacebookWebClient
+            from app.adapters.facebook_adapter import FacebookPublisherAdapter
+            from app.application.use_cases.reconcile_publish_use_case import ReconcilePublishUseCase
+            
+            resolver = SelectorResolver(settings.selectors_path, save_html=settings.save_diagnostic_html)
+            async with ChromeManager(settings) as chrome:
+                client = FacebookWebClient(settings, container.job_repository, chrome, resolver=resolver)
+                adapter = FacebookPublisherAdapter(settings, container.job_repository, client)
+                use_case = ReconcilePublishUseCase(container.job_repository, adapter)
+                return await use_case.execute(args.job_id)
+                
+        try:
+            result = asyncio.run(run_reconcile())
+            print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+            return 0 if result.success else 1
+        except Exception as exc:
+            print(json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False))
+            return 2
+
+    if args.command == "publication-status":
+        container = DependencyContainer(settings)
+        job = container.job_repository.get_job(args.job_id)
+        if not job:
+            print(json.dumps({"success": False, "error": f"Job not found: {args.job_id}"}))
+            return 1
+            
+        print(json.dumps({
+            "job_id": job.job_id,
+            "status": job.status.value,
+            "facebook_target_url": job.data.get("facebook_target_url"),
+            "facebook_content_hash": job.data.get("facebook_content_hash"),
+            "facebook_post_id": job.data.get("facebook_post_id"),
+            "facebook_post_url": job.data.get("facebook_post_url"),
+            "facebook_publication_started_at": job.data.get("facebook_publication_started_at"),
+            "facebook_error": job.data.get("facebook_error")
+        }, ensure_ascii=False, indent=2))
+        return 0
+
     if args.command == "worker":
-        from dataclasses import asdict
         from app.config.facebook_browser import FacebookBrowserConfig
         from app.preflight import PreflightError, run_preflight
 
         try:
             report = run_preflight(
-                settings, FacebookBrowserConfig.from_settings(settings)
+                settings,
+                FacebookBrowserConfig.from_settings(settings),
+                mode="full",
             )
-            print(json.dumps(asdict(report), ensure_ascii=False))
+            print(json.dumps(report.to_dict(), ensure_ascii=False, default=str))
+            if report.overall_status == "FAIL":
+                return 1
             if args.preflight_only:
                 return 0
             container = DependencyContainer(settings)

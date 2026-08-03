@@ -10,6 +10,7 @@ from app.models.results import (
     FacebookCommentResult,
     FacebookPermalinkResult,
     FacebookPostPreparationResult,
+    FacebookPostValidationResult,
     FacebookPublishResult,
     FacebookWorkflowResult,
 )
@@ -33,7 +34,83 @@ class FacebookPublisherAdapter:
         self.client = client
         self.content = content or PostContentService(settings)
 
+    def validate_job(self, job_id: str) -> FacebookPostValidationResult:
+        job = self._job(job_id)
+        errors = []
+        warnings = []
+        fingerprint = None
+        
+        target_url = self.settings.effective_facebook_target_url()
+        if not target_url:
+            errors.append("FACEBOOK_TARGET_URL or FACEBOOK_TEST_TARGET_URL is required")
+        else:
+            try:
+                target_url = self.content.normalize_target_url(target_url)
+            except Exception as e:
+                errors.append(str(e))
+                
+        if job.status not in {
+            WorkflowStatus.APPROVED,
+            WorkflowStatus.FACEBOOK_PUBLISH_FAILED,
+            WorkflowStatus.RETRY_PENDING,
+            WorkflowStatus.FACEBOOK_PUBLISHING,
+            WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+            WorkflowStatus.WAITING_FOR_AUTH_REVIEW,
+        }:
+            errors.append(f"Job is in an invalid pre-publication state: {job.status.value}")
+
+        if job.status in {WorkflowStatus.COMPLETED, WorkflowStatus.FACEBOOK_PUBLISHED}:
+            errors.append("Job is already completed or published")
+            
+        if job.data.get("facebook_post_id") or job.data.get("facebook_post_url"):
+            errors.append("Job already contains verified post ID or permalink")
+
+        cdha = job.data.get("cdha_result") or {}
+        try:
+            post_text = self.content.build_post(
+                source_url=job.source_url,
+                key_findings=list(cdha.get("key_findings") or []),
+                impression=cdha.get("impression"),
+                clinical_factors=str(job.data.get("clinical_factors") or ""),
+                operator_text=job.data.get("facebook_operator_text"),
+                cdha_view_url=str(job.data.get("cdha_view_url") or ""),
+            )
+        except Exception as e:
+            post_text = ""
+            errors.append(f"Caption validation failed: {str(e)}")
+
+        selected_names = job.data.get("facebook_selected_screenshot_names")
+        try:
+            images, image_warnings = self.content.select_screenshots(
+                job_id, list(selected_names) if selected_names else None
+            )
+            warnings.extend(image_warnings)
+        except Exception as e:
+            images = []
+            errors.append(f"Media validation failed: {str(e)}")
+            
+        if not errors and target_url and post_text and images:
+            try:
+                fingerprint = self.content.content_fingerprint(target_url, post_text, images)
+            except Exception as e:
+                errors.append(f"Fingerprint generation failed: {str(e)}")
+                
+        return FacebookPostValidationResult(
+            valid=len(errors) == 0,
+            errors=tuple(errors),
+            warnings=tuple(warnings),
+            content_fingerprint=fingerprint,
+        )
+
     async def prepare(self, *, job_id: str) -> FacebookPostPreparationResult:
+        validation = self.validate_job(job_id)
+        if not validation.valid:
+            error_msg = "; ".join(validation.errors)
+            self.repository.update_data(job_id, {"facebook_error": error_msg})
+            return FacebookPostPreparationResult(
+                False, job_id, error=error_msg, warnings=list(validation.warnings)
+            )
+            
         job = self._job(job_id)
         if job.status not in {
             WorkflowStatus.APPROVED,

@@ -91,7 +91,11 @@ class Settings:
     cdha_url: str
     page_timeout_seconds: int
     upload_timeout_seconds: int
+    browser_action_timeout_seconds: float
+    browser_navigation_timeout_seconds: float
+    cdha_upload_timeout_seconds: float
     cdha_analysis_timeout_seconds: int
+    cdha_result_timeout_seconds: float
     cdha_poll_interval_seconds: int
     cdha_result_stability_seconds: int
     clinical_factors_max_chars: int
@@ -165,6 +169,7 @@ class Settings:
     browser_startup_timeout_seconds: float
     browser_max_start_attempts: int
     worker_poll_interval_seconds: float
+    worker_stage_timeout_seconds: float
     job_lease_seconds: float
     job_heartbeat_seconds: float
     facebook_state_detection_timeout_seconds: float
@@ -173,6 +178,12 @@ class Settings:
     facebook_max_retries: int
     facebook_save_debug_artifacts: bool
     facebook_manual_auth_timeout_seconds: int
+    preflight_ollama_timeout_seconds: float
+    preflight_browser_start_timeout_seconds: float
+    preflight_facebook_timeout_seconds: float
+    preflight_cdha_timeout_seconds: float
+    preflight_selector_timeout_seconds: float
+    preflight_report_dir: Path
 
     @classmethod
     def from_env(cls, env_file: Path | None = None) -> "Settings":
@@ -224,7 +235,19 @@ class Settings:
             ).strip(),
             page_timeout_seconds=_int_env("PAGE_TIMEOUT_SECONDS", 60),
             upload_timeout_seconds=_int_env("UPLOAD_TIMEOUT_SECONDS", 180),
+            browser_action_timeout_seconds=_float_env(
+                "BROWSER_ACTION_TIMEOUT_SECONDS", 60, 0.001
+            ),
+            browser_navigation_timeout_seconds=_float_env(
+                "BROWSER_NAVIGATION_TIMEOUT_SECONDS", 60, 0.001
+            ),
+            cdha_upload_timeout_seconds=_float_env(
+                "CDHA_UPLOAD_TIMEOUT_SECONDS", 180, 0.001
+            ),
             cdha_analysis_timeout_seconds=_int_env("CDHA_ANALYSIS_TIMEOUT_SECONDS", 900),
+            cdha_result_timeout_seconds=_float_env(
+                "CDHA_RESULT_TIMEOUT_SECONDS", 120, 0.001
+            ),
             cdha_poll_interval_seconds=_int_env("CDHA_POLL_INTERVAL_SECONDS", 3),
             cdha_result_stability_seconds=_int_env("CDHA_RESULT_STABILITY_SECONDS", 5),
             clinical_factors_max_chars=_int_env(
@@ -323,6 +346,9 @@ class Settings:
             ),
             browser_max_start_attempts=_int_env("FACEBOOK_MAX_START_ATTEMPTS", 2, 1),
             worker_poll_interval_seconds=_float_env("WORKER_POLL_INTERVAL_SECONDS", 1, 0.05),
+            worker_stage_timeout_seconds=_float_env(
+                "WORKER_STAGE_TIMEOUT_SECONDS", 1200, 0.001
+            ),
             job_lease_seconds=_float_env("JOB_LEASE_SECONDS", 240, 3),
             job_heartbeat_seconds=_float_env("JOB_HEARTBEAT_SECONDS", 30, 1),
             facebook_state_detection_timeout_seconds=_float_env("FACEBOOK_STATE_DETECTION_TIMEOUT_SECONDS", 15, 0.1),
@@ -331,6 +357,24 @@ class Settings:
             facebook_max_retries=_int_env("FACEBOOK_MAX_RETRIES", 3, 0),
             facebook_save_debug_artifacts=_bool_env("FACEBOOK_SAVE_DEBUG_ARTIFACTS", True),
             facebook_manual_auth_timeout_seconds=_int_env("FACEBOOK_MANUAL_AUTH_TIMEOUT_SECONDS", 900, 1),
+            preflight_ollama_timeout_seconds=_float_env(
+                "PREFLIGHT_OLLAMA_TIMEOUT_SECONDS", 30, 0.1
+            ),
+            preflight_browser_start_timeout_seconds=_float_env(
+                "PREFLIGHT_BROWSER_START_TIMEOUT_SECONDS", 45, 0.1
+            ),
+            preflight_facebook_timeout_seconds=_float_env(
+                "PREFLIGHT_FACEBOOK_TIMEOUT_SECONDS", 30, 0.1
+            ),
+            preflight_cdha_timeout_seconds=_float_env(
+                "PREFLIGHT_CDHA_TIMEOUT_SECONDS", 30, 0.1
+            ),
+            preflight_selector_timeout_seconds=_float_env(
+                "PREFLIGHT_SELECTOR_TIMEOUT_SECONDS", 5, 0.1
+            ),
+            preflight_report_dir=_path_env(
+                "PREFLIGHT_REPORT_DIR", "runtime/diagnostics/preflight"
+            ),
         )
         settings._validate_compatibility_aliases()
         for name in dotenv_added_keys:
@@ -445,7 +489,8 @@ class Settings:
                 "cdp_port": self.browser_cdp_port,
                 "startup_strategy": "managed_chrome_cdp",
                 "startup_timeout_seconds": self.browser_startup_timeout_seconds,
-                "action_timeout_seconds": self.page_timeout_seconds,
+                "action_timeout_seconds": self.browser_action_timeout_seconds,
+                "navigation_timeout_seconds": self.browser_navigation_timeout_seconds,
                 "lock_path": str(self.browser_lock_path),
                 "pid_path": str(self.browser_pid_path),
             },
@@ -469,9 +514,20 @@ class Settings:
                 "facebook_publisher": self.active_facebook_publisher,
                 "cdha": self.active_cdha_adapter,
             },
+            "timeouts": {
+                "browser_action_seconds": self.browser_action_timeout_seconds,
+                "browser_navigation_seconds": self.browser_navigation_timeout_seconds,
+                "cdha_upload_seconds": self.cdha_upload_timeout_seconds,
+                "cdha_analysis_seconds": self.cdha_analysis_timeout_seconds,
+                "cdha_result_seconds": self.cdha_result_timeout_seconds,
+                "queue_lease_seconds": self.job_lease_seconds,
+                "worker_heartbeat_seconds": self.job_heartbeat_seconds,
+                "worker_stage_seconds": self.worker_stage_timeout_seconds,
+            },
             "runtime_directories": {
                 "downloads": str(self.browser_download_dir),
                 "diagnostics": str(self.diagnostic_directory),
+                "preflight_reports": str(self.preflight_report_dir),
                 "screenshots": str(self.screenshot_dir),
                 "logs": str(self.log_dir),
             },
@@ -514,6 +570,21 @@ class Settings:
             missing.append("CDHA_URL is required.")
         if self.job_heartbeat_seconds >= self.job_lease_seconds:
             missing.append("JOB_HEARTBEAT_SECONDS must be less than JOB_LEASE_SECONDS.")
+        positive_timeouts = {
+            "BROWSER_ACTION_TIMEOUT_SECONDS": self.browser_action_timeout_seconds,
+            "BROWSER_NAVIGATION_TIMEOUT_SECONDS": self.browser_navigation_timeout_seconds,
+            "CDHA_UPLOAD_TIMEOUT_SECONDS": self.cdha_upload_timeout_seconds,
+            "CDHA_ANALYSIS_TIMEOUT_SECONDS": self.cdha_analysis_timeout_seconds,
+            "CDHA_RESULT_TIMEOUT_SECONDS": self.cdha_result_timeout_seconds,
+            "QUEUE_LEASE_SECONDS": self.job_lease_seconds,
+            "WORKER_HEARTBEAT_INTERVAL_SECONDS": self.job_heartbeat_seconds,
+            "WORKER_STAGE_TIMEOUT_SECONDS": self.worker_stage_timeout_seconds,
+        }
+        missing.extend(
+            f"{name} must be greater than zero."
+            for name, value in positive_timeouts.items()
+            if value <= 0
+        )
         try:
             self.effective_facebook_target_url()
         except ValueError as exc:
@@ -551,5 +622,6 @@ class Settings:
             self.browser_pid_path.parent,
             self.browser_download_dir,
             self.facebook_cookie_file.parent,
+            self.preflight_report_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)

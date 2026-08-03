@@ -1,3 +1,160 @@
+# Kế hoạch: Xác minh Facebook publishing và chống đăng trùng (Prompt 5)
+
+## Mục tiêu
+
+Triển khai `promt.md` hiện tại: publication chỉ thành công khi có post ID hoặc
+permalink chính xác đã được xác minh; validation bắt buộc trước side effect;
+attempt/fingerprint bền vững chống duplicate và crash; uncertain publication
+phải reconciliation thủ công/an toàn; không publish Facebook thật trong test.
+
+## Nguyên tắc an toàn
+
+- Bảo toàn toàn bộ thay đổi Prompt 1–4 chưa commit và dữ liệu runtime.
+- Không xóa/chỉnh database, profile, cookie, log, lock sống hoặc artifact gốc.
+- Không thực hiện live publish khi chưa có Full readiness và quyền rõ ràng.
+- Không xem click/dialog đóng/navigation/timeout là bằng chứng published.
+- Không auto-retry attempt ở `SUBMITTING`/`SUBMITTED_UNCONFIRMED`.
+- Root cause phải dựa trên persisted evidence và call chain; có test đỏ trước fix.
+
+## Các giai đoạn
+
+- [ ] **Pha 1 — Evidence và call graph:** đọc trọn Prompt 5, inventory publisher,
+  persisted errors/IDs/permalinks/diagnostics, official confirm-publish path và
+  baseline 388 tests.
+- [ ] **Pha 2 — Contracts/state/validation:** result model, authoritative state
+  integration, mandatory validation gate và deterministic fingerprint.
+- [ ] **Pha 3 — Durable attempt và publisher:** attempt repository/migration,
+  pre-click `SUBMITTING`, composer/media/caption verification và structured auth.
+- [ ] **Pha 4 — Post verification/reconciliation:** exact ID/permalink evidence,
+  bounded reconciliation, duplicate prevention, restart/resume behavior và CLI.
+- [ ] **Pha 5 — Diagnostics/tests/docs:** sanitized artifacts, controlled failure
+  fixtures, operations docs và evidence report.
+- [ ] **Pha 6 — Verification:** focused/full suite, compile/static/diff, Quick/
+  Full report thực tế và controlled-publication verdict trung thực.
+
+## Trạng thái hiện tại
+
+- Pha 1: `in_progress`
+- Pha 2–6: `pending`
+- Baseline kế thừa: **388 passed**, cần xác minh lại trực tiếp.
+
+## Lỗi gặp phải
+
+| Lỗi | Lần thử | Cách xử lý |
+|---|---:|---|
+| Lệnh đọc ghép phát cảnh báo `Failed to create stream fd` nhưng vẫn trả đủ prompt metadata/diff | 1 | Không suy ra test failure; tiếp tục đọc theo vùng nhỏ và chỉ escalate nếu lệnh kiểm thử thực sự không hoàn tất |
+| Host không có alias `python` khi mở SQLite read-only | 1 | Dùng executable `python3` hiện có; không lặp lại lệnh `python` và không sửa environment |
+| Baseline full suite trong sandbox dừng ở ~27% sau `Failed to create stream fd`, không exit/summary | 1 | Dừng tiến trình treo; chạy lại cùng lệnh ngoài sandbox hạn chế như các phiên đã xác nhận |
+
+---
+
+# Kế hoạch: Sửa độ tin cậy CDHA và browser automation (Prompt 4)
+
+## Mục tiêu
+
+Triển khai `promt.md` hiện tại: dùng bằng chứng lỗi persisted để làm workflow
+CDHA/browser dùng chung có ownership rõ ràng, state-aware, lease/heartbeat/retry
+an toàn, timeout hữu hạn, selector bền vững và diagnostics được làm sạch; không
+thực hiện publish Facebook thật và không báo readiness/success khi chưa kiểm tra.
+
+## Nguyên tắc an toàn
+
+- Bảo toàn toàn bộ thay đổi Prompt 3 đang chưa commit và dữ liệu runtime.
+- Không xóa/chỉnh database, profile, cookie, lock sống hay artifacts gốc.
+- Không mở browser thật hoặc gọi CDHA/Facebook nếu chưa cần và chưa được phép.
+- Root cause phải có bằng chứng source/persisted fixture; test hồi quy đỏ trước
+  khi sửa hành vi.
+- Không tự động retry external action nếu đã có CDHA external ID/result URL.
+
+## Các giai đoạn
+
+- [x] **Pha 1 — Failure evidence và baseline:** đọc trọn prompt, inventory DB/
+  queue/log/artifact/lock/source và chạy baseline an toàn.
+- [x] **Pha 2 — Lifecycle/health contracts:** xác định owner duy nhất, health
+  states, page acquire/release/reconnect và structured browser errors.
+- [x] **Pha 3 — CDHA state machine/selectors/waits:** registry selector, semantic
+  completion states, bounded waits, recovery theo persisted external identity.
+- [x] **Pha 4 — Queue reliability:** lease, heartbeat, stale recovery, timeout
+  policy, retry taxonomy/idempotency và crash-safe transitions.
+- [x] **Pha 5 — Diagnostics và regression tests:** artifacts sanitized/capped,
+  fixtures cho các failure mode và integration tests không external side effect.
+- [x] **Pha 6 — Verification/report:** full suite, compile/static/diff, safe
+  non-destructive checks và báo cáo bằng chứng.
+
+## Trạng thái hiện tại
+
+- Pha 1: `complete`
+- Pha 2: `complete`
+- Pha 3: `complete`
+- Pha 4: `complete`
+- Pha 5–6: `complete`
+- Automated verification: **388 passed, 0 failed, 0 skipped**; compile,
+  tracked shell syntax, static ownership/selector audit and diff check pass.
+- Real Quick: `FAIL` because host `ffmpeg` is missing.
+- Full: `NOT EXECUTED — AUTHORIZATION BLOCKED`.
+
+## Lỗi gặp phải
+
+| Lỗi | Lần thử | Cách xử lý |
+|---|---:|---|
+| Output khảo sát đầu bị truncate vì planning files chứa nhiều phiên | 1 | Đọc `promt.md` và source theo từng vùng nhỏ; ghi findings sau mỗi hai lượt xem |
+| Host không có executable `sqlite3` khi query canonical DB read-only | 1 | Dùng module `sqlite3` chuẩn của Python cho các SELECT read-only, không cài package hay sửa DB |
+| Temporary venv `/tmp/minhdang-preflight-venv` đã bị dọn trước baseline | 1 | Kiểm tra interpreter/dependency hiện có; nếu cần tạo lại venv dưới `/tmp`, không sửa `.venv` dự án |
+| Repository `.venv` dùng Python 3.14 nhưng không load được `pytest` | 1 | Tạo `/tmp/minhdang-prompt4-venv` với Python 3.13.5; giữ `.venv` nguyên trạng |
+| Cài requirements vào venv tạm thất bại do sandbox DNS | 1 | Retry qua quyền network được phê duyệt; 18 packages cài thành công dưới `/tmp` |
+| Full suite trong sandbox dừng khoảng 30% không có exit/summary | 1 | Chạy lại cùng lệnh ngoài sandbox hạn chế; baseline **357 passed in 5.51s** |
+| Audit tham chiếu nhầm `app/domain/services/job_state_transitions.py` | 1 | Dùng `rg` định vị transition implementation thật trước khi đọc; không lặp lại path sai |
+| Audit tham chiếu nhầm `app/domain/models/workflow_job.py` và `entities/job.py` | 1 | Model thật là `app/domain/models/job.py`; dùng kết quả `rg` thay vì đoán path |
+| Full suite đầu sau Prompt 4: 1 fail diagnostics unpack (383 pass) | 1 | Tách manager health khỏi khả năng capture của page synthetic còn mở; closed page vẫn không bị chạm. Focused rerun 28 pass |
+| Patch docs nhiều file lệch context tại README nên không áp dụng | 1 | Tách patch theo từng file và dùng heading/đoạn thực tế sau khi đọc context; không lặp patch gộp |
+| Temporary Prompt 4 venv bị dọn sau lượt tiếp tục của người dùng | 1 | Tạo lại dưới `/tmp` từ requirements; không sửa `.venv` dự án |
+
+---
+
+# Kế hoạch: Nâng preflight thành kiểm tra readiness end-to-end trung thực
+
+## Mục tiêu
+
+Triển khai `promt.md` hiện tại (Prompt 3): thay preflight nông bằng một hệ thống
+Quick/Full duy nhất dưới unified CLI, có check/result/verdict cấu trúc, timeout,
+diagnostics được làm sạch và kiểm thử hồi quy; không tạo external side effect.
+
+## Nguyên tắc an toàn
+
+- Không xóa profile, cookie, lock sống, database hay dữ liệu runtime.
+- Quick chỉ kiểm tra local; Full chỉ thực hiện probe đọc-only.
+- Không upload, phân tích ca bệnh, publish, comment hay đổi trạng thái job.
+- Required check bị skip/timeout/unknown/missing luôn làm verdict FAIL.
+- Không in/lưu cookie, token, mật khẩu, HTML nhạy cảm hoặc dữ liệu bệnh nhân.
+
+## Các giai đoạn
+
+- [x] **Pha 1 — Current-state audit và reproduction:** lần official CLI/call
+  graph, tái hiện `ollama_checked=false` nhưng PASS, lập inventory và baseline.
+- [x] **Pha 2 — Structured contracts và verdict:** model check/report, matrix
+  Quick/Full, timeout và regression tests đỏ trước khi sửa.
+- [x] **Pha 3 — Quick readiness:** runtime, settings, paths, tools, DB/schema,
+  cookie/config, composition-root và adapter wiring không external action.
+- [x] **Pha 4 — Full readiness:** Ollama health/model/inference, browser/lock,
+  Facebook auth/target, CDHA auth/selectors và read-only diagnostics.
+- [x] **Pha 5 — CLI/reporting:** `app.main preflight`, concise/verbose output,
+  exit code và JSON report sanitized.
+- [x] **Pha 6 — Verification/report:** focused tests, full suite, quick/full
+  preflight, compile/static/diff checks và evidence report.
+
+## Trạng thái hiện tại
+
+- Pha 1–6: `complete`
+- Automated verification: **357 passed, 0 failed, 0 skipped**; focused 44
+  passed; compile, shell syntax, static ownership audit and diff check pass.
+- Real Quick: `FAIL` (host missing `ffmpeg`), exit code 1.
+- Real Full: `FAIL`, exit code 1. Browser startup passed; blockers are missing
+  `ffmpeg`, Ollama server unavailable, Facebook `LOGIN_REQUIRED`, and CDHA
+  `LOGIN_REQUIRED`. Dependent required checks remain skipped, so external
+  readiness is explicitly not claimed.
+
+---
+
 # Kế hoạch: Hợp nhất Chrome profile, session, cookie và cấu hình
 
 ## Mục tiêu

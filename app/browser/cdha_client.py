@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from app.browser.chrome_manager import ChromeManager
+from app.browser.cdha_state import (
+    AuthenticationState,
+    CDHAState,
+    CDHAStateSnapshot,
+    CDHAStateTimeoutError,
+    wait_for_cdha_state,
+)
 from app.browser.selector_resolver import SelectorResolutionError, SelectorResolver
 from app.config.settings import Settings
 from app.domain.models.cdha_clinical_summary import CDHAClinicalSummary
@@ -21,6 +30,14 @@ from app.browser.error_mapper import map_playwright_error
 from app.error_events import build_error_event_details
 from app.errors import (
     AuthenticationRequiredError,
+    CDHAAuthenticationRequiredError,
+    CDHAControlDisabledError,
+    CDHAControlHiddenError,
+    CDHARenderError,
+    CDHASelectorMismatchError,
+    BrowserContextClosedError,
+    BrowserDisconnectedError,
+    BrowserPageClosedError,
     CDHARenderError,
     CDHAUploadError,
     FrameNotReadyError,
@@ -97,11 +114,16 @@ class CDHAWebClient:
         self._write_text_atomic(masked_factors_path, factors)
         page: Any = None
         try:
-            page = await self.chrome.new_page()
+            acquire_page = getattr(self.chrome, "acquire_page", None)
+            page = (
+                await acquire_page(f"cdha:{job_id}")
+                if acquire_page is not None
+                else await self.chrome.new_page()
+            )
             await page.goto(
                 self.settings.cdha_url,
                 wait_until="domcontentloaded",
-                timeout=self.settings.page_timeout_seconds * 1000,
+                timeout=self.settings.browser_navigation_timeout_seconds * 1000,
             )
             if not await self.is_authenticated(page):
                 current = self.repository.get_job(job_id)
@@ -111,13 +133,7 @@ class CDHAWebClient:
                         WorkflowStatus.NEEDS_CDHA_LOGIN,
                         details={"reason": "login_or_manual_security_action_required"},
                     )
-                await self.chrome.wait_for_manual_action(
-                    "Complete CDHA login, 2FA, CAPTCHA, or account verification manually. "
-                    "No challenge will be bypassed.",
-                    lambda: self.is_authenticated(page),
-                )
-            if not await self.is_authenticated(page):
-                raise AuthenticationRequiredError(
+                raise CDHAAuthenticationRequiredError(
                     "CDHA authenticated page was not verified",
                     phase="CDHA_OPENING", operation="authenticate", job_id=job_id,
                 )
@@ -126,8 +142,36 @@ class CDHAWebClient:
             ):
                 raise RuntimeError("CDHA ultrasound-video modality could not be verified")
 
-            view_url = job.data.get("cdha_view_url")
+            job = self.repository.get_job(job_id) or job
+            fingerprint = self.submission_fingerprint(job)
+            self.repository.update_data(
+                job_id, {"cdha_submission_fingerprint": fingerprint}
+            )
+            view_url = self.existing_analysis_url(job)
             if not view_url:
+                submission_state = str(
+                    job.data.get("cdha_submission_state") or ""
+                ).upper()
+                if submission_state in {
+                    "SUBMITTING",
+                    "UPLOADED",
+                    "SUBMITTED",
+                    "UNCERTAIN",
+                }:
+                    raise CDHAUploadError(
+                        "A prior CDHA submission may already exist; reconcile it "
+                        "before any resubmission",
+                        error_code="CDHA_SUBMISSION_UNCERTAIN",
+                        retryable=False,
+                        manual_action_required=True,
+                        phase="CDHA_UPLOADING",
+                        operation="reconcile_submission",
+                        job_id=job_id,
+                        details={
+                            "current_cdha_state": "UPLOAD_IN_PROGRESS",
+                            "submission_fingerprint": fingerprint,
+                        },
+                    )
                 video = self.validate_video_path(video_path)
                 self.repository.transition(
                     job_id,
@@ -137,7 +181,11 @@ class CDHAWebClient:
                 self.logger.info("Uploading local video file via CDHA iframe", extra={"job_id": job_id})
                 
                 await self._prepare_video_upload(
-                    page, video, job_id=job_id, diagnostics_dir=diagnostics_dir
+                    page,
+                    video,
+                    job_id=job_id,
+                    diagnostics_dir=diagnostics_dir,
+                    submission_fingerprint=fingerprint,
                 )
 
                 factors_input = await self.resolver.find_first(
@@ -163,7 +211,23 @@ class CDHAWebClient:
                     WorkflowStatus.CDHA_ANALYZING,
                     details={"action": "analysis_started"},
                 )
-                await self._wait_for_analysis(page)
+                await self._wait_for_analysis(page, job_id=job_id)
+                analysis_url = str(getattr(page, "url", "") or "")
+                external_id = dict(
+                    parse_qsl(
+                        urlsplit(analysis_url).query, keep_blank_values=True
+                    )
+                ).get("view")
+                if external_id:
+                    self.repository.update_data(
+                        job_id,
+                        {
+                            "cdha_submission_state": "SUBMITTED",
+                            "cdha_external_analysis_id": external_id,
+                            "cdha_view_url": analysis_url,
+                            "cdha_submitted_at": datetime.now(UTC).isoformat(),
+                        },
+                    )
                 extracted = await self.extract_result(page, job_id, started_at)
             else:
                 self.logger.info(f"CDHA analysis already completed, jumping to result URL: {view_url}", extra={"job_id": job_id})
@@ -226,9 +290,6 @@ class CDHAWebClient:
                     page, "cdha.consultation", timeout_ms=3_000
                 )
                 await consult_btn.click()
-                
-                # Give it a moment to process the share request
-                await page.wait_for_timeout(1000)
                 self.logger.info("Successfully clicked Share -> Consultation")
             except Exception as e:
                 self.logger.warning(f"Could not click Share -> Consultation: {e}")
@@ -304,11 +365,44 @@ class CDHAWebClient:
             mapped = exc if isinstance(exc, PipelineError) else map_playwright_error(
                 exc, phase=phase, operation="analyze_video", job_id=job_id
             )
-            failure_diagnostics: tuple[Path, Path] | None = None
+            failure_diagnostics: tuple[Path, ...] | None = None
             if page is not None:
                 try:
+                    diagnostic_stamp = datetime.now(UTC).strftime(
+                        "%Y%m%dT%H%M%S.%fZ"
+                    )
+                    failure_dir = (
+                        diagnostics_dir / diagnostic_stamp / phase.casefold()
+                    )
                     failure_diagnostics = await self.chrome.save_diagnostics(
-                        page, diagnostics_dir, "cdha-failure"
+                        page,
+                        failure_dir,
+                        "cdha-failure",
+                        details={
+                            "job_id": job_id,
+                            "workflow_stage": phase,
+                            "current_cdha_state": mapped.details.get(
+                                "current_cdha_state", "UNKNOWN"
+                            ),
+                            "selector_attempts": mapped.details.get(
+                                "selector_attempts", []
+                            ),
+                            "timeout_seconds": mapped.details.get(
+                                "timeout_seconds"
+                            ),
+                            "attempt": getattr(current, "attempt_count", None),
+                            "queue_lease": {
+                                "claimed_by": getattr(current, "claimed_by", None),
+                                "lease_expires_at": getattr(
+                                    current, "lease_expires_at", None
+                                ),
+                                "last_heartbeat": getattr(
+                                    current, "last_heartbeat", None
+                                ),
+                            },
+                            "persisted_job_state": phase,
+                            "error_code": mapped.error_code,
+                        },
                     )
                 except Exception as diagnostic_error:
                     self.logger.warning(
@@ -336,9 +430,31 @@ class CDHAWebClient:
                     "cdha_completed_at": completed_at,
                 }
                 if failure_diagnostics:
-                    failure_patch["cdha_failure_screenshot_path"] = str(failure_diagnostics[0])
-                    if self.settings.save_diagnostic_html:
-                        failure_patch["cdha_failure_html_path"] = str(failure_diagnostics[1])
+                    failure_patch["cdha_failure_diagnostic_paths"] = [
+                        str(path) for path in failure_diagnostics
+                    ]
+                    screenshot = next(
+                        (
+                            path
+                            for path in failure_diagnostics
+                            if path.suffix.casefold() == ".png"
+                        ),
+                        None,
+                    )
+                    html = next(
+                        (
+                            path
+                            for path in failure_diagnostics
+                            if path.suffix.casefold() == ".html"
+                        ),
+                        None,
+                    )
+                    if screenshot:
+                        failure_patch["cdha_failure_screenshot_path"] = str(
+                            screenshot
+                        )
+                    if html:
+                        failure_patch["cdha_failure_html_path"] = str(html)
                 self.repository.transition(
                     job_id, WorkflowStatus.CDHA_FAILED, details=details, data_patch=failure_patch
                 )
@@ -351,16 +467,58 @@ class CDHAWebClient:
                 success=False, job_id=job_id, started_at=started_at,
                 completed_at=completed_at, error=error,
             )
+        finally:
+            if page is not None:
+                release_page = getattr(self.chrome, "release_page", None)
+                if release_page is not None:
+                    try:
+                        await release_page(page)
+                    except Exception as release_error:
+                        self.logger.warning(
+                            "Failed to release adapter-owned CDHA page",
+                            extra={
+                                "job_id": job_id,
+                                "error_type": type(release_error).__name__,
+                            },
+                        )
 
     async def is_authenticated(self, page: Any) -> bool:
+        return (
+            await self.detect_authentication_state(page)
+            is AuthenticationState.AUTHENTICATED
+        )
+
+    async def detect_authentication_state(
+        self, page: Any
+    ) -> AuthenticationState:
         url = str(getattr(page, "url", "")).casefold()
+        if await self.resolver.exists(
+            page, "cdha.permission_denied", timeout_ms=500
+        ):
+            return AuthenticationState.PERMISSION_DENIED
+        if await self.resolver.exists(
+            page, "cdha.two_factor_markers", timeout_ms=500
+        ):
+            return AuthenticationState.TWO_FACTOR_REQUIRED
+        if await self.resolver.exists(
+            page, "cdha.checkpoint_markers", timeout_ms=500
+        ):
+            return AuthenticationState.CHECKPOINT_REQUIRED
+        if await self.resolver.exists(
+            page, "cdha.session_expired", timeout_ms=500
+        ):
+            return AuthenticationState.SESSION_EXPIRED
         if any(marker in url for marker in ("/login", "/signin", "auth.")):
-            return False
+            return AuthenticationState.LOGIN_REQUIRED
         if await self.resolver.exists(page, "cdha.login_markers", timeout_ms=800):
-            return False
+            return AuthenticationState.LOGIN_REQUIRED
         if await self.resolver.exists(page, "cdha.security_markers", timeout_ms=800):
-            return False
-        return await self.resolver.exists(page, "cdha.authenticated_marker", timeout_ms=1_500)
+            return AuthenticationState.CHECKPOINT_REQUIRED
+        if await self.resolver.exists(
+            page, "cdha.authenticated_marker", timeout_ms=1_500
+        ):
+            return AuthenticationState.AUTHENTICATED
+        return AuthenticationState.UNKNOWN
 
     @staticmethod
     def validate_video_path(video_path: Path) -> Path:
@@ -372,6 +530,38 @@ class CDHAWebClient:
         if video.stat().st_size <= 0:
             raise ValueError(f"Video file is empty: {video}")
         return video
+
+    @staticmethod
+    def submission_fingerprint(job: Any) -> str:
+        data = getattr(job, "data", {}) or {}
+        source = (
+            str(getattr(job, "normalized_source_url", "") or "").strip()
+            or str(getattr(job, "source_url", "") or "").strip()
+        )
+        payload = "\n".join(
+            (
+                str(getattr(job, "job_id", "")),
+                str(data.get("checksum_sha256") or ""),
+                source,
+            )
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def existing_analysis_url(self, job: Any) -> str:
+        data = getattr(job, "data", {}) or {}
+        persisted = str(data.get("cdha_view_url") or "").strip()
+        if persisted:
+            return persisted
+        external_id = str(data.get("cdha_external_analysis_id") or "").strip()
+        if not external_id:
+            return ""
+        parsed = urlsplit(self.settings.cdha_url)
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        query["view"] = external_id
+        query.pop("modality", None)
+        return urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path, urlencode(query), "")
+        )
 
 
     def _cdha_retry_policy(self) -> RetryPolicy:
@@ -578,42 +768,191 @@ class CDHAWebClient:
         # We no longer wait for upload acknowledgement here because CDHA uses a 2-step process
         # where the file is processed locally first, then uploaded when we click btnComplete.
 
-    async def _complete_upload(self, page: Any) -> None:
+    async def _completion_control_snapshot(
+        self, page: Any, frame: Any
+    ) -> CDHAStateSnapshot:
+        get_health = getattr(self.chrome, "get_health", None)
+        if get_health is not None:
+            health = await get_health(page)
+            if health.state.value == "PAGE_CLOSED":
+                return CDHAStateSnapshot(CDHAState.PAGE_CLOSED)
+            if health.state.value in {"DISCONNECTED", "CONTEXT_CLOSED"}:
+                return CDHAStateSnapshot(
+                    CDHAState.BROWSER_DISCONNECTED,
+                    details={"browser_health_state": health.state.value},
+                )
+        if await self._view_url_value(page):
+            return CDHAStateSnapshot(CDHAState.UPLOAD_COMPLETED)
+        probe = getattr(self.resolver, "probe", None)
+        if probe is None:
+            button = await self.resolver.find_first(
+                frame,
+                "cdha.upload_complete_button",
+                timeout_ms=int(self.settings.browser_action_timeout_seconds * 1000),
+            )
+            enabled = (
+                bool(await button.is_enabled())
+                if hasattr(button, "is_enabled")
+                else True
+            )
+            return CDHAStateSnapshot(
+                CDHAState.UPLOAD_READY if enabled else CDHAState.CONTROL_DISABLED
+            )
+        observations = await probe(
+            frame,
+            "cdha.upload_complete_button",
+            timeout_ms=min(
+                1_000, int(self.settings.browser_action_timeout_seconds * 1000)
+            ),
+        )
+        attempted = tuple(item.to_dict() for item in observations)
+        if any(
+            item.attached and item.visible and item.enabled is not False
+            for item in observations
+        ):
+            return CDHAStateSnapshot(
+                CDHAState.UPLOAD_READY, selector_attempts=attempted
+            )
+        if any(item.attached and item.visible for item in observations):
+            return CDHAStateSnapshot(
+                CDHAState.CONTROL_DISABLED, selector_attempts=attempted
+            )
+        if any(item.attached for item in observations):
+            return CDHAStateSnapshot(
+                CDHAState.CONTROL_HIDDEN, selector_attempts=attempted
+            )
+        return CDHAStateSnapshot(
+            CDHAState.CONTROL_NOT_FOUND, selector_attempts=attempted
+        )
+
+    async def _complete_upload(
+        self,
+        page: Any,
+        *,
+        job_id: str | None = None,
+        submission_fingerprint: str | None = None,
+    ) -> None:
         if await self._view_url_value(page):
             return
         frame = await self._resolve_upload_frame(page, timeout_ms=5_000)
-        button = await self.resolver.find_first(
-            frame, "cdha.upload_complete_button", timeout_ms=90_000
-        )
-        if hasattr(button, "is_enabled") and not await button.is_enabled():
-            raise CDHAUploadError(
-                "CDHA upload Complete button is disabled",
+        try:
+            snapshot = await wait_for_cdha_state(
+                lambda: self._completion_control_snapshot(page, frame),
+                accepted_states={
+                    CDHAState.UPLOAD_READY,
+                    CDHAState.UPLOAD_COMPLETED,
+                },
+                timeout_seconds=self.settings.cdha_upload_timeout_seconds,
+                poll_interval_seconds=self.settings.cdha_poll_interval_seconds,
+                job_id=job_id,
+                phase="CDHA_UPLOADING",
+                operation="wait_for_upload_completion_control",
+                on_progress=lambda state: self.logger.info(
+                    "CDHA upload control state changed",
+                    extra={
+                        "job_id": job_id,
+                        "cdha_state": state.state.value,
+                    },
+                ),
+            )
+        except CDHAStateTimeoutError as exc:
+            details = {
+                **exc.details,
+                "selector_attempts": [
+                    dict(item) for item in exc.final_snapshot.selector_attempts
+                ],
+            }
+            if exc.final_snapshot.state is CDHAState.CONTROL_HIDDEN:
+                raise CDHAControlHiddenError(
+                    "CDHA completion control remained hidden before timeout",
+                    phase="CDHA_UPLOADING",
+                    operation="complete_upload",
+                    job_id=job_id,
+                    details=details,
+                ) from exc
+            if exc.final_snapshot.state is CDHAState.CONTROL_DISABLED:
+                raise CDHAControlDisabledError(
+                    "CDHA completion control remained disabled before timeout",
+                    phase="CDHA_UPLOADING",
+                    operation="complete_upload",
+                    job_id=job_id,
+                    details=details,
+                ) from exc
+            raise CDHASelectorMismatchError(
+                "CDHA completion control was not found before timeout",
                 phase="CDHA_UPLOADING",
                 operation="complete_upload",
+                job_id=job_id,
+                details=details,
+            ) from exc
+        if snapshot.state is CDHAState.UPLOAD_COMPLETED:
+            return
+        button = await self.resolver.find_first(
+            frame,
+            "cdha.upload_complete_button",
+            timeout_ms=int(self.settings.browser_action_timeout_seconds * 1000),
+        )
+        if hasattr(button, "is_enabled") and not await button.is_enabled():
+            raise CDHAControlDisabledError(
+                "CDHA upload completion control became disabled before click",
+                phase="CDHA_UPLOADING",
+                operation="complete_upload",
+                job_id=job_id,
             )
-        await button.click(timeout=10_000)
-        await self._wait_for_upload(page)
+        if job_id:
+            self.repository.update_data(
+                job_id,
+                {
+                    "cdha_submission_state": "SUBMITTING",
+                    "cdha_submission_fingerprint": submission_fingerprint,
+                    "cdha_submission_started_at": datetime.now(UTC).isoformat(),
+                },
+            )
+        await button.click(
+            timeout=int(self.settings.browser_action_timeout_seconds * 1000)
+        )
+        view_url = await self._wait_for_upload(page)
+        if job_id and view_url:
+            self.repository.update_data(
+                job_id,
+                {
+                    "cdha_submission_state": "UPLOADED",
+                    "cdha_upload_url": view_url,
+                    "cdha_upload_completed_at": datetime.now(UTC).isoformat(),
+                },
+            )
 
     async def _prepare_video_upload(
-        self, page: Any, video: Path, *, job_id: str, diagnostics_dir: Path
+        self,
+        page: Any,
+        video: Path,
+        *,
+        job_id: str,
+        diagnostics_dir: Path,
+        submission_fingerprint: str,
     ) -> None:
         file_input = await self._ensure_upload_dialog_open(
             page, job_id=job_id, diagnostics_dir=diagnostics_dir
         )
         await self._upload_video_file(page, file_input, video)
-        await self._complete_upload(page)
+        await self._complete_upload(
+            page,
+            job_id=job_id,
+            submission_fingerprint=submission_fingerprint,
+        )
 
-    async def _wait_for_upload(self, page: Any) -> None:
-        deadline = time.monotonic() + self.settings.upload_timeout_seconds
+    async def _wait_for_upload(self, page: Any) -> str:
+        deadline = time.monotonic() + self.settings.cdha_upload_timeout_seconds
         upload_started = False
         try:
             frame = await self._resolve_upload_frame(page, timeout_ms=1000, visible=False)
         except Exception:
             frame = page
         while time.monotonic() < deadline:
-            if await self._view_url_value(page):
+            view_url = await self._view_url_value(page)
+            if view_url:
                 self.logger.info("CDHA upload completed; view URL is available")
-                return
+                return view_url
             if await self.resolver.exists(frame, "cdha.upload_error", timeout_ms=500):
                 message = await self._optional_text(frame, "cdha.upload_error")
                 raise CDHAUploadError(
@@ -625,7 +964,7 @@ class CDHAWebClient:
             if await self.resolver.exists(frame, "cdha.upload_started", timeout_ms=500):
                 upload_started = True
             if await self.resolver.exists(frame, "cdha.upload_complete", timeout_ms=500):
-                return
+                return ""
             await asyncio.sleep(min(1.0, self.settings.cdha_poll_interval_seconds))
         suffix = " after starting" if upload_started else " (upload start was not detected)"
         raise CDHAUploadError(
@@ -637,39 +976,165 @@ class CDHAWebClient:
             operation="wait_for_upload_completion",
         )
 
-    async def _wait_for_analysis(self, page: Any) -> None:
-        deadline = time.monotonic() + self.settings.cdha_analysis_timeout_seconds
-        started = False
-        stable_since: float | None = None
-        previous_result = ""
-        while time.monotonic() < deadline:
-            if "view=" in page.url:
-                self.logger.info("Results page detected via URL, marking analysis as complete", extra={"job_id": "unknown"})
-                return
-            if await self.resolver.exists(page, "cdha.error_message", timeout_ms=500):
-                message = await self._optional_text(page, "cdha.error_message")
-                raise RuntimeError(f"CDHA analysis failed: {message or 'error message displayed'}")
-            if await self.resolver.exists(page, "cdha.analysis_started", timeout_ms=500):
-                started = True
-            complete = await self.resolver.exists(page, "cdha.analysis_complete", timeout_ms=500)
-            result_visible = await self.resolver.exists(page, "cdha.result_container", timeout_ms=500)
-            if complete or result_visible:
-                started = True
-                current_result = await self._optional_text(page, "cdha.result_container") or ""
-                now = time.monotonic()
-                if current_result and current_result == previous_result:
-                    stable_since = stable_since or now
-                    if now - stable_since >= self.settings.cdha_result_stability_seconds:
-                        return
-                else:
-                    previous_result = current_result
-                    stable_since = now
-                if complete and not current_result:
-                    return
-            await asyncio.sleep(self.settings.cdha_poll_interval_seconds)
-        if not started:
-            raise TimeoutError("CDHA analysis did not start before timeout")
-        raise TimeoutError("CDHA analysis did not complete before timeout")
+    async def _detect_analysis_state(self, page: Any) -> CDHAStateSnapshot:
+        get_health = getattr(self.chrome, "get_health", None)
+        if get_health is not None:
+            health = await get_health(page)
+            if health.state.value == "PAGE_CLOSED":
+                return CDHAStateSnapshot(CDHAState.PAGE_CLOSED)
+            if health.state.value in {"DISCONNECTED", "CONTEXT_CLOSED"}:
+                return CDHAStateSnapshot(
+                    CDHAState.BROWSER_DISCONNECTED,
+                    details={"browser_health_state": health.state.value},
+                )
+        try:
+            if hasattr(page, "is_closed") and bool(page.is_closed()):
+                return CDHAStateSnapshot(CDHAState.PAGE_CLOSED)
+        except Exception:
+            return CDHAStateSnapshot(CDHAState.PAGE_CLOSED)
+        url = str(getattr(page, "url", "") or "")
+        authentication = await self.detect_authentication_state(page)
+        if authentication in {
+            AuthenticationState.LOGIN_REQUIRED,
+            AuthenticationState.TWO_FACTOR_REQUIRED,
+            AuthenticationState.CHECKPOINT_REQUIRED,
+            AuthenticationState.SESSION_EXPIRED,
+        }:
+            return CDHAStateSnapshot(
+                CDHAState.LOGIN_REQUIRED,
+                current_url=url,
+                details={"authentication_state": authentication.value},
+            )
+        if authentication is AuthenticationState.PERMISSION_DENIED:
+            return CDHAStateSnapshot(
+                CDHAState.PERMISSION_DENIED,
+                current_url=url,
+                details={"authentication_state": authentication.value},
+            )
+        if await self.resolver.exists(page, "cdha.error_message", timeout_ms=300):
+            message = await self._optional_text(page, "cdha.error_message")
+            return CDHAStateSnapshot(
+                CDHAState.ANALYSIS_FAILED,
+                current_url=url,
+                details={"message": message or "CDHA error message displayed"},
+            )
+        if await self.resolver.exists(page, "cdha.result_container", timeout_ms=300):
+            result = await self._optional_text(page, "cdha.result_container")
+            if result:
+                return CDHAStateSnapshot(CDHAState.RESULT_READY, current_url=url)
+        if await self.resolver.exists(page, "cdha.analysis_complete", timeout_ms=300):
+            return CDHAStateSnapshot(
+                CDHAState.ANALYSIS_COMPLETED, current_url=url
+            )
+        if "view=" in url:
+            return CDHAStateSnapshot(
+                CDHAState.ANALYSIS_COMPLETED, current_url=url
+            )
+        if await self.resolver.exists(page, "cdha.analysis_started", timeout_ms=300):
+            return CDHAStateSnapshot(CDHAState.ANALYSIS_RUNNING, current_url=url)
+        try:
+            if await self.resolver.exists(
+                page, "cdha.analysis_queued", timeout_ms=300
+            ):
+                return CDHAStateSnapshot(
+                    CDHAState.ANALYSIS_QUEUED, current_url=url
+                )
+        except KeyError:
+            pass
+        return CDHAStateSnapshot(CDHAState.UNKNOWN, current_url=url)
+
+    async def _wait_for_analysis(
+        self, page: Any, *, job_id: str | None = None
+    ) -> None:
+        terminal_states = {
+            CDHAState.RESULT_READY,
+            CDHAState.ANALYSIS_COMPLETED,
+            CDHAState.ANALYSIS_FAILED,
+            CDHAState.LOGIN_REQUIRED,
+            CDHAState.PERMISSION_DENIED,
+            CDHAState.PAGE_CLOSED,
+            CDHAState.BROWSER_DISCONNECTED,
+        }
+        try:
+            snapshot = await wait_for_cdha_state(
+                lambda: self._detect_analysis_state(page),
+                accepted_states=terminal_states,
+                timeout_seconds=self.settings.cdha_analysis_timeout_seconds,
+                poll_interval_seconds=self.settings.cdha_poll_interval_seconds,
+                job_id=job_id,
+                on_progress=lambda state: self.logger.info(
+                    "CDHA analysis state changed",
+                    extra={"job_id": job_id, "cdha_state": state.state.value},
+                ),
+            )
+        except CDHAStateTimeoutError as exc:
+            if exc.final_snapshot.state is CDHAState.UNKNOWN:
+                raise CDHAStateTimeoutError(
+                    "CDHA analysis did not start before timeout",
+                    final_snapshot=exc.final_snapshot,
+                    timeout_seconds=self.settings.cdha_analysis_timeout_seconds,
+                    job_id=job_id,
+                ) from exc
+            raise
+        if snapshot.state is CDHAState.RESULT_READY:
+            return
+        if snapshot.state is CDHAState.ANALYSIS_FAILED:
+            raise CDHARenderError(
+                str(snapshot.details.get("message") or "CDHA analysis failed"),
+                retryable=False,
+                phase="CDHA_ANALYZING",
+                operation="wait_for_analysis",
+                job_id=job_id,
+                details={"current_cdha_state": snapshot.state.value},
+            )
+        if snapshot.state in {
+            CDHAState.LOGIN_REQUIRED,
+            CDHAState.PERMISSION_DENIED,
+        }:
+            raise CDHAAuthenticationRequiredError(
+                "CDHA authentication or permission is required during analysis",
+                phase="CDHA_ANALYZING",
+                operation="wait_for_analysis",
+                job_id=job_id,
+                details={
+                    "current_cdha_state": snapshot.state.value,
+                    **snapshot.details,
+                },
+            )
+        if snapshot.state is CDHAState.PAGE_CLOSED:
+            raise BrowserPageClosedError(
+                "CDHA page closed during analysis",
+                phase="CDHA_ANALYZING",
+                operation="wait_for_analysis",
+                job_id=job_id,
+                details={"current_cdha_state": snapshot.state.value},
+            )
+        if snapshot.state is CDHAState.BROWSER_DISCONNECTED:
+            error_type = (
+                BrowserContextClosedError
+                if snapshot.details.get("browser_health_state")
+                == "CONTEXT_CLOSED"
+                else BrowserDisconnectedError
+            )
+            raise error_type(
+                "CDHA shared browser became unavailable during analysis",
+                phase="CDHA_ANALYZING",
+                operation="wait_for_analysis",
+                job_id=job_id,
+                details={
+                    "current_cdha_state": snapshot.state.value,
+                    **snapshot.details,
+                },
+            )
+        await wait_for_cdha_state(
+            lambda: self._detect_analysis_state(page),
+            accepted_states={CDHAState.RESULT_READY},
+            timeout_seconds=self.settings.cdha_result_timeout_seconds,
+            poll_interval_seconds=self.settings.cdha_poll_interval_seconds,
+            job_id=job_id,
+            phase="CDHA_ANALYZING",
+            operation="wait_for_result_ready",
+        )
 
     async def extract_result(
         self, page: Any, job_id: str, started_at: str = ""

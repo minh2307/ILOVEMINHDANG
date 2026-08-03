@@ -7,7 +7,10 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from app.errors import (
     AuthenticationRequiredError,
     BrowserAutomationError,
+    BrowserContextClosedError,
+    BrowserDisconnectedError,
     BrowserNetworkError,
+    BrowserPageClosedError,
     BrowserTargetClosedError,
     BrowserTimeoutError,
     CheckpointRequiredError,
@@ -24,6 +27,13 @@ _TARGET_CLOSED_MARKERS = (
     "context has been closed",
     "browser has been closed",
     "browser closed",
+)
+_PAGE_CLOSED_MARKERS = ("page has been closed", "page closed", "target page has been closed")
+_CONTEXT_CLOSED_MARKERS = ("context has been closed", "context closed")
+_BROWSER_CLOSED_MARKERS = (
+    "browser has been closed",
+    "browser closed",
+    "browser disconnected",
 )
 _FRAME_MARKERS = (
     "frame was detached",
@@ -73,6 +83,12 @@ def map_playwright_error(
         return AuthenticationRequiredError(message, **metadata)
     if isinstance(exc, PlaywrightTimeoutError):
         return BrowserTimeoutError(message, **metadata)
+    if any(marker in lowered for marker in _PAGE_CLOSED_MARKERS):
+        return BrowserPageClosedError(message, **metadata)
+    if any(marker in lowered for marker in _CONTEXT_CLOSED_MARKERS):
+        return BrowserContextClosedError(message, **metadata)
+    if any(marker in lowered for marker in _BROWSER_CLOSED_MARKERS):
+        return BrowserDisconnectedError(message, **metadata)
     if any(marker in lowered for marker in _TARGET_CLOSED_MARKERS):
         return BrowserTargetClosedError(message, **metadata)
     if any(marker in lowered for marker in _FRAME_MARKERS):

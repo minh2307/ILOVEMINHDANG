@@ -71,6 +71,25 @@ class BrowserTargetClosedError(BrowserAutomationError):
     retryable = True
 
 
+class BrowserDisconnectedError(BrowserTargetClosedError):
+    error_code = "BROWSER_DISCONNECTED"
+    retryable = True
+
+
+class BrowserContextClosedError(BrowserTargetClosedError):
+    error_code = "BROWSER_CONTEXT_CLOSED"
+    retryable = True
+
+
+class BrowserPageClosedError(BrowserTargetClosedError):
+    error_code = "BROWSER_PAGE_CLOSED"
+    retryable = True
+
+
+class BrowserPageOwnershipError(BrowserAutomationError):
+    error_code = "BROWSER_PAGE_NOT_OWNED"
+
+
 class BrowserNetworkError(BrowserAutomationError):
     error_code = "BROWSER_NETWORK_ERROR"
     retryable = True
@@ -102,6 +121,33 @@ class CDHAUploadError(PipelineError):
 
 class CDHARenderError(PipelineError):
     error_code = "CDHA_RENDER_ERROR"
+    retryable = True
+
+
+class CDHAAuthenticationRequiredError(AuthenticationRequiredError):
+    error_code = "CDHA_AUTHENTICATION_REQUIRED"
+
+
+class CDHASelectorMismatchError(SelectorNotFoundError):
+    error_code = "CDHA_SELECTOR_MISMATCH"
+
+
+class CDHAControlHiddenError(CDHARenderError):
+    error_code = "CDHA_CONTROL_HIDDEN"
+    retryable = True
+
+
+class CDHAControlDisabledError(CDHARenderError):
+    error_code = "CDHA_CONTROL_DISABLED"
+    retryable = True
+
+
+class CDHAAnalysisTimeoutError(BrowserTimeoutError, TimeoutError):
+    error_code = "CDHA_ANALYSIS_TIMEOUT"
+
+
+class QueueLeaseExpiredError(PipelineError):
+    error_code = "QUEUE_LEASE_EXPIRED"
     retryable = True
 
 

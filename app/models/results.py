@@ -148,6 +148,22 @@ def _serialize_datetime(value: datetime | str | None) -> str | None:
 
 
 @dataclass(frozen=True, slots=True)
+class FacebookPostValidationResult:
+    valid: bool
+    errors: tuple[str, ...]
+    warnings: tuple[str, ...]
+    content_fingerprint: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "valid": self.valid,
+            "errors": list(self.errors),
+            "warnings": list(self.warnings),
+            "content_fingerprint": self.content_fingerprint,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class FacebookPostPreparationResult:
     success: bool
     job_id: str
@@ -172,28 +188,65 @@ class FacebookPostPreparationResult:
         }
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class FacebookPublishResult:
+    """Authoritative result for a Facebook publication attempt.
+
+    Required fields:
+        success: bool   — True only when a verified post ID or permalink was obtained.
+        status: str     — One of the PUBLICATION_STATUS_* constants or a job_id
+                          (legacy callers pass job_id here; new callers pass status string).
+        target_url: str — Configured target Facebook Page URL.
+
+    All remaining fields have defaults and should be populated when available.
+    """
+
+    # --- Core required fields ---
     success: bool
-    job_id: str
+    status: str       # publication status string (e.g. PUBLISHED_VERIFIED) or job_id for legacy
     target_url: str = ""
+
+    # --- Verification evidence (required for PUBLISHED_VERIFIED) ---
     post_id: str | None = None
-    post_url: str | None = None
+    permalink: str | None = None
     published_at: datetime | str | None = None
     verification_method: str | None = None
-    diagnostic_screenshot_path: str | Path | None = None
+
+    # --- Fingerprint & attempt tracking ---
+    content_fingerprint: str = ""
+    attempt_id: str = ""
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+    artifact_paths: tuple[str, ...] = ()
+
+    # --- Legacy compatibility fields ---
+    job_id: str = ""
+    post_url: str | None = None
     warnings: list[str] = field(default_factory=list)
     error: str | None = None
 
+    # --- Extra diagnostic fields stored but not required ---
+    diagnostic_screenshot_path: str | None = None
+
+    @property
+    def is_verified(self) -> bool:
+        """True only when durable post evidence is present."""
+        return self.success and bool(self.post_id or self.permalink)
+
     def to_dict(self) -> dict[str, Any]:
         return {
-            "success": self.success, "job_id": self.job_id,
+            "success": self.success, "status": self.status,
             "target_url": self.target_url, "post_id": self.post_id,
-            "post_url": self.post_url,
+            "permalink": self.permalink,
             "published_at": _serialize_datetime(self.published_at),
             "verification_method": self.verification_method,
-            "diagnostic_screenshot_path": _serialize_path(self.diagnostic_screenshot_path),
+            "content_fingerprint": self.content_fingerprint,
+            "attempt_id": self.attempt_id,
+            "diagnostics": dict(self.diagnostics),
+            "artifact_paths": list(self.artifact_paths),
+            "job_id": self.job_id,
+            "post_url": self.post_url or self.permalink,
             "warnings": list(self.warnings), "error": self.error,
+            "is_verified": self.is_verified,
         }
 
 

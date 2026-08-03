@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,18 @@ _PRIVACY = PrivacyService()
 
 class SelectorResolutionError(SelectorNotFoundError, LookupError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class SelectorObservation:
+    priority: int
+    selector: str
+    attached: bool
+    visible: bool
+    enabled: bool | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 class SelectorResolver:
@@ -138,6 +151,45 @@ class SelectorResolver:
         )
         return False
 
+    async def probe(
+        self, page: Any, key: str, *, timeout_ms: int = 1_000
+    ) -> tuple[SelectorObservation, ...]:
+        """Inspect candidates independently without collapsing hidden/disabled into missing."""
+        candidates = self.candidates(key)
+        per_selector_timeout = max(1, timeout_ms // max(1, len(candidates)))
+        observations: list[SelectorObservation] = []
+        for priority, candidate in enumerate(candidates):
+            locator = self._locator(page, candidate).first
+            description = self._describe(candidate)
+            attached = False
+            visible = False
+            enabled: bool | None = None
+            try:
+                await locator.wait_for(state="attached", timeout=per_selector_timeout)
+                attached = True
+                if hasattr(locator, "is_visible"):
+                    visible = bool(await locator.is_visible())
+                else:
+                    visible = True
+                if hasattr(locator, "is_enabled"):
+                    enabled = bool(await locator.is_enabled())
+            except Exception as exc:
+                mapped = map_playwright_error(
+                    exc, phase="SELECTOR_PROBE", operation=f"inspect:{key}"
+                )
+                if is_terminal_browser_condition(mapped):
+                    raise mapped from exc
+            observations.append(
+                SelectorObservation(
+                    priority=priority,
+                    selector=description,
+                    attached=attached,
+                    visible=visible,
+                    enabled=enabled,
+                )
+            )
+        return tuple(observations)
+
     async def click_first(
         self,
         page: Any,
@@ -248,7 +300,13 @@ class SelectorResolver:
             if self.save_html:
                 artifact = (output_dir / f"selector-{safe_key}.html").resolve()
                 if hasattr(page, "content"):
-                    artifact.write_text(await page.content(), encoding="utf-8")
+                    html = await page.content()
+                    html = re.sub(
+                        r'(?i)(\b(?:value|data-token|data-access-token)\s*=\s*)(["\']).*?\2',
+                        r'\1"[REDACTED]"',
+                        html,
+                    )
+                    artifact.write_text(_PRIVACY.mask(html), encoding="utf-8")
                 else:
                     artifact.write_text("HTML content not available for FrameLocator", encoding="utf-8")
             for path in (screenshot, metadata, artifact):

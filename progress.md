@@ -1,4 +1,252 @@
+# Progress Log — Prompt 5 Facebook Publication Verification
+
+## Session: 2026-08-03
+
+- **Pha 1:** `in_progress`
+- Đọc đầy đủ `planning-with-files` và `systematic-debugging`.
+- Xác nhận prompt đã chuyển từ Prompt 4 sang Prompt 5 (1.258 dòng).
+- Bảo toàn toàn bộ worktree Prompt 1–4; chưa sửa production.
+- Đọc phần đầu Prompt 5, ghi nhận yêu cầu result/state/validation/fingerprint/
+  durable attempt và nguyên tắc không xem click/navigation/dialog đóng là success.
+- Đọc trọn Prompt 5, bao gồm 19 pha kỹ thuật, test matrix, safe/live boundary và
+  cấu trúc báo cáo cuối 15 phần.
+- Bắt đầu persisted-evidence inventory và official `confirm-publish` call graph.
+- Canonical DB là `data/jobs.sqlite3` (320 KiB); các DB legacy phần lớn 0 byte.
+- Query read-only đầu tiên không chạy vì host không có alias `python`; chuyển
+  sang `python3`, không thay đổi DB/environment.
+- Baseline sandbox dừng ở khoảng 27% không có failure/summary sau stream-fd
+  errors; đã dừng sạch và chuyển sang cùng suite ngoài sandbox để phân biệt lỗi
+  môi trường với regression.
+- Baseline ngoài sandbox hoàn tất **388 passed in 5.28s**.
+
+---
+
+# Progress Log — Prompt 4 CDHA/Browser Reliability
+
+## Session: 2026-08-03
+
+- **Pha 1:** `in_progress`
+- Đọc đầy đủ skill `planning-with-files`.
+- Xác nhận prompt hiện tại là Prompt 4 (945 dòng), khác với chat tham chiếu.
+- Ghi nhận và bảo toàn 15 modified/untracked files của Prompt 3.
+- Khởi tạo kế hoạch Prompt 4 và bắt đầu failure-evidence inventory.
+- Đọc trọn 945 dòng prompt và thực hiện source/runtime inventory ban đầu.
+- Xác nhận repo đã có queue lease/heartbeat và browser-lock heartbeat, nhưng vẫn
+  cần audit call graph, CDHA selector/state logic, persisted failures và timeout
+  ownership trước khi thiết kế test đỏ.
+- Định vị các SQLite/runtime artifacts và đọc các đường active đầu tiên:
+  `CDHAWebClient`, browser manager và durable queue. Chưa sửa production.
+- Xác nhận composition root dùng `data/jobs.sqlite3`, settings/timeouts và các
+  helper upload/analysis active. Lần query DB bằng CLI thất bại vì host không có
+  `sqlite3`; đã ghi lỗi và chuyển sang Python stdlib read-only.
+- Query canonical DB read-only bằng Python stdlib và lập failure inventory từ
+  11 jobs/529 events/3 queue rows, logs và JSON diagnostics.
+- Xác nhận persisted evidence cho browser/page closed, `#btnComplete`
+  missing/hidden/disabled, upload uncertain, auth required, unknown states và
+  queue timeout 180 giây. Chưa thay đổi production.
+- Hoàn tất audit đầu tiên cho selector/error/port/worker và test coverage hiện
+  hữu; xác định các gap cụ thể nhưng chưa đề xuất/sửa trước baseline.
+- Baseline attempt 1 không bắt đầu vì temporary venv từ phiên trước đã bị dọn.
+  Đây là lỗi môi trường trước collection; không có test fail và không sửa source.
+- `.venv` dự án được xác nhận ABI/environment-stale (Python 3.14, thiếu pytest);
+  không sửa nó. Đã tạo `/tmp/minhdang-prompt4-venv` bằng Python 3.13.5.
+- Dependency install lần đầu bị sandbox DNS, lần retry được phê duyệt thành công;
+  18 packages cài dưới `/tmp`, workspace không bị thay đổi.
+- Restricted-sandbox baseline dừng khoảng 30% không có exit code; cùng suite
+  ngoài sandbox hoàn tất **357 passed in 5.51s**.
+- **Pha 1 complete; Pha 2 in_progress.**
+- Pha 2 audit xác nhận browser manager active, temporary-page gap, existing
+  official recovery commands và khoảng trống adapter-level CDHA idempotency.
+- Hoàn tất pattern/root-cause comparison; bắt đầu viết regression tests đỏ cho
+  lifecycle, selector/state, timeout/idempotency và queue lease.
+- Regression file mới fail collection như mong đợi vì contract chưa tồn tại.
+- Implemented browser health/page ownership, selector observations, CDHA state
+  wait, typed timeout settings, queue stage/lease-loss/max-attempt recovery,
+  CDHA fingerprint/reconciliation guard và closed-page-safe diagnostics.
+- Verification hiện tại: **13 Prompt 4 tests passed**, **86 focused tests
+  passed**.
+- **Pha 2 complete; Pha 3 in_progress.**
+- Expanded Prompt 4 suite lên 27 tests cho hidden/disabled/missing/fallback,
+  auth taxonomy, cancellation, external-ID reuse, safe inspect và cleanup.
+- Full suite attempt: **383 passed, 1 failed** do diagnostics compatibility;
+  root cause được sửa tối thiểu, focused rerun **28 passed**.
+- **Pha 3 complete; Pha 4 in_progress.**
+- Hoàn tất official `inspect-browser`/`inspect-queue`, typed authentication,
+  stage-aware heartbeat và cập nhật env/runbook.
+- Focused verification tiếp theo chưa chạy vì `/tmp` venv bị dọn giữa các lượt;
+  đã ghi nhận là lỗi môi trường trước collection.
+- Tái tạo venv tạm và chạy focused suite: **105 passed in 1.06s**.
+- **Pha 4 complete; Pha 5 in_progress.**
+- Removed active `FacebookJobClient` hard-coded 180-second wait; it now uses the
+  typed worker-stage timeout.
+- Final full suite: **388 passed in 4.90s**.
+- Compile, shell syntax, static lifecycle/selector audits and diff check pass.
+- Real Quick: **FAIL**, exit 1, missing `ffmpeg`; report mode 0600 and secret
+  scan clean.
+- `config` and `inspect-queue` succeeded. `inspect-browser` sandbox run produced
+  no exit/output, so the read-only approved rerun was used and reported
+  DISCONNECTED/CDP false/no PID/no lock without starting Chrome.
+- Full preflight not executed because authenticated external access was not
+  newly authorized.
+- Added `docs/cdha-browser-reliability-report.md`.
+- **Pha 5–6 complete.**
+
+---
+
 # Progress Log — Unified Browser/Profile/Cookie Configuration
+
+## Session: 2026-08-03 — Referenced-chat continuation
+
+- **Status:** complete
+- Re-entered the referenced-chat task from the actual dirty worktree and read
+  `promt.md`, the planning files, and both applicable skills completely.
+- Confirmed the Prompt 3 implementation is present as 14 modified files plus
+  two new files; `git diff --check` is clean and the structured preflight
+  contracts/official runner are present.
+- Verification attempt through the temporary Python environment emitted
+  `Failed to create stream fd: Operation not permitted` before Python could
+  report its version. This matches the previously documented sandbox
+  infrastructure failure; no code or environment change was made. Following
+  `systematic-debugging`, the next step is a minimal environment-boundary probe,
+  not a source fix.
+- Recreated `/tmp/minhdang-preflight-venv` with Python 3.14. Dependency install
+  first failed on sandbox DNS, then succeeded through the approved network path;
+  the repository `.venv` remains untouched.
+- Focused Prompt 3 verification passed **43 tests**. The restricted-sandbox full
+  suite hung reproducibly around 20% at a downloader adapter after stream
+  creation failures; the identical approved out-of-sandbox suite passed
+  **356/356 in 4.57s**.
+- Source compile, tracked shell syntax, static preflight ownership and
+  `git diff --check` passed.
+- Real Quick returned **FAIL** and wrote
+  `runtime/diagnostics/preflight/preflight_quick_20260803T081304.628572Z.json`;
+  the required blocker is missing `ffmpeg`.
+- Real Full was authorized and executed read-only. It returned **FAIL** and
+  wrote
+  `runtime/diagnostics/preflight/preflight_full_20260803T081355.550403Z.json`.
+  Browser startup passed; blockers were missing `ffmpeg`, Ollama unavailable,
+  Facebook `LOGIN_REQUIRED`, and CDHA authentication not ready.
+- Full diagnostics showed a localized CDHA login title classified as `UNKNOWN`.
+  Added a regression test first (expected import failure), then introduced one
+  shared Full classifier that checks URL, localized title, canonical login
+  selectors, security markers and the official auth fallback. Focused suite is
+  now **44 passed**.
+- Error log: initial source search included nonexistent `app/cdha`; active code
+  was found at `app/browser/cdha_client.py`, and the bad path was not retried.
+- Final post-fix verification: **44 focused passed**, **357 full-suite passed
+  in 4.36s**, compile, tracked shell syntax, single-ownership static audit and
+  `git diff --check` passed.
+- Repeated live Full after the detector fix: exit code **1**, overall **FAIL**,
+  browser start passed, Facebook and CDHA both explicitly
+  `LOGIN_REQUIRED`. Latest report:
+  `runtime/diagnostics/preflight/preflight_full_20260803T081651.486122Z.json`.
+- Latest Full report and both browser metadata artifacts are mode `0600`;
+  secret/HTML/patient-data pattern scans returned no matches.
+- Repeated referenced-chat request audit: `promt.md` SHA-256 is
+  `7520e19808ae97e20b4630029532a5b498e6450830d846e352601a6a30589b74`;
+  the active six-phase plan remains complete, the latest Full report exists,
+  and `git diff --check` remains clean. No duplicate implementation changes
+  were made.
+- Re-read the complete `planning-with-files` skill and the existing planning
+  files before taking implementation action.
+- The workspace is currently clean according to `git status --short`.
+- Existing records say the latest `promt.md` implementation reached 345 passing
+  tests, but this session will verify the current prompt/source/tests directly
+  rather than relying on the referenced-chat summary.
+- Read the current 1,072-line `promt.md`; it is Prompt 3 for an authoritative
+  Quick/Full readiness preflight and supersedes the older referenced prompt.
+- Added a new six-phase plan and initial prompt findings without overwriting
+  prior session history.
+- Read the complete `systematic-debugging` skill because Prompt 3 requires a
+  misleading-PASS reproduction before any fix.
+- Located the current flat preflight implementation, official CLI hook and
+  existing tests; no production implementation changes have been made yet.
+- Confirmed the root cause at the official CLI boundary: `worker
+  --preflight-only` returns 0 after a non-exception report whose
+  `ollama_checked` field is false.
+- Error log: attempted to inspect `app/browser/file_browser_lock.py`, which does
+  not exist; the active implementation is
+  `app/infrastructure/browser/file_browser_lock.py`. The incorrect path will not
+  be retried.
+- Baseline attempt 1 failed before collection because `.venv/bin/pytest` has a
+  stale absolute shebang pointing at `/media/.../.venv/bin/python3`, while the
+  workspace is mounted at `/run/media/...`.
+- Inspection confirmed `.venv/bin/python -> python3 ->
+  /usr/bin/python3` remains valid. The next attempt will invoke the same
+  environment as `.venv/bin/python -m pytest` rather than modify the user's
+  virtualenv.
+- Baseline attempt 2 also failed before collection: the venv was created for
+  Python 3.12, but `/usr/bin/python3` now resolves to Python 3.14.4, so the
+  interpreter does not load `.venv/lib/python3.12/site-packages`.
+- The installed test/dependency packages are still present under the Python
+  3.12 site-packages directory. No symlink or venv file has been modified.
+- `/usr/bin/python3.12` is no longer installed; only Python 3.14 is available.
+- `uv` is available. The verification environment will therefore be recreated
+  under `/tmp` from `requirements.txt`, preserving the user's broken-but-
+  untouched `.venv`.
+- Temporary venv attempt 1 failed because uv's default cache under the read-only
+  home directory could not be created; retry used `/tmp/minhdang-uv-cache`.
+- Dependency installation attempt 1 then failed on sandbox DNS access to PyPI.
+  The approved network retry succeeded and installed all requirements into
+  `/tmp/minhdang-preflight-venv`; repository files and `.venv` were unchanged.
+- Baseline attempts inside the sandbox were terminated around 20% by repeated
+  `Failed to create stream fd` infrastructure errors; the JUnit artifact was
+  never written, so no result was inferred from those runs.
+- Approved out-of-sandbox baseline completed successfully: **345 passed in
+  4.69s** using `/tmp/minhdang-preflight-venv/bin/python -m pytest -q`.
+- Added the first verdict/completeness regression tests before implementation.
+  Expected red result: collection fails because `CheckStatus` and the structured
+  report contract do not yet exist in `app.preflight`.
+- Implemented the structured result/verdict contract and adapted the legacy
+  runner return value. Focused verification: **6 passed** across new verdict
+  tests and the existing preflight mutation guard.
+- Added preflight-specific typed timeouts/report path, official Ollama adapter
+  readiness hooks, the Quick local matrix, Full read-only Ollama/browser/auth
+  probes, lock inspection, sanitized diagnostics/reporting and human formatter.
+- First post-runner verification command referenced two nonexistent test files
+  (`tests/test_settings.py`, `tests/test_ollama_client.py`), so pytest correctly
+  stopped before collection. The command will not be repeated; actual related
+  tests were located by filename.
+- `compileall app` succeeded for production source but also traversed legacy
+  embedded virtualenvs and emitted unrelated Python 3.14 warnings. Final compile
+  will target tracked/source directories without embedded environments.
+- Updated the legacy missing-Playwright test to the new structured contract and
+  gated composition-root construction behind local prerequisites, preserving
+  the no-database/no-lock mutation invariant. Focused suite: **37 passed**.
+- Registered the single official `preflight --mode quick|full [--verbose]`
+  command before runtime-directory creation, mapped report verdicts to CLI exit
+  codes, and made Worker startup require a non-failing Full report.
+- CLI and related focused verification now passes: **38 passed**.
+- Added Quick side-effect boundary, official Ollama success/timeout, live-lock
+  preservation and report-redaction regression tests. Focused suite: **43
+  passed**.
+- Full repository suite after implementation: **356 passed in 4.39s**.
+- Real Quick preflight executed through `python -m app.main`: exit code **1**,
+  overall **FAIL** because `ffmpeg` is absent. Canonical cookie absence and four
+  inactive legacy paths are WARN; external checks are explicitly optional
+  SKIPPED in Quick mode.
+- Quick report was written under `runtime/diagnostics/preflight/`; manual and
+  pattern inspection found no cookie values, session IDs, passwords,
+  authorization headers or access tokens.
+- Real Full preflight escalation was rejected because it would use the
+  authenticated Chrome profile and contact Ollama, Facebook and CDHA. No
+  workaround or indirect live probe was attempted. Final evidence must mark
+  external readiness as not executed/blocked, never PASS.
+- Final verification attempt 1 stopped before collection because the execution
+  environment had cleaned `/tmp/minhdang-preflight-venv` and its uv cache.
+  This is an ephemeral-environment error, not a test failure; the repository
+  `.venv` remains untouched.
+- Recreated the temporary environment and completed final verification:
+  **43 focused passed**, **356 full-suite passed in 4.77s**, tracked/source
+  compile passed, all tracked shell scripts passed `bash -n`, static ownership
+  audit found one `PreflightReport` and one `run_preflight`, and
+  `git diff --check` passed.
+- Final real Quick command returned exit code 1 and wrote
+  `runtime/diagnostics/preflight/preflight_quick_20260803T065024.541901Z.json`;
+  the only required failure is missing host `ffmpeg`.
+- Added the required 12-section evidence report at
+  `docs/preflight-readiness-report.md` and updated README, operations and the
+  Vietnamese run guide.
 
 ## Session: 2026-07-30
 

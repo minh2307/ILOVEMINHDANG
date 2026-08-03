@@ -115,6 +115,18 @@ class OllamaClient:
                 checked_at=checked_at,
             )
 
+    async def list_models(self) -> tuple[str, ...]:
+        """Return configured server model identifiers without pulling a model."""
+        response = await self._get("/api/tags", timeout=min(15, self._timeout))
+        models = response.get("models", [])
+        if not isinstance(models, list):
+            raise AIProviderError("Ollama /api/tags returned an invalid models payload")
+        return tuple(
+            str(item.get("name", "")).strip()
+            for item in models
+            if isinstance(item, dict) and str(item.get("name", "")).strip()
+        )
+
     async def get_capabilities(self) -> ModelCapabilities:
         """Determine model capabilities from Ollama model info API.
 

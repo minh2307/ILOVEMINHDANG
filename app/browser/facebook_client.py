@@ -236,7 +236,11 @@ class FacebookWebClient:
                     job_id, details={"facebook_manual_gate": f"invalid_selection_{choice}"}
                 )
             return FacebookPublishResult(
-                False, job_id, target, warnings=["Publication was not approved"],
+                success=False,
+                status="PUBLISH_CANCELLED",
+                target_url=target,
+                job_id=job_id,
+                warnings=["Publication was not approved"],
                 error="Operator did not select Publish now",
             )
         privacy_scan = self.content.privacy.scan(post_text)
@@ -254,7 +258,13 @@ class FacebookWebClient:
                 "FORCE MODE may create a duplicate. Type FORCE PUBLISH to continue: "
             ).strip()
             if warning != "FORCE PUBLISH":
-                return FacebookPublishResult(False, job_id, target, error="Force confirmation failed")
+                return FacebookPublishResult(
+                    success=False,
+                    status="FORCE_CONFIRMATION_FAILED",
+                    target_url=target,
+                    job_id=job_id,
+                    error="Force confirmation failed",
+                )
         started = datetime.now(UTC)
         before_ids = await self._visible_post_ids(page)
         self.repository.transition(
@@ -273,8 +283,36 @@ class FacebookWebClient:
                 diagnostics_dir=self._diagnostics_dir(job_id),
                 context=f"job_id={job_id} state=FACEBOOK_PUBLISHING action=publish_exact_button",
             )
+            
+            await self._save_diagnostics(page, job_id, "pre-publish")
+            # Persist SUBMITTING before clicking — if we crash here, the attempt is UNCERTAIN
+            self.repository.update_data(job_id, {
+                "facebook_submission_status": "SUBMITTING",
+                "facebook_submit_url": safe_browser_url(str(page.url)),
+                "facebook_submit_timestamp": datetime.now(UTC).isoformat(),
+            })
+            self.repository.record_event(
+                job_id, event_type="FACEBOOK_SUBMITTING",
+                details={
+                    "browser_url": safe_browser_url(str(page.url)),
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "submission_status": "SUBMITTING",
+                }
+            )
+
             await button.click()
             publish_clicked = True
+
+            # Persist SUBMITTED_UNCONFIRMED immediately after click
+            self.repository.update_data(job_id, {
+                "facebook_submission_status": "SUBMITTED_UNCONFIRMED",
+                "facebook_click_timestamp": datetime.now(UTC).isoformat(),
+            })
+            self.repository.record_event(
+                job_id, event_type="FACEBOOK_SUBMITTED_UNCONFIRMED",
+                details={"timestamp": datetime.now(UTC).isoformat(), "submission_status": "SUBMITTED_UNCONFIRMED"}
+            )
+            await self._save_diagnostics(page, job_id, "post-click")
             
             # Handle two-step publish flow (Tiếp -> Đăng)
             try:
@@ -298,10 +336,42 @@ class FacebookWebClient:
                         "facebook_verification_signals": signals,
                         "facebook_diagnostic_screenshot_path": str(paths[0]),
                         "facebook_error": result.error,
+                        "facebook_submission_status": "PUBLICATION_UNCERTAIN",
                     },
                 )
-                return result
+                return FacebookPublishResult(
+                    success=False,
+                    status="PUBLICATION_UNCERTAIN",
+                    target_url=target,
+                    job_id=job_id,
+                    diagnostics={"verification_signals": signals},
+                    diagnostic_screenshot_path=str(paths[0]),
+                    error=result.error or "Facebook publication outcome is uncertain — reconciliation required",
+                )
+            # Verified publication — require post_id or permalink
+            if not (result.post_id or result.permalink):
+                # Publication verified by signals but no durable identifier
+                paths = await self._save_diagnostics(page, job_id, "publish-no-id")
+                self.repository.transition(
+                    job_id,
+                    WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+                    details={"reason": "verified_signals_but_no_post_id", "verification_signals": signals},
+                    data_patch={
+                        "facebook_publication_uncertain": True,
+                        "facebook_error": "Post published but no verifiable post ID or permalink captured",
+                        "facebook_submission_status": "PUBLICATION_UNCERTAIN",
+                    },
+                )
+                return FacebookPublishResult(
+                    success=False,
+                    status="VERIFICATION_TIMEOUT",
+                    target_url=target,
+                    job_id=job_id,
+                    diagnostics={"verification_signals": signals},
+                    error="Post published but no verifiable post ID or permalink captured — reconciliation required",
+                )
             completed = datetime.now(UTC)
+            permalink = result.permalink or result.post_url
             self.repository.transition(
                 job_id,
                 WorkflowStatus.FACEBOOK_PUBLISHED,
@@ -311,8 +381,11 @@ class FacebookWebClient:
                     "facebook_publication_completed_at": completed.isoformat(),
                     "facebook_verification_signals": signals,
                     "facebook_post_id": result.post_id,
-                    "facebook_post_url_candidate": result.post_url,
+                    "facebook_post_url": permalink,
+                    "facebook_post_url_candidate": permalink,
                     "facebook_error": None,
+                    "facebook_submission_status": "VERIFIED",
+                    "facebook_verification_method": result.verification_method,
                 },
             )
             return result
@@ -341,15 +414,28 @@ class FacebookWebClient:
                     },
                 )
             return FacebookPublishResult(
-                False, job_id, target,
-                diagnostic_screenshot_path=str(paths[0]), error=str(exc),
+                success=False,
+                status="PUBLICATION_UNCERTAIN" if publish_clicked else "PUBLISH_ACTION_FAILED",
+                target_url=target,
+                job_id=job_id,
+                diagnostic_screenshot_path=str(paths[0]),
+                diagnostics={"exception": str(exc), "publish_clicked": publish_clicked},
+                error=str(exc),
             )
 
     async def reconcile_interrupted_publication(self, *, job_id: str) -> FacebookPublishResult:
         """Verify a post after a crash without ever clicking Publish again."""
         job = self._require_job(job_id)
-        if job.status is not WorkflowStatus.FACEBOOK_PUBLISHING:
-            raise ValueError(f"Publication reconciliation requires FACEBOOK_PUBLISHING; got {job.status.value}")
+        allowed_reconcile_statuses = {
+            WorkflowStatus.FACEBOOK_PUBLISHING,
+            WorkflowStatus.PUBLISH_RECONCILIATION_REQUIRED,
+            WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+        }
+        if job.status not in allowed_reconcile_statuses:
+            raise ValueError(
+                f"Publication reconciliation requires one of "
+                f"{[s.value for s in allowed_reconcile_statuses]}; got {job.status.value}"
+            )
         target = str(job.data.get("facebook_target_url") or "")
         text = str(job.data.get("facebook_post_text") or "")
         images = [Path(path) for path in job.data.get("facebook_image_paths") or []]
@@ -367,7 +453,8 @@ class FacebookWebClient:
             result, signals = await self._verify_publication(
                 page, job_id, text, images, started, before_ids
             )
-            if result.success and result.post_url:
+            if result.success and (result.post_id or result.permalink or result.post_url):
+                permalink = result.permalink or result.post_url
                 self.repository.transition(
                     job_id, WorkflowStatus.FACEBOOK_PUBLISHED,
                     event_type="FACEBOOK_PUBLICATION_RECONCILED",
@@ -376,8 +463,10 @@ class FacebookWebClient:
                         "facebook_publication_verified": True,
                         "facebook_publication_uncertain": False,
                         "facebook_post_id": result.post_id,
-                        "facebook_post_url_candidate": result.post_url,
-                        "facebook_post_url": result.post_url,
+                        "facebook_post_url_candidate": permalink,
+                        "facebook_post_url": permalink,
+                        "facebook_submission_status": "RECONCILED_VERIFIED",
+                        "facebook_verification_method": result.verification_method,
                     },
                 )
                 return result
@@ -387,17 +476,30 @@ class FacebookWebClient:
                 details={"verification_signals": signals, "publish_clicked": False},
                 data_patch={"facebook_publication_uncertain": True},
             )
-            return result
+            return FacebookPublishResult(
+                success=False,
+                status="PUBLICATION_UNCERTAIN",
+                target_url=target,
+                job_id=job_id,
+                diagnostics={"verification_signals": signals},
+                error="Reconciliation did not find a matching verified post",
+            )
         except Exception as exc:
             current = self._require_job(job_id)
-            if current.status is WorkflowStatus.FACEBOOK_PUBLISHING:
+            if current.status in allowed_reconcile_statuses:
                 self.repository.transition(
                     job_id, WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN,
                     event_type="FACEBOOK_PUBLICATION_RECONCILIATION_REQUIRED",
                     details={"error_type": type(exc).__name__, "publish_clicked": False},
                     data_patch={"facebook_publication_uncertain": True},
                 )
-            return FacebookPublishResult(False, job_id, target, error=str(exc))
+            return FacebookPublishResult(
+                success=False,
+                status="PUBLICATION_UNCERTAIN",
+                target_url=target,
+                job_id=job_id,
+                error=str(exc),
+            )
         finally:
             if page is not None and not page.is_closed():
                 close = getattr(page, "close", None)
@@ -728,13 +830,27 @@ class FacebookWebClient:
                 url = candidate.get("url") if candidate else None
                 post_id = self.extract_post_id(url or "")
                 methods = [key for key, value in signals.items() if value]
+                target_url = self._require_job(job_id).data.get("facebook_target_url", "")
                 return FacebookPublishResult(
-                    True, job_id, self._require_job(job_id).data.get("facebook_target_url", ""),
-                    post_id, url, datetime.now(UTC), "+".join(methods), None, [], None,
+                    success=True,
+                    status="PUBLISHED_VERIFIED",
+                    target_url=target_url,
+                    post_id=post_id,
+                    permalink=url,
+                    published_at=datetime.now(UTC),
+                    verification_method="+".join(methods),
+                    job_id=job_id,
+                    post_url=url,
+                    diagnostics={"signals": signals, "candidate": candidate or {}},
                 ), signals
             await asyncio.sleep(1)
+        target_url = self._require_job(job_id).data.get("facebook_target_url", "")
         return FacebookPublishResult(
-            False, job_id, self._require_job(job_id).data.get("facebook_target_url", ""),
+            success=False,
+            status="PUBLICATION_UNCERTAIN",
+            target_url=target_url,
+            job_id=job_id,
+            diagnostics={"signals": signals},
             warnings=["Publication could not be verified strongly enough"],
             error="Facebook publication outcome is uncertain",
         ), signals
@@ -931,17 +1047,43 @@ class FacebookWebClient:
         folder.mkdir(parents=True, exist_ok=True)
         screenshot = (folder / f"{name}.png").resolve()
         metadata = (folder / f"{name}.json").resolve()
-        await page.screenshot(path=str(screenshot), full_page=True)
-        metadata.write_text(
-            json.dumps({"url": safe_browser_url(str(page.url)), "name": name}, indent=2),
-            encoding="utf-8",
-        )
+        attempt_json = (folder / "attempt.json").resolve()
+        
+        try:
+            await page.screenshot(path=str(screenshot), full_page=True)
+        except Exception:
+            pass
+            
+        try:
+            title = await page.title()
+        except Exception:
+            title = "Unknown"
+            
+        job = self._require_job(job_id)
+        
+        info = {
+            "url": safe_browser_url(str(getattr(page, "url", ""))),
+            "name": name,
+            "title": title,
+            "job_id": job_id,
+            "target_url": job.data.get("facebook_target_url"),
+            "content_fingerprint": job.data.get("facebook_content_hash"),
+        }
+        metadata.write_text(json.dumps(info, indent=2), encoding="utf-8")
+        attempt_json.write_text(json.dumps(info, indent=2), encoding="utf-8")
+        
         artifact = metadata
         if self.settings.save_diagnostic_html:
             artifact = (folder / f"{name}.html").resolve()
-            artifact.write_text(await page.content(), encoding="utf-8")
-        for path in (screenshot, metadata, artifact):
-            path.chmod(0o600)
+            try:
+                artifact.write_text(await page.content(), encoding="utf-8")
+            except Exception:
+                pass
+        
+        for path in (screenshot, metadata, attempt_json, artifact):
+            if path.exists():
+                path.chmod(0o600)
+                
         return screenshot, artifact
 
     async def _fail_with_diagnostics(
@@ -1023,7 +1165,16 @@ class FacebookWebClient:
         return (self.settings.job_data_dir / job_id).resolve()
 
     def _diagnostics_dir(self, job_id: str) -> Path:
-        return self._job_dir(job_id) / "browser_snapshots" / "facebook"
+        job = self._require_job(job_id)
+        raw_started = job.data.get("facebook_publication_started_at")
+        ts = "latest"
+        if raw_started:
+            try:
+                dt = datetime.fromisoformat(raw_started.replace("Z", "+00:00"))
+                ts = dt.strftime("%Y%m%dT%H%M%SZ")
+            except Exception:
+                pass
+        return self.settings.project_root / "runtime" / "diagnostics" / "jobs" / job_id / ts / "facebook-publish"
 
     @staticmethod
     async def _input_text(locator: Any) -> str:

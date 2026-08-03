@@ -26,7 +26,7 @@ class JobStateTransitions:
         JobStatus.FACEBOOK_PREPARING: frozenset({JobStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW, JobStatus.FACEBOOK_PUBLISH_FAILED, JobStatus.WAITING_FOR_AUTH_REVIEW, JobStatus.RETRYABLE, JobStatus.RETRY_PENDING, JobStatus.BLOCKED}),
         JobStatus.WAITING_FOR_AUTH_REVIEW: frozenset({JobStatus.FACEBOOK_PREPARING, JobStatus.RETRYABLE, JobStatus.BLOCKED}),
         JobStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW: frozenset({JobStatus.FACEBOOK_PUBLISHING, JobStatus.FACEBOOK_PUBLISH_FAILED, JobStatus.APPROVED}),
-        JobStatus.FACEBOOK_PUBLISHING: frozenset({JobStatus.FACEBOOK_PUBLISHED, JobStatus.FACEBOOK_PUBLISH_FAILED, JobStatus.FACEBOOK_PUBLISH_UNCERTAIN}),
+        JobStatus.FACEBOOK_PUBLISHING: frozenset({JobStatus.FACEBOOK_PUBLISHED, JobStatus.FACEBOOK_PUBLISH_FAILED, JobStatus.FACEBOOK_PUBLISH_UNCERTAIN, JobStatus.AUTHENTICATION_REQUIRED}),
         JobStatus.FACEBOOK_PUBLISHED: frozenset({JobStatus.POST_URL_EXTRACTING}),
         JobStatus.POST_URL_EXTRACTING: frozenset({JobStatus.POST_URL_EXTRACTED, JobStatus.POST_URL_EXTRACTION_FAILED, JobStatus.RETRY_PENDING}),
         JobStatus.POST_URL_EXTRACTED: frozenset({JobStatus.COMMENT_ADDING}),
@@ -39,7 +39,19 @@ class JobStateTransitions:
         JobStatus.FACEBOOK_PUBLISH_FAILED: frozenset({JobStatus.RETRY_PENDING}),
         JobStatus.POST_URL_EXTRACTION_FAILED: frozenset({JobStatus.RETRY_PENDING}),
         JobStatus.COMMENT_FAILED: frozenset({JobStatus.RETRY_PENDING}),
-        JobStatus.FACEBOOK_PUBLISH_UNCERTAIN: frozenset(),
+        # FACEBOOK_PUBLISH_UNCERTAIN: can escalate to formal reconciliation required,
+        # or loop back to itself during incremental reconcile attempts.
+        JobStatus.FACEBOOK_PUBLISH_UNCERTAIN: frozenset({
+            JobStatus.PUBLISH_RECONCILIATION_REQUIRED,
+            JobStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+        }),
+        # PUBLISH_RECONCILIATION_REQUIRED: can resolve to PUBLISHED (post found)
+        # or fall back to UNCERTAIN (post not found, try again later).
+        JobStatus.PUBLISH_RECONCILIATION_REQUIRED: frozenset({
+            JobStatus.FACEBOOK_PUBLISHED,
+            JobStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+        }),
+        JobStatus.AUTHENTICATION_REQUIRED: frozenset({JobStatus.FACEBOOK_PREPARING, JobStatus.FACEBOOK_PUBLISHING, JobStatus.WAITING_FOR_AUTH_REVIEW}),
         JobStatus.RETRY_PENDING: frozenset({JobStatus.DOWNLOADREEL_RUNNING, JobStatus.GEMINI_OPENING, JobStatus.AI_ANALYZING, JobStatus.CDHA_OPENING, JobStatus.SCREENSHOTS_CAPTURING, JobStatus.FACEBOOK_PREPARING, JobStatus.POST_URL_EXTRACTING, JobStatus.COMMENT_ADDING}),
         JobStatus.RETRYABLE: frozenset({JobStatus.DOWNLOADREEL_RUNNING, JobStatus.AI_ANALYZING, JobStatus.CDHA_OPENING, JobStatus.FACEBOOK_PREPARING, JobStatus.POST_URL_EXTRACTING, JobStatus.COMMENT_ADDING}),
         JobStatus.BLOCKED: frozenset({JobStatus.RETRYABLE}),

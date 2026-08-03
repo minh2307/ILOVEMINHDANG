@@ -3,14 +3,14 @@ from __future__ import annotations
 import importlib.util
 from dataclasses import replace
 
-import pytest
-
 from app.config.facebook_browser import FacebookBrowserConfig
 from app.config.settings import Settings
-from app.preflight import PreflightError, run_preflight
+from app.preflight import CheckStatus, run_preflight
 
 
-def test_missing_playwright_fails_before_runtime_mutation(tmp_path, monkeypatch):
+def test_missing_playwright_is_structured_failure_before_runtime_mutation(
+    tmp_path, monkeypatch
+):
     settings = replace(
         Settings.from_env(tmp_path / "missing.env"),
         facebook_target_url="https://www.facebook.com/test",
@@ -30,8 +30,14 @@ def test_missing_playwright_fails_before_runtime_mutation(tmp_path, monkeypatch)
         lambda name: None if name == "playwright" else real_find_spec(name),
     )
 
-    with pytest.raises(PreflightError, match="Playwright is not installed"):
-        run_preflight(settings, config)
+    report = run_preflight(settings, config, mode="quick", write_report=False)
 
+    package_check = next(check for check in report.checks if check.name == "python_packages")
+    composition_check = next(
+        check for check in report.checks if check.name == "composition_root"
+    )
+    assert report.overall_status == "FAIL"
+    assert package_check.status is CheckStatus.FAILED
+    assert composition_check.status is CheckStatus.SKIPPED
     assert not config.lock_path.exists()
     assert not settings.database_path.exists()

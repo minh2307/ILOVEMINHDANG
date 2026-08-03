@@ -49,6 +49,7 @@ class SQLiteJobQueue(JobQueuePort):
                     claimed_by TEXT,
                     lease_expires_at REAL,
                     last_heartbeat TEXT,
+                    current_stage TEXT,
                     completed_at TEXT,
                     created_at TEXT,
                     updated_at TEXT
@@ -63,6 +64,7 @@ class SQLiteJobQueue(JobQueuePort):
                 "claimed_by": "TEXT",
                 "lease_expires_at": "REAL",
                 "last_heartbeat": "TEXT",
+                "current_stage": "TEXT",
                 "completed_at": "TEXT",
                 "created_at": "TEXT",
                 "updated_at": "TEXT",
@@ -154,7 +156,8 @@ class SQLiteJobQueue(JobQueuePort):
             changed = conn.execute("""
                 UPDATE queue
                 SET status = 'ACQUIRING_BROWSER_LOCK', claimed_by = ?,
-                    lease_expires_at = ?, last_heartbeat = ?, updated_at = ?
+                    lease_expires_at = ?, last_heartbeat = ?,
+                    current_stage = 'ACQUIRING_BROWSER_LOCK', updated_at = ?
                 WHERE job_id = ? AND status = ?
             """, (
                 worker_id, now_epoch + lease_seconds, now, now,
@@ -177,7 +180,12 @@ class SQLiteJobQueue(JobQueuePort):
             )
 
     async def heartbeat(
-        self, job_id: str, *, worker_id: str, lease_seconds: float = 120.0
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: float = 120.0,
+        current_stage: str | None = None,
     ) -> bool:
         """Extend a claim only when it is still owned by this worker."""
         now_epoch = time.time()
@@ -185,10 +193,18 @@ class SQLiteJobQueue(JobQueuePort):
         with self._connect() as conn:
             changed = conn.execute("""
                 UPDATE queue
-                SET lease_expires_at = ?, last_heartbeat = ?, updated_at = ?
+                SET lease_expires_at = ?, last_heartbeat = ?,
+                    current_stage = COALESCE(?, current_stage), updated_at = ?
                 WHERE job_id = ? AND claimed_by = ?
                   AND status IN ('ACQUIRING_BROWSER_LOCK', 'WAITING_FOR_BROWSER_LOCK', 'RUNNING')
-            """, (now_epoch + max(1.0, float(lease_seconds)), now, now, job_id, worker_id)).rowcount
+            """, (
+                now_epoch + max(0.01, float(lease_seconds)),
+                now,
+                current_stage,
+                now,
+                job_id,
+                worker_id,
+            )).rowcount
             return changed == 1
 
     async def set_state(
@@ -207,8 +223,9 @@ class SQLiteJobQueue(JobQueuePort):
             if row is None:
                 return False
             conn.execute(
-                "UPDATE queue SET status = ?, updated_at = ? WHERE job_id = ?",
-                (state_value, self._timestamp(), job_id),
+                "UPDATE queue SET status = ?, current_stage = ?, updated_at = ? "
+                "WHERE job_id = ?",
+                (state_value, state_value, self._timestamp(), job_id),
             )
             self._insert_event(
                 conn, job_id, event_type, from_state=row["status"], to_state=state_value,
@@ -278,24 +295,49 @@ class SQLiteJobQueue(JobQueuePort):
         with self._connect() as conn:
             placeholders = ",".join("?" for _ in self.INTERRUPTED_STATES)
             rows = conn.execute(
-                f"SELECT job_id, status, attempt_count FROM queue "
+                f"SELECT job_id, status, attempt_count, max_attempts FROM queue "
                 f"WHERE status IN ({placeholders}) "
                 "AND (lease_expires_at IS NULL OR lease_expires_at <= ?)",
                 (*self.INTERRUPTED_STATES, now_epoch),
             ).fetchall()
             for row in rows:
                 attempt = row["attempt_count"] + 1
+                exhausted = attempt > row["max_attempts"]
+                target = "BLOCKED" if exhausted else "RETRYABLE"
+                error_message = (
+                    "Maximum retry attempts exceeded during stale lease recovery"
+                    if exhausted
+                    else "Worker lease expired before completion"
+                )
                 conn.execute("""
-                    UPDATE queue SET status='RETRYABLE', attempt_count=?, next_retry_at=0,
-                           error_message='Worker lease expired before completion',
+                    UPDATE queue SET status=?, attempt_count=?, next_retry_at=0,
+                           error_message=?,
                            claimed_by=NULL, lease_expires_at=NULL, last_heartbeat=NULL,
-                           updated_at=?
+                           current_stage=?, updated_at=?
                     WHERE job_id=?
-                """, (attempt, now, row["job_id"]))
+                """, (
+                    target,
+                    attempt,
+                    error_message,
+                    target,
+                    now,
+                    row["job_id"],
+                ))
                 self._insert_event(
-                    conn, row["job_id"], "PLAYWRIGHT_RETRY_SCHEDULED",
-                    from_state=row["status"], to_state="RETRYABLE", attempt=attempt,
-                    details={"reason": "expired_worker_lease", "delay_seconds": 0},
+                    conn,
+                    row["job_id"],
+                    "MAXIMUM_ATTEMPTS_EXCEEDED"
+                    if exhausted
+                    else "PLAYWRIGHT_RETRY_SCHEDULED",
+                    from_state=row["status"],
+                    to_state=target,
+                    attempt=attempt,
+                    details={
+                        "reason": "maximum_attempts_exceeded"
+                        if exhausted
+                        else "expired_worker_lease",
+                        "delay_seconds": 0,
+                    },
                 )
             return len(rows)
 

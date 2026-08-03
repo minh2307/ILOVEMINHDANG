@@ -178,6 +178,14 @@ class OllamaAnalyzer:
     async def health_check(self) -> AIHealthStatus:
         return await self._client.health_check()
 
+    async def list_models(self) -> tuple[str, ...]:
+        """Read-only readiness hook using the official configured client."""
+        return await self._client.list_models()
+
+    async def minimal_inference(self, prompt: str) -> str:
+        """Run a non-clinical readiness inference through the official adapter."""
+        return await self._client.generate(prompt=prompt, stream=False)
+
     async def get_capabilities(self) -> ModelCapabilities:
         return await self._client.get_capabilities()
 

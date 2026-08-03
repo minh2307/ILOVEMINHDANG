@@ -140,7 +140,10 @@ def test_confirm_publish_invokes_official_use_case(cli, monkeypatch):
 
 @dataclass
 class FakePreflightReport:
-    success: bool = True
+    overall_status: str = "PASS"
+
+    def to_dict(self):
+        return {"overall_status": self.overall_status}
 
 
 def test_worker_command_invokes_official_worker_runner(cli, monkeypatch):
@@ -150,12 +153,34 @@ def test_worker_command_invokes_official_worker_runner(cli, monkeypatch):
     )
     monkeypatch.setattr(
         "app.preflight.run_preflight",
-        lambda _settings, _browser_config: FakePreflightReport(),
+        lambda _settings, _browser_config, **_kwargs: FakePreflightReport(),
     )
 
     assert main(["worker", "--once"]) == 0
     assert cli[-1].worker.once_calls == 1
     assert cli[-1].worker.start_calls == 0
+
+
+def test_preflight_command_uses_mode_and_exit_code(cli, monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(
+        "app.config.facebook_browser.FacebookBrowserConfig.from_settings",
+        lambda _settings: object(),
+    )
+    monkeypatch.setattr(
+        "app.preflight.run_preflight",
+        lambda _settings, _browser_config, **kwargs: (
+            calls.append(kwargs) or FakePreflightReport("FAIL")
+        ),
+    )
+    monkeypatch.setattr(
+        "app.preflight.format_preflight_report",
+        lambda report, **_kwargs: f"Overall verdict: {report.overall_status}",
+    )
+
+    assert main(["preflight", "--mode", "full", "--verbose"]) == 1
+    assert calls == [{"mode": "full"}]
+    assert "Overall verdict: FAIL" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(

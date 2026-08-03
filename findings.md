@@ -1,3 +1,397 @@
+# Findings — Prompt 5 Facebook Publication Verification
+
+- Ngày 2026-08-03, `promt.md` hiện có **1.258 dòng**, SHA-256
+  `2011198ec0be33b54c9cdff0a0e59a51bc1a4fab7bf0accd1c5cef0f05859195`;
+  đây là Prompt 5, không phải Prompt 4 được ghi trong chat tham chiếu.
+- Baseline được prompt tuyên bố là 388 test; cần chạy lại, không dựa riêng vào
+  lịch sử.
+- Definition of Done yêu cầu verified post ID/permalink, mandatory validation,
+  durable attempt trước side effect, `SUBMITTING` trước final click, uncertain
+  state không auto-retry, reconciliation use case/CLI và duplicate prevention
+  qua restart.
+- Live publication không được thực hiện hoặc tuyên bố nếu không có readiness,
+  authorization và bằng chứng post thật. Mock chỉ chứng minh automated behavior.
+- Worktree hiện chứa thay đổi Prompt 1–4 (28 file trong diff stat cùng file mới);
+  toàn bộ được bảo toàn, không reset/ghi đè.
+- Chưa sửa production cho Prompt 5; đang ở systematic-debugging Phase 1:
+  persisted evidence và official call graph trước mọi fix.
+- Đã đọc trọn 1.258 dòng Prompt 5. Các ranh giới bắt buộc gồm semantic composer
+  selectors, kiểm tra caption/media ngay trong composer, exact post evidence,
+  canonical permalink validation, attempt lifecycle, retry-safety taxonomy,
+  reconciliation và sanitized job-specific diagnostics.
+- Safe verification chỉ được dùng fixture/mock nếu live flag không bật; Full
+  chỉ chạy khi có quyền live. Không tự bật `E2E_ALLOW_LIVE_PUBLISH`.
+- Active official flow sơ bộ: `app.main confirm-publish` →
+  `ConfirmPublishUseCase` → durable queue → `ProcessJobUseCase`/
+  `VerifiedWorkflowStageAdapter` → `CDHAPipeline` →
+  `PlaywrightFacebookAdapter` → `FacebookWebClient`.
+- `FacebookWebClient` hiện đã có prepare/publish/reconcile/permalink helpers và
+  trạng thái `FACEBOOK_PUBLISH_UNCERTAIN`, nhưng publish đang chuyển thẳng
+  `FACEBOOK_PUBLISHING → FACEBOOK_PUBLISHED` trước stage extract permalink.
+  Đây là gap cần chứng minh bằng đọc source/test/persisted records.
+- Có một `PlaywrightPostAdapter` khác cho legacy port; cần xác định nó chỉ
+  delegate/deprecate hay còn active trước khi kết luận có hai publisher.
+- `confirm-publish` hiện chỉ hỏi exact phrase rồi queue một workflow item; Worker
+  chạy `ProcessJobUseCase`. Khi status `FACEBOOK_PUBLISHING`, use case gọi
+  reconciliation; khi `FACEBOOK_PUBLISHED`, nó tách permalink thành stage sau.
+- `PlaywrightPostAdapter` đã bị vô hiệu hóa rõ ràng và không tạo browser/publish;
+  active publisher là `FacebookPublisherAdapter`/`FacebookWebClient`.
+- Active adapter xây caption và ghi cả raw `facebook_post_text` vào job data,
+  rồi gọi browser prepare. Nó chưa có mandatory domain validation/attempt
+  persistence boundary riêng trước browser side effect.
+- `FacebookPublisherAdapter.complete()` vẫn coi `FACEBOOK_PUBLISHED` là đầu vào
+  để trích permalink, xác nhận evidence được persist sau published state ở thiết
+  kế hiện tại.
+- Root cause false success đã xác nhận trực tiếp:
+  `publication_is_verified()` cho phép `publish_success` toast +
+  `composer_closed` thành verified dù không có exact candidate. Result có thể
+  `success=True` với cả `post_id=None` và `post_url=None`, rồi transition
+  `FACEBOOK_PUBLISHED`.
+- Publisher chỉ lưu `FACEBOOK_PUBLISHING` trước click; chưa có durable
+  publication-attempt entity/status `SUBMITTING`/`SUBMITTED_UNCONFIRMED`.
+  `publish_clicked` chỉ là biến RAM, nên crash boundary không bền vững.
+- Hai-step flow nuốt mọi exception khi tìm/click nút `post_button`, làm mờ
+  không tìm thấy/hidden/disabled/ambiguous và có thể tiếp tục verification sai.
+- Selector `publish_button` trộn `Tiếp/Next` và `Đăng/Post` cùng broad CSS
+  `:has-text`, trong khi Prompt 5 cần phân biệt action và chặn ambiguity.
+- Validation hiện có nền tảng tốt (clinical sections, URLs, PII, images) nhưng
+  fingerprint chỉ gồm target+caption+media; thiếu job/source/CDHA external ID.
+  Nó cũng chưa xác nhận caption hiện tại khớp approved snapshot/version.
+- `_ensure_authenticated()` chuyển UNKNOWN thành `RETRYABLE` ở prepare; Prompt 5
+  yêu cầu UNKNOWN block publication/reconciliation, không xem là selector drift
+  hoặc auto-retry.
+- `FACEBOOK_PUBLISH_UNCERTAIN` hiện terminal và không thể completed (đúng safety
+  nền), nhưng không có đường official reconciliation success từ trạng thái đó.
+- Canonical persisted DB là `data/jobs.sqlite3`; schema hiện không có bảng
+  publication attempts. Attempts chỉ tồn tại gián tiếp trong `jobs.data_json`
+  và `job_events`, không có unique fingerprint/status ownership riêng.
+- Persisted evidence:
+  - job `cf768...` đang `COMPLETED` nhưng vẫn có
+    `facebook_publication_uncertain=1`, `post_id=NULL` và một share URL;
+  - job `50e5...` ghi nhận nhiều UNKNOWN → `RETRYABLE`, sau đó nhiều lần
+    `FACEBOOK_PUBLISHING → FACEBOOK_PUBLISH_UNCERTAIN → FAILED`;
+  - event 467 ghi đúng lỗi `FACEBOOK_PUBLISH_FAILED -> COMPLETED`;
+  - các event cũ có uncertain bị đưa trở lại manual review/post URL extracted,
+    chứng minh duplicate/bypass risk trong persisted history;
+  - nhiều failure do selector chọn nhầm nút `Tiếp` disabled hoặc không resolve
+    composer/publish controls.
+- Có ít nhất một record `FACEBOOK_PUBLISHING → FACEBOOK_PUBLISHED` rồi mới
+  `POST_URL_EXTRACTING`, phù hợp với false-success architecture đã thấy trong
+  source; DB có verified records nhưng evidence model không tách raw/canonical
+  hoặc attempt.
+- Baseline trực tiếp ngoài restricted sandbox: **388 passed in 5.28s**. Suite
+  sandbox treo ở ~27% vì stream-fd infrastructure, không phải test failure.
+
+---
+
+# Findings — Prompt 4 CDHA/Browser Reliability
+
+- Ngày 2026-08-03, `promt.md` hiện có 945 dòng và là Prompt 4, không phải Prompt
+  3 hay refactor browser cũ trong chat tham chiếu.
+- Phạm vi chính: failure evidence thật, browser ownership/health, CDHA selector
+  và semantic state, bounded waits/timeouts, queue lease/heartbeat/recovery,
+  retry/idempotency và diagnostics sanitized.
+- Baseline worktree có 15 modified/untracked files thuộc Prompt 3; tất cả được
+  coi là thay đổi người dùng cần bảo toàn. Không reset hoặc ghi đè.
+- Planning files hiện chứa lịch sử nhiều prompt; kế hoạch Prompt 4 được thêm ở
+  đầu thay vì xóa lịch sử.
+- Chưa có kết luận root cause hoặc thay đổi production nào cho Prompt 4.
+- Đã đọc trọn 945 dòng prompt. Definition of Done yêu cầu không chỉ selector:
+  phải chứng minh ownership, health states, bounded semantic waits, typed
+  timeouts, lease/heartbeat, crash resume, CDHA idempotency, auth taxonomy,
+  diagnostics, official recovery commands và full regression suite.
+- Source hiện đã có nền tảng lease/heartbeat: `workers/facebook_browser_worker.py`
+  nhận queue lease/heartbeat, tạo task renew lease, duy trì browser-lock
+  heartbeat và giới hạn retry; SQLite queue có `claimed_by`,
+  `lease_expires_at`, `last_heartbeat`.
+- `workers/facebook_browser_worker.py` vẫn có mặc định lock wait 180 giây; settings
+  cũng còn nhiều timeout 180 giây. Cần phân biệt hard-coded legacy với timeout
+  có kiểu trước khi kết luận lỗi.
+- Selector CDHA hiện có `#btnComplete` trong `app/config/selectors.yaml`; chưa xác
+  nhận registry/detector active hay fallback thực tế vì output search bị
+  truncate.
+- Các fixed waits thấy trong active `screenshot_service.py` và nhiều module
+  legacy. Phần `.disabled`/`infrastructure/legacy` không được coi là active nếu
+  call graph không dẫn tới chúng.
+- Runtime hiện có Full/Quick preflight diagnostics, Facebook debug HTML/metadata,
+  Chrome PID và browser lock guard/startup. Chưa đọc nội dung nhạy cảm; mọi lần
+  đọc tiếp sẽ chỉ lấy metadata/sanitized evidence cần thiết.
+- Có nhiều SQLite ứng viên (`data/jobs.db`, `data/cdha_workflow.db`,
+  `data/jobs.sqlite3`, `data/cdha_jobs.db`, `data/facebook_browser_jobs.sqlite3`,
+  `data/pipeline.db`, `runtime/jobs.sqlite3`, `runtime/queue.db`). Cần xác định
+  canonical path từ `Settings`/composition root trước khi query record.
+- Active `CDHAWebClient.analyze_video()` mở trang qua `ChromeManager.new_page()`,
+  dùng `cdha_view_url` để bỏ upload khi đã có result URL, nhưng đường no-result
+  upload/chạy analysis chưa thấy external ID/fingerprint trong phần đã đọc.
+- Client hiện gọi `_wait_for_analysis(page)` sau click và có một fixed
+  `page.wait_for_timeout(1000)` ở auto-share; auto-share nằm trước transition
+  `CDHA_ANALYZED` và nuốt mọi exception thành warning. Cần đọc toàn bộ helper/call
+  chain để xác định tác động, chưa sửa.
+- `FacebookBrowserManager.close()` chỉ dừng Playwright connection và release lock,
+  không gọi `browser.close()`/`context.close()`. `new_page()` trả page trực tiếp;
+  ownership/release API và health taxonomy chưa thấy trong phần source đã đọc.
+- `SQLiteJobQueue.dequeue()` claim bằng `BEGIN IMMEDIATE` + conditional update,
+  heartbeat chỉ gia hạn khi đúng worker và trạng thái in-flight. `recover_jobs()`
+  chỉ xét lease expiry, tăng attempt rồi requeue; chưa thấy enforcement
+  `max_attempts` trong recovery hoặc stage field riêng.
+- Composition root xác nhận canonical workflow DB/queue cùng dùng
+  `Settings.database_path`, mặc định `data/jobs.sqlite3`.
+- Settings hiện tách `page_timeout=60`, `upload_timeout=180`,
+  `cdha_analysis_timeout=900`, poll/stability, browser startup/lock wait,
+  queue lease/heartbeat và Facebook timeouts. Tuy vậy chưa có CDHA result timeout,
+  worker stage timeout hay browser action/navigation names độc lập đúng contract.
+- `CDHAWebClient._complete_upload()` resolve `cdha.upload_complete_button` trong
+  iframe với timeout 90 giây, chỉ kiểm `is_enabled`, rồi click; hidden/attached/
+  covered/page-health/current semantic state chưa được tách.
+- `_wait_for_analysis()` đã dùng monotonic bounded polling, nhưng trả success chỉ
+  theo `view=` URL hoặc generic `analysis_complete`/result selector và ném
+  `TimeoutError` chuỗi; chưa có final structured state, stage-aware diagnostics
+  hay callback heartbeat.
+- Host thiếu CLI `sqlite3`; đây là tooling môi trường, không phải code defect.
+  Query tiếp theo sẽ dùng Python stdlib ở chế độ read-only.
+
+## Persisted Failure Inventory
+
+| Failure | Evidence source | Stage | Current handler | Observed retry |
+|---|---|---|---|---|
+| Page/context/browser closed during analysis | `job_events` 53, job `cf768...`: `Page.title: Target page, context or browser has been closed`; workflow log lines 578–609 | `CDHA_ANALYZING` | generic Playwright mapper; diagnostic screenshot/title retried on closed page | transitioned `CDHA_FAILED`; historical repeats |
+| Browser connection closed before page acquisition | `job_events` 272, job `e6f...`: `BrowserContext.new_page: Connection closed while reading from the driver` | `CDHA_OPENING` | `BROWSER_NETWORK_ERROR`, retryable | no health-specific persisted state |
+| `#btnComplete` hidden and disabled | `job_events` 238: locator repeatedly resolved to hidden `<button disabled id="btnComplete"...>` then target closed | `CDHA_UPLOADING` / selector resolution | `SelectorResolver.find_first()` waits for visible, ultimately mapped `BROWSER_TARGET_CLOSED` | retryable target-closed obscures hidden/disabled state |
+| Completion control missing | `job_events` 234 + log 2115: only `#btnComplete`, timeout/`SELECTOR_NOT_FOUND` | `CDHA_UPLOADING` | selector resolution error | non-retryable/manual |
+| Upload unacknowledged | events 39/226 and log 437: upload start not detected/outcome uncertain | `CDHA_UPLOADING` | `CDHAUploadError(CDHA_UPLOAD_UNCERTAIN)` | non-retryable/manual |
+| CDHA login required | events 20/444; diagnostic title localized login | `CDHA_OPENING` | transition `NEEDS_CDHA_LOGIN` | manual action, no bypass |
+| Result URL treated complete with unknown job logging | log 2158/2500/2623/2676/2904 | `CDHA_ANALYZING` | `_wait_for_analysis` returns on any `view=` URL and logs `job_id=unknown` | proceeds as success before result extraction validates |
+| Queue item timeout near 180s | queue row `...:CREATED` and event 516: worker did not complete inner job within 180s | `DOWNLOADREEL_RUNNING` | legacy worker-client wait | failed; later separate retry queue item completed |
+| Facebook auth/unknown | events/logs 485+, log 2870–2884 | `FACEBOOK_PREPARING` | page-state detector distinguishes `login_required` and `unknown` | publish blocked/failed; Prompt 5 owns verification |
+
+- Canonical DB contains 11 workflow jobs, 529 job events, 3 official queue rows
+  and 13 queue events. No active lease/heartbeat values remain in persisted rows.
+- Diagnostics are currently sparse two-field JSON for CDHA failure
+  (`url`, masked `title`); selector diagnostics do record candidates/failures and
+  workflow context. They do not yet record browser health, semantic CDHA state,
+  timeout, lease or heartbeat.
+- The historical hidden/disabled evidence proves the active UI really used an
+  iframe `#iframeContent` and `#btnComplete`, so keeping that ID as a registry
+  candidate is justified; inventing `data-testid` would not be.
+- The diagnostic failure path is a confirmed secondary root cause: after a
+  TargetClosed error, `save_diagnostics()` unconditionally screenshots and reads
+  title/content, causing another TargetClosed and losing the intended bundle.
+- `SelectorResolver.find_first()` supports ordered candidates but only returns a
+  locator once visible. It cannot report attached/hidden/disabled separately;
+  `exists()` also means “visible”, not DOM presence. This is the source-level
+  reason persisted hidden `#btnComplete` becomes a timeout/selector/closed error.
+- `selectors.yaml` has exactly one upload completion candidate:
+  `css: #btnComplete`. Actual evidence supports adding real semantic fallback
+  `role=button` with localized text `Hoàn tất` (seen in persisted DOM trace);
+  no evidence yet for an iframe alternative or `data-testid`.
+- Canonical errors collapse page/context/browser closure into one
+  `BrowserTargetClosedError`. Browser port/model are skeletal and disconnected
+  from the active `FacebookBrowserManager`; they expose no acquire/release/health.
+- Worker creates queue-heartbeat immediately after claim and cancels it in
+  `finally`, while browser lock heartbeat runs only after acquisition. It records
+  no workflow stage into queue, does not interrupt dispatch after lease renewal
+  rejection, and classifies retryability by string matching instead of the
+  canonical `PipelineError.retryable`.
+- Existing tests already cover atomic claim, fresh-heartbeat recovery protection,
+  lock timeout, one bounded upload acknowledgement, one CDHA analysis timeout
+  and target-closed not becoming selector-not-found. They do not cover hidden/
+  disabled control taxonomy, health distinction, lease-loss cancellation,
+  max-attempt recovery or idempotent external submission.
+- Lần probe trước dùng các `test -x` nối bằng `;` nên output cuối không chứng minh
+  từng đường dẫn tồn tại. Baseline xác nhận `/tmp/minhdang-preflight-venv` đã bị
+  dọn; repository `.venv` cần được kiểm tra riêng và không được sửa.
+- Baseline thực tế của worktree hiện tại là **357 passed in 5.51s**, không phải
+  356; chênh một test đến từ Prompt 3 đang chưa commit. Restricted sandbox dừng
+  giữa suite không có summary, còn cùng lệnh ngoài sandbox hoàn tất exit 0.
+- `cdha_external_analysis_id` chỉ xuất hiện trong một lifecycle unit test; active
+  `CDHAWebClient` hiện chỉ reuse `cdha_view_url`. Vì vậy test resume ở application
+  layer tạo cảm giác idempotency nhưng browser adapter chưa persist/reconcile
+  external identity đúng lúc.
+- Download adapter đã persist `checksum_sha256`; đây là stable source-video hash
+  có thể được đưa vào CDHA submission fingerprint cùng `job_id` và normalized
+  source URL, không cần hash lại filename.
+- `FacebookTabManager` đã có ownership per job và chỉ close temporary Facebook
+  pages trong `release_job`; `CDHAWebClient` không dùng tab manager và không
+  release page nó tạo, nên temporary CDHA pages hiện leak cho đến manager detach.
+- Official CLI đã có `status/retry/resume` use cases. Chưa có `inspect-browser`
+  hay `inspect-queue`; `status` trả queue rows liên quan nhưng không có diagnosis/
+  next-action synthesis.
+- `sanitized_runtime_configuration()` chỉ xuất browser startup/action timeout;
+  chưa xuất upload/analysis/result/lease/heartbeat/stage timeouts theo Prompt 4.
+- Audit path của transition map bị đoán sai; phải locate bằng source search, chưa
+  có kết luận về trạng thái auth blocked mới.
+- Transition map thật ở `app/domain/rules/state_transitions.py`. `NEEDS_CDHA_LOGIN`
+  hiện có thể đi `CDHA_UPLOADING/CDHA_FAILED/RETRY_PENDING`; không có
+  `WAITING_FOR_AUTH_REVIEW` từ CDHA. Giữ `NEEDS_CDHA_LOGIN` là manual blocked
+  state phù hợp hơn thêm enum thứ hai.
+- CDHA contract test hiện giả Chrome `wait_for_manual_action()` tự hoàn tất và
+  chỉ xác nhận final `NEEDS_CDHA_LOGIN` khi auth vẫn thiếu. Có thể bỏ interactive
+  wait khỏi worker adapter và trả manual error ngay mà vẫn giữ state semantics;
+  login setup CLI riêng vẫn là nơi hợp lệ để chờ operator.
+- Root-cause hypotheses đã đủ cụ thể để bắt đầu test đỏ:
+  1) visible-only resolver gây mất hidden/disabled state;
+  2) manager thiếu tracked page ownership/health;
+  3) CDHA chỉ reuse result URL, không persist submitting fingerprint/external ID;
+  4) queue recovery không enforce max attempt và worker không dừng khi lease mất;
+  5) closed-page diagnostics cố tương tác với target đã chết.
+- Regression Prompt 4 ban đầu đỏ đúng tại import `app.browser.cdha_state`, chứng
+  minh test chưa thể pass nhờ implementation cũ. Sau implementation đầu,
+  **13/13 Prompt 4 tests** và **86/86 focused existing+new tests** pass.
+- Lifecycle ownership cuối pha 2: `FacebookBrowserManager` sở hữu Playwright
+  attach, shared connection/context/lock và registry temporary pages; adapter chỉ
+  release page manager đã cấp. `close()` release tracked pages rồi chỉ detach
+  Playwright, không close shared browser/context.
+- Health state hiện phân biệt `DISCONNECTED`, `CONTEXT_CLOSED`, `PAGE_CLOSED`,
+  `CONNECTED`; errors riêng không còn buộc mọi closure thành selector mismatch.
+- Settings mới tách action/navigation/upload/analysis/result/lease/heartbeat/
+  worker-stage timeout và đưa chúng vào startup diagnostics sanitized.
+- Full-suite attempt đầu sau implementation đạt 383 pass/1 fail. Failure không
+  phải CDHA: diagnostics contract cũ cho phép capture một page synthetic còn mở
+  dù manager chưa attach. Fix tại ranh giới đúng: health vẫn `DISCONNECTED`, URL
+  vẫn sanitized, nhưng target còn mở được capture; target `PAGE_CLOSED` không bị
+  gọi title/screenshot/content. Focused regression **28 passed**.
+- CDHA result URL không còn bị lẫn với upload URL: `#urlInput` được persist là
+  `cdha_upload_url/UPLOADED`; external analysis ID chỉ parse từ URL `?view=` sau
+  khi analysis đạt result boundary. Restart ở `SUBMITTING/UPLOADED/UNCERTAIN`
+  không tự upload lại.
+- Queue cuối pha 4 có atomic claim, owner, lease expiry, heartbeat, dynamic
+  workflow `current_stage`, attempt/max-attempt và recovery `BLOCKED` khi crash
+  vượt giới hạn. Worker race dispatch với lease-loss event, cancel stage khi
+  mất ownership và dùng structured retryable `QUEUE_LEASE_EXPIRED`.
+- Official read-only recovery inspection đã có `inspect-browser` và
+  `inspect-queue`; queue output cố ý bỏ payload/clinical data.
+- Sau khi tái tạo venv tạm, focused coverage cho CDHA/browser/queue/CLI/preflight
+  đạt **105 passed**.
+- Final full suite: **388 passed in 4.90s**, 0 failed, 0 skipped.
+- Compile, tracked shell syntax, `git diff --check`, single active browser-launch
+  ownership, no broad/force CDHA selector and no CDHA `wait_for_timeout` all pass.
+- Real Quick preflight returned truthful **FAIL** solely because required
+  `ffmpeg` is unavailable. Report mode is `0600` and secret pattern scan found
+  no matches.
+- Safe `config`, `inspect-queue`, and `inspect-browser` ran. Browser inspection
+  reported `DISCONNECTED`, `cdp_ready=false`, no managed PID, and no lock; it did
+  not launch Chrome. Full was not run without new authenticated authorization.
+- Required 14-section evidence report:
+  `docs/cdha-browser-reliability-report.md`.
+
+---
+
+# Findings — Prompt 3 Readiness Preflight
+
+- Referenced-chat continuation verification on 2026-08-03 confirms the focused
+  readiness suite passes **43/43** and the full repository suite passes
+  **356/356** outside the restricted process sandbox.
+- The sandbox-only full-suite hang occurs at
+  `test_downloadreel_adapter.py::test_successful_adapter_normalization_and_sqlite_transitions`
+  after repeated `Failed to create stream fd`; the identical suite completes in
+  4.57 seconds outside the sandbox. This is environment isolation, not a
+  production/test regression.
+- Source compile, tracked shell syntax, static single-ownership audit and
+  `git diff --check` all pass. Active source contains exactly one
+  `PreflightReport` and one `run_preflight`.
+- Current real Quick result remains truthfully **FAIL**: the only required
+  failure is missing `ffmpeg`; cookie absence and inactive legacy paths are
+  optional warnings, while every external probe is explicitly optional/skipped.
+- Full preflight is now authorized and executed. It truthfully returns
+  **FAIL**: `ffmpeg` missing; Ollama server unavailable (model/inference
+  skipped); canonical browser lock free and manager startup passed; Facebook is
+  `LOGIN_REQUIRED` (target skipped); CDHA authentication failed and selector
+  probe skipped.
+- Full and Quick JSON reports are mode `0600`. Secret-pattern scans of both
+  reports and both browser diagnostic JSON files returned no matches. Browser
+  artifacts contain only check name, sanitized URL/title and bounded state
+  metadata.
+- The live CDHA diagnostic exposes a classification gap: the page title is
+  `@CDHa.ai • Đăng nhập`, but `_full_browser_checks` reports `UNKNOWN` because
+  it only recognizes login markers in the URL before falling back from
+  `is_authenticated=False` to `UNKNOWN`. Prompt 3 requires an explicit
+  `LOGIN_REQUIRED` state when a login page is detectable, so this must receive a
+  regression test and a source-level detector fix before final handoff.
+- `CDHAWebClient.is_authenticated()` already checks the canonical
+  `cdha.login_markers` registry, but returns only a boolean. The Full preflight
+  discards the reason and independently checks URL/security markers, so a
+  selector-visible login page at `/dash` becomes `UNKNOWN`. The smallest fix is
+  to make the Full classifier explicitly reuse `cdha.login_markers` (and a
+  sanitized title fallback for the live localized login title) before calling
+  `is_authenticated`; no production authentication behavior needs changing.
+- Inspection initially included nonexistent `app/cdha`; active CDHA code is
+  `app/browser/cdha_client.py`. The incorrect path produced one harmless `rg`
+  warning and will not be retried.
+- Full browser probes are read-only in source: they acquire the canonical lock,
+  use the official manager/profile, navigate temporary Facebook/CDHA pages,
+  collect sanitized metadata on failure, close only those pages, and disconnect
+  the manager. No downloader, upload, analysis, publish, comment, or job-state
+  mutation appears in the Full probe call path.
+- `promt.md` hiện có 1.072 dòng và là yêu cầu mới sau Prompt 1/2, không phải
+  prompt browser-manager trong chat được tham chiếu.
+- Definition of Done yêu cầu một official command `python -m app.main preflight`
+  với Quick (local-only) và Full (read-only external probes).
+- Điểm hồi quy bắt buộc phải tái hiện trước khi sửa là overall PASS trong khi
+  Ollama bắt buộc nhưng `ollama_checked=false`.
+- Full PASS đòi mọi required check đã chạy và pass; skipped, timeout, unknown,
+  missing hoặc failed required check đều phải FAIL.
+- Các probe Full không được download Reel, upload video, tạo phân tích, publish,
+  comment, đổi trạng thái job, bypass auth hoặc gửi dữ liệu bệnh nhân.
+- Worktree sạch trước khi planning files được cập nhật cho phiên 2026-08-03;
+  commit hiện tại là `24d77e6`.
+- Current preflight implementation is a single synchronous function in
+  `app/preflight.py` with a flat `PreflightReport`; it has no per-check status,
+  required flag, duration, category, aggregate verdict, mode, timeout state or
+  report artifact.
+- `run_preflight(..., require_ollama=False)` is the default. In that path Ollama
+  is not contacted, `ollama_checked=False` is returned, and no exception/verdict
+  prevents the caller from treating the run as successful.
+- Current Ollama validation only requests `/api/tags`; it does not prove exact
+  model availability, official-adapter inference, non-empty/parseable output or
+  an explicit timeout result.
+- The only visible official integration is currently `worker
+  --preflight-only`; no unified `preflight --mode quick|full` subcommand exists.
+- Existing `tests/test_preflight.py` primarily asserts fail-fast exceptions and
+  does not cover structured verdict rules or Quick/Full side-effect boundaries.
+- Root-cause hypothesis to verify at the CLI boundary: the caller interprets
+  every non-exception flat report as success, while execution of required
+  dependencies is controlled by an optional boolean rather than a mode/check
+  matrix with completeness enforcement.
+- CLI verification confirmed the hypothesis: `_run_official_command()` calls
+  `run_preflight(settings, FacebookBrowserConfig.from_settings(settings))`
+  without `require_ollama=True`, serializes the returned dataclass, and returns
+  exit code 0 for `worker --preflight-only`. Thus `ollama_checked=false` is an
+  expected successful result in the current official path.
+- `DependencyContainer` eagerly creates browser config/directories, browser
+  lock/manager, repositories, queue, pipeline, adapters/use cases and worker.
+  Preflight must validate this graph without starting the browser or worker and
+  without silently using a separate factory.
+- The official analyzer factory is `app.ai.provider_factory.build_analyzer()`,
+  producing `OllamaAnalyzer` over `OllamaClient`. The client already supports
+  `/api/tags` model checks and `generate()`/`chat()`, so Full mode can reuse the
+  official adapter boundary rather than introduce a second Ollama client.
+- `Settings` already centralizes canonical browser profile/lock/cookie paths,
+  adapter names and sanitized fingerprint, but it has no preflight-specific
+  timeout fields or report directory yet.
+- Current cookie inspection validates Netscape header/rows but exposes no
+  size/format result object suitable for the new check matrix.
+- Structured verdict contracts now enforce completeness independently of CLI:
+  a required non-PASS result or an absent required check yields FAIL; optional
+  warnings yield WARN only after all required checks pass.
+- Full browser readiness can reuse one `FacebookBrowserManager`: `start()`
+  acquires the canonical lock, starts/connects CDP and returns the shared
+  context; `new_page()` creates owned temporary pages; `close()` disconnects
+  Playwright and releases only its own lock without closing the shared browser.
+- `FacebookStateDetector` already distinguishes login, two-factor, checkpoint,
+  disabled/session/network/rate-limit and unknown states using URL, semantic
+  selectors and bilingual text. UNKNOWN is not authenticated.
+- `CDHAWebClient.is_authenticated()` is read-only but boolean; preflight must add
+  explicit URL/security/selector outcomes around it.
+- Real Quick result on 2026-08-03 is FAIL because `ffmpeg` is not installed.
+  The canonical cookie is explicitly optional/missing (WARN), and four retained
+  inactive legacy paths are WARN.
+- Live Full execution is authorization-blocked: it would contact Ollama,
+  Facebook and CDHA with the authenticated canonical browser profile. No live
+  Full verdict exists, and the final report must use the external-readiness-
+  blocked verdict.
+
+---
+
 ## Session 2026-07-30 — Unified Browser/Profile/Cookie Configuration
 
 - `promt.md` đã thay đổi sau phiên CLI/state-machine; prompt mới có 628 dòng và

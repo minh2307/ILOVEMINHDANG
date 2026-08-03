@@ -30,18 +30,42 @@ root. The official workflow and queue share `DATABASE_PATH` (default
 `data/jobs.sqlite3`). Browser state is kept in
 `runtime/chrome_profiles/cdha_automation` and is ignored by Git.
 
-Validate without claiming a job or opening Chrome:
+Validate local readiness without claiming a job, opening Chrome, contacting
+Facebook/CDHA, or running model inference:
 
 ```bash
-.venv/bin/python main.py worker --preflight-only
+.venv/bin/python -m app.main preflight --mode quick
 ```
+
+Run bounded read-only external probes only when use of the authenticated
+canonical Chrome profile is authorized:
+
+```bash
+.venv/bin/python -m app.main preflight --mode full
+.venv/bin/python -m app.main preflight --mode full --verbose
+```
+
+Quick PASS means local/configuration/tool/storage readiness only. Full PASS
+additionally proves the configured Ollama model and minimal inference, browser
+lock/startup, Facebook authentication/target, and CDHA authentication/selectors.
+Reports are written under `runtime/diagnostics/preflight/`. A required
+failed/skipped/timeout/unknown check always produces FAIL and exit code 1.
 
 Inspect the same sanitized configuration used by the Worker and browser CLI:
 
 ```bash
-.venv/bin/python main.py config
+.venv/bin/python -m app.main config
+.venv/bin/python -m app.main inspect-browser
+.venv/bin/python -m app.main inspect-queue
 .venv/bin/python -m app.browser.facebook_browser_cli config
 ```
+
+The inspection commands do not launch Chrome or expose queue payloads. Browser
+health distinguishes disconnection, closed context, and closed page. CDHA uses
+bounded semantic state polling and ordered observed selectors; hidden,
+disabled, missing, authentication, and unknown states never become success.
+Persisted upload/result identities block automatic duplicate CDHA submission
+after a restart.
 
 The Reel downloader optionally uses the Netscape file at `FACEBOOK_COOKIE_FILE`
 (default `runtime/auth/facebook_cookies.txt`). Facebook publishing and CDHA
@@ -51,25 +75,25 @@ authenticate through the persistent Chrome profile; they do not import that file
 
 ```bash
 # Persist a job and idempotently queue its current state
-.venv/bin/python main.py create-job --url "https://www.facebook.com/reel/..."
+.venv/bin/python -m app.main create-job --url "https://www.facebook.com/reel/..."
 
 # Run scheduler and worker as separate processes
-.venv/bin/python main.py orchestrator
-.venv/bin/python main.py worker
+.venv/bin/python -m app.main orchestrator
+.venv/bin/python -m app.main worker
 
 # Bounded operational forms
-.venv/bin/python main.py orchestrator --once
-.venv/bin/python main.py worker --once
+.venv/bin/python -m app.main orchestrator --once
+.venv/bin/python -m app.main worker --once
 
 # Inspect or resume one job
-.venv/bin/python main.py status --job-id "<job-id>"
-.venv/bin/python main.py resume --job-id "<job-id>"
-.venv/bin/python main.py retry --job-id "<job-id>"
-.venv/bin/python main.py cancel --job-id "<job-id>"
+.venv/bin/python -m app.main status --job-id "<job-id>"
+.venv/bin/python -m app.main resume --job-id "<job-id>"
+.venv/bin/python -m app.main retry --job-id "<job-id>"
+.venv/bin/python -m app.main cancel --job-id "<job-id>"
 
 # Manual gates
-.venv/bin/python main.py review --job-id "<job-id>"
-.venv/bin/python main.py confirm-publish --job-id "<job-id>"
+.venv/bin/python -m app.main review --job-id "<job-id>"
+.venv/bin/python -m app.main confirm-publish --job-id "<job-id>"
 ```
 
 `confirm-publish` requires the operator to type `PUBLISH <job-id>`. Automated
@@ -126,4 +150,6 @@ rows are reported for manual handling.
 See [architecture](docs/architecture.md), [workflow](docs/workflow.md),
 [folder structure](docs/folder-structure.md), [migration notes](docs/migration-notes.md),
 [operations](docs/operations.md), the [official CLI convergence report](docs/official-cli-state-machine-report.md),
-and the [unified browser configuration report](docs/unified-browser-configuration-report.md).
+the [unified browser configuration report](docs/unified-browser-configuration-report.md),
+and the [preflight readiness report](docs/preflight-readiness-report.md).
+See also the [CDHA/browser reliability report](docs/cdha-browser-reliability-report.md).

@@ -2,6 +2,18 @@
 
 Tài liệu này hướng dẫn cài đặt và chạy dự án trên Linux theo từng bước. Tất cả lệnh bên dưới cần được chạy từ thư mục gốc của dự án.
 
+Kiểm tra phục hồi an toàn, không mở Chrome và không sửa database:
+
+```bash
+python -m app.main inspect-browser
+python -m app.main inspect-queue
+python -m app.main status --job-id <job-id>
+```
+
+Không xóa lock đang sống hoặc sửa SQLite bằng tay. Nếu CDHA đã có external ID
+hoặc result URL, `resume` tiếp tục từ kết quả đó. Nếu lần submit cũ chưa chắc
+chắn, hệ thống chặn upload lại và yêu cầu đối soát.
+
 ## 1. Tổng quan luồng xử lý
 
 Dự án nhận URL Facebook Reel và xử lý theo luồng:
@@ -159,17 +171,24 @@ Kiểm tra CLI pipeline mà không mở Chrome:
 
 Kết quả cần kết thúc bằng `Config check: PASS`. Sửa tất cả mục `FAIL` trước khi tiếp tục.
 
-Kiểm tra worker mà không nhận job, không mở Chrome và không đăng bài:
+Kiểm tra local mà không nhận job, không mở Chrome, không gọi Ollama inference và
+không truy cập Facebook/CDHA:
 
 ```bash
-./scripts/run_worker.sh --preflight-only
+.venv/bin/python -m app.main preflight --mode quick
 ```
 
-Hoặc:
+Kiểm tra Full chỉ đọc (dùng Chrome profile chính thức và truy cập
+Ollama/Facebook/CDHA) khi đã được phép dùng session đăng nhập:
 
 ```bash
-./scripts/run_facebook_worker.sh --preflight-only
+.venv/bin/python -m app.main preflight --mode full
+.venv/bin/python -m app.main preflight --mode full --verbose
 ```
+
+Mọi required check bị `failed`, `skipped`, `timeout`, `unknown` hoặc không chạy
+đều làm kết quả `FAIL` và exit code 1. Quick PASS chỉ có nghĩa local readiness;
+chỉ Full PASS mới có nghĩa external readiness đã được xác minh.
 
 Khởi tạo cơ sở dữ liệu của pipeline:
 
@@ -209,7 +228,8 @@ Trong cửa sổ Chrome:
 ### 9.1 Kiểm tra an toàn, không claim job
 
 ```bash
-.venv/bin/python main.py worker --preflight-only
+.venv/bin/python -m app.main preflight --mode quick
+.venv/bin/python -m app.main preflight --mode full
 ```
 
 ### 9.2 Tạo job và xử lý đến checkpoint duyệt

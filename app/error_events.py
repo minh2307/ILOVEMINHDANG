@@ -27,6 +27,27 @@ def safe_error_message(value: str) -> str:
     return masked[:1000]
 
 
+def _safe_error_details(value: Any, *, key: str = "") -> Any:
+    blocked = {
+        "authorization", "access_token", "token", "password", "cookie",
+        "cookies", "storage_state", "clinical_factors", "patient",
+    }
+    if key.casefold() in blocked:
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {
+            str(item_key): _safe_error_details(item_value, key=str(item_key))
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_safe_error_details(item) for item in value]
+    if isinstance(value, str):
+        return safe_error_message(value)
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return safe_error_message(str(value))
+
+
 def build_error_event_details(
     error: PipelineError,
     *,
@@ -48,5 +69,6 @@ def build_error_event_details(
         "browser_url": safe_browser_url(browser_url),
         "selector_key": selector_key,
         "diagnostic_paths": list(error.diagnostic_paths),
+        "details": _safe_error_details(error.details),
     }
     return {key: value for key, value in payload.items() if value is not None}

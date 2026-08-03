@@ -15,6 +15,7 @@ from app.application.ports.browser_lock_port import BrowserLockPort
 from app.application.ports.job_queue_port import JobQueuePort
 from app.application.services.facebook_job_dispatcher import FacebookJobDispatcher
 from app.domain.enums.job_status import JobStatus
+from app.errors import PipelineError, QueueLeaseExpiredError
 
 
 logger = logging.getLogger("cdha_pipeline.facebook_worker")
@@ -38,7 +39,9 @@ class FacebookBrowserWorker:
         queue_lease_seconds: float = 120,
         queue_heartbeat_seconds: float = 30,
         poll_interval_seconds: float = 1,
+        stage_timeout_seconds: float = 1200,
         close_resources: Callable[[], Awaitable[None]] | None = None,
+        stage_provider: Callable[[Any], str] | None = None,
         startup_diagnostics: dict[str, Any] | None = None,
     ) -> None:
         self._queue = queue
@@ -50,12 +53,14 @@ class FacebookBrowserWorker:
         self._retry_max = max(self._retry_base, float(retry_max_seconds))
         self._retry_jitter = max(0.0, float(retry_jitter_seconds))
         self._worker_id = worker_id or f"worker-{uuid.uuid4().hex}"
-        self._queue_lease_seconds = max(3.0, float(queue_lease_seconds))
+        self._queue_lease_seconds = max(0.05, float(queue_lease_seconds))
         self._queue_heartbeat_seconds = min(
-            max(1.0, float(queue_heartbeat_seconds)), self._queue_lease_seconds / 2
+            max(0.01, float(queue_heartbeat_seconds)), self._queue_lease_seconds / 2
         )
         self._poll_interval_seconds = max(0.05, float(poll_interval_seconds))
+        self._stage_timeout_seconds = max(0.001, float(stage_timeout_seconds))
         self._close_resources = close_resources
+        self._stage_provider = stage_provider
         self._startup_diagnostics = dict(startup_diagnostics or {})
         self._startup_diagnostics_logged = False
         self._running = False
@@ -181,13 +186,29 @@ class FacebookBrowserWorker:
     async def _schedule_retry(self, job: Any, reason: str) -> None:
         await self._queue.retry(job.job_id, reason, self._retry_delay(job.attempt_count))
 
-    async def _maintain_queue_lease(self, job_id: str) -> None:
+    async def _maintain_queue_lease(
+        self, job: Any, lease_lost: asyncio.Event
+    ) -> None:
         while True:
             await asyncio.sleep(self._queue_heartbeat_seconds)
+            current_stage = JobStatus.RUNNING.value
+            if self._stage_provider is not None:
+                try:
+                    current_stage = str(self._stage_provider(job) or current_stage)
+                except Exception:
+                    logger.warning(
+                        "Unable to resolve current workflow stage for heartbeat",
+                        extra={
+                            "component": "worker",
+                            "event": "WORKFLOW_STAGE_UNAVAILABLE",
+                            "job_id": job.job_id,
+                        },
+                    )
             renewed = await self._queue.heartbeat(
-                job_id,
+                job.job_id,
                 worker_id=self._worker_id,
                 lease_seconds=self._queue_lease_seconds,
+                current_stage=current_stage,
             )
             if not renewed:
                 logger.error(
@@ -195,14 +216,17 @@ class FacebookBrowserWorker:
                     extra={
                         "component": "worker",
                         "event": "QUEUE_LEASE_LOST",
-                        "job_id": job_id,
+                        "job_id": job.job_id,
                         "details": {"worker_id": self._worker_id},
                     },
                 )
+                lease_lost.set()
                 return
 
     @staticmethod
     def _is_retryable_exception(exc: Exception) -> bool:
+        if isinstance(exc, PipelineError):
+            return bool(exc.retryable and not exc.manual_action_required)
         name = type(exc).__name__.lower()
         message = str(exc).lower()
         markers = (
@@ -211,6 +235,45 @@ class FacebookBrowserWorker:
         )
         return any(marker in name or marker in message for marker in markers)
 
+    async def _dispatch_with_lease_guard(
+        self, job: Any, lease_lost: asyncio.Event
+    ) -> Any:
+        dispatch = asyncio.create_task(self._dispatcher.dispatch(job))
+        lost = asyncio.create_task(lease_lost.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {dispatch, lost},
+                timeout=self._stage_timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                dispatch.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await dispatch
+                raise TimeoutError(
+                    "Worker stage timeout exceeded "
+                    f"({self._stage_timeout_seconds:g}s) at {JobStatus.RUNNING.value}"
+                )
+            if lost in done and lease_lost.is_set():
+                dispatch.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await dispatch
+                raise QueueLeaseExpiredError(
+                    "Queue lease was lost while the workflow stage was running",
+                    job_id=job.job_id,
+                    phase=JobStatus.RUNNING.value,
+                    operation="queue_heartbeat",
+                    details={
+                        "timeout_seconds": self._queue_lease_seconds,
+                        "worker_id": self._worker_id,
+                    },
+                )
+            return await dispatch
+        finally:
+            lost.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await lost
+
     async def run_once(self) -> bool:
         job = await self._queue.dequeue(
             worker_id=self._worker_id, lease_seconds=self._queue_lease_seconds
@@ -218,7 +281,10 @@ class FacebookBrowserWorker:
         if job is None:
             return False
 
-        queue_heartbeat = asyncio.create_task(self._maintain_queue_lease(job.job_id))
+        lease_lost = asyncio.Event()
+        queue_heartbeat = asyncio.create_task(
+            self._maintain_queue_lease(job, lease_lost)
+        )
         try:
             acquired = await self._wait_for_lock(job.job_id)
             if not acquired:
@@ -230,7 +296,7 @@ class FacebookBrowserWorker:
             if start_heartbeat is not None:
                 start_heartbeat()
             try:
-                result = await self._dispatcher.dispatch(job)
+                result = await self._dispatch_with_lease_guard(job, lease_lost)
                 if result.success:
                     await self._queue.complete(job.job_id)
                 else:

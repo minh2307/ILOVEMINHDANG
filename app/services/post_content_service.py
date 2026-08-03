@@ -188,6 +188,20 @@ Nguồn phân tích:
         value = str(text or "").strip()
         if not value:
             raise PostContentValidationError("Facebook post content cannot be empty")
+        # --- Placeholder and template variable gate ---
+        if re.search(r"(?i)(?:^|[\s:])(?:n/a|null|undefined)(?:\s|$)", value):
+            raise PostContentValidationError(
+                "Facebook post content contains a null or N/A placeholder value"
+            )
+        if re.search(r"\{\{[^}]+\}\}", value):
+            raise PostContentValidationError(
+                "Facebook post content contains an unfilled template variable ({{...}})"
+            )
+        if re.search(r"(?i)\[(?:PLACEHOLDER|TODO|FILL[_ -]?IN|INSERT[_ -]?HERE|YOUR[_ -]?TEXT)\]", value):
+            raise PostContentValidationError(
+                "Facebook post content contains an unfilled placeholder tag"
+            )
+        # --- Privacy and credential gate ---
         privacy_input = value.replace(source_url, "") if source_url else value
         if cdha_view_url:
             privacy_input = privacy_input.replace(cdha_view_url, "")
