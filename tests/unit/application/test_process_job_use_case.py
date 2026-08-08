@@ -39,6 +39,11 @@ class FakeStages:
         self.repository.transition(job_id, JobStatus.SCREENSHOTS_CAPTURED)
         return StageExecutionResult(True)
 
+    async def approve_review(self, job_id: str) -> StageExecutionResult:
+        self.calls.append("auto_approve")
+        self.repository.transition(job_id, JobStatus.APPROVED)
+        return StageExecutionResult(True)
+
     async def facebook(self, job_id: str) -> StageExecutionResult:
         status = self.repository.get_job(job_id).status
         if status is JobStatus.APPROVED:
@@ -99,6 +104,35 @@ async def test_full_workflow_stops_at_both_manual_gates_and_resumes(repository):
     assert completed.success is True
     assert repository.get_job("job-1").status is JobStatus.COMPLETED
     assert stages.calls[-3:] == ["facebook_publish", "permalink", "comment"]
+
+
+@pytest.mark.asyncio
+async def test_configured_automatic_workflow_skips_both_manual_gates(repository):
+    repository.create_job("https://www.facebook.com/reel/auto", job_id="job-auto")
+    stages = FakeStages(repository)
+    use_case = ProcessJobUseCase(
+        repository,
+        stages,
+        auto_approve_review=True,
+        require_facebook_confirmation=False,
+    )
+
+    result = await use_case.execute("job-auto")
+
+    assert result.success is True
+    assert repository.get_job("job-auto").status is JobStatus.COMPLETED
+    assert result.data["pending_manual_action"] is False
+    assert stages.calls == [
+        "download",
+        "analyze",
+        "cdha",
+        "screenshots",
+        "auto_approve",
+        "facebook_prepare",
+        "facebook_publish",
+        "permalink",
+        "comment",
+    ]
 
 
 @pytest.mark.asyncio

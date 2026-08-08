@@ -66,16 +66,22 @@ class DependencyContainer:
             chrome=self.browser_manager,
             auto_continue=False,
             interactive_review=False,
-            # This provider is reachable only from an explicitly confirmed
-            # PROCESS_WORKFLOW queue item created by the CLI manual gate.
+            # Manual mode still uses an explicit confirmed queue item. In
+            # automatic mode the client bypasses the prompt via configuration.
             confirmation_provider=lambda _prompt: "1",
         )
         self.stage_adapter = VerifiedWorkflowStageAdapter(self.pipeline)
         self.process_job = ProcessJobUseCase(
-            self.job_repository, self.stage_adapter
+            self.job_repository,
+            self.stage_adapter,
+            auto_approve_review=self.settings.auto_approve_review,
+            require_facebook_confirmation=self.settings.facebook_final_confirmation,
         )
         self.scheduler = ScheduleWorkflowJobsUseCase(
-            self.job_repository, self.job_queue
+            self.job_repository,
+            self.job_queue,
+            auto_approve_review=self.settings.auto_approve_review,
+            require_facebook_confirmation=self.settings.facebook_final_confirmation,
         )
         self.create_job = CreateJobUseCase(self.job_repository, self.scheduler)
         self.retry_job = RetryJobUseCase(self.job_repository, self.scheduler)

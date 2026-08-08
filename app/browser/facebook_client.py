@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 import logging
 import re
@@ -94,7 +95,9 @@ class FacebookWebClient:
             raise ValueError("At least one validated screenshot is required")
         if len(images) > self.settings.facebook_max_image_count:
             raise ValueError("Facebook image count exceeds configured limit")
-        fingerprint = self.content.content_fingerprint(target, post_text, images)
+        fingerprint = self.content.content_fingerprint(
+            target, post_text, images, job_id, job.source_url, cdha_view_url
+        )
         self._guard_duplicate(job_id, target, fingerprint)
         job = self._require_job(job_id)
         if job.status is WorkflowStatus.FACEBOOK_PUBLISH_FAILED:
@@ -126,6 +129,16 @@ class FacebookWebClient:
                 job_id, details={"manual_override": "force_facebook_publish"}
             )
         diagnostics = self._diagnostics_dir(job_id)
+        
+        attempt_id = self.repository.create_publication_attempt(
+            job_id=job_id,
+            content_fingerprint=fingerprint,
+            target_url=target,
+            status="CREATED",
+            media_hashes=image_hashes,
+        )
+        self.repository.update_data(job_id, {"facebook_attempt_id": attempt_id})
+        
         try:
             page, uploaded = await self._prepare_composer(
                 target, post_text, images, job_id, diagnostics
@@ -178,8 +191,14 @@ class FacebookWebClient:
             page, _ = await self._prepare_composer(
                 target, post_text, images, job_id, self._diagnostics_dir(job_id)
             )
-        self._display_final_gate(job_id, job.data)
-        choice = self.confirmation_provider("Select [1-6]: ").strip()
+        if self.settings.facebook_final_confirmation:
+            self._display_final_gate(job_id, job.data)
+            choice = self.confirmation_provider("Select [1-6]: ").strip()
+        else:
+            choice = "1"
+            self.repository.record_event(
+                job_id, details={"facebook_manual_gate": "disabled_by_configuration"}
+            )
         if choice != "1":
             if choice == "2":
                 self.repository.transition(
@@ -250,7 +269,7 @@ class FacebookWebClient:
                 "facebook_manual_gate": "publish_approved",
                 "privacy_risk_level": privacy_scan.risk_level,
                 "privacy_categories": list(privacy_scan.detected_categories),
-                "media_pii_warning_acknowledged": True,
+                "media_pii_warning_acknowledged": self.settings.facebook_final_confirmation,
             },
         )
         if self.force_publish:
@@ -285,6 +304,13 @@ class FacebookWebClient:
             )
             
             await self._save_diagnostics(page, job_id, "pre-publish")
+            
+            attempt_id = job.data.get("facebook_attempt_id")
+            if attempt_id:
+                self.repository.update_publication_attempt(
+                    attempt_id, status="SUBMITTING"
+                )
+                
             # Persist SUBMITTING before clicking — if we crash here, the attempt is UNCERTAIN
             self.repository.update_data(job_id, {
                 "facebook_submission_status": "SUBMITTING",
@@ -302,6 +328,11 @@ class FacebookWebClient:
 
             await button.click()
             publish_clicked = True
+
+            if attempt_id:
+                self.repository.update_publication_attempt(
+                    attempt_id, status="SUBMITTED_UNCONFIRMED"
+                )
 
             # Persist SUBMITTED_UNCONFIRMED immediately after click
             self.repository.update_data(job_id, {
@@ -339,6 +370,10 @@ class FacebookWebClient:
                         "facebook_submission_status": "PUBLICATION_UNCERTAIN",
                     },
                 )
+                if attempt_id:
+                    self.repository.update_publication_attempt(
+                        attempt_id, status="UNCERTAIN", error_message=result.error
+                    )
                 return FacebookPublishResult(
                     success=False,
                     status="PUBLICATION_UNCERTAIN",
@@ -388,7 +423,17 @@ class FacebookWebClient:
                     "facebook_verification_method": result.verification_method,
                 },
             )
-            return result
+            if attempt_id:
+                self.repository.update_publication_attempt(
+                    attempt_id,
+                    status="VERIFIED",
+                    post_id=result.post_id,
+                    permalink=permalink,
+                    verification_method=result.verification_method,
+                    completed=True,
+                )
+            # Update the returned result to include the attempt_id
+            return replace(result, attempt_id=attempt_id) if attempt_id else result
         except Exception as exc:
             paths = await self._save_diagnostics(page, job_id, "publish-verification-failure")
             current = self._require_job(job_id)
@@ -413,6 +458,14 @@ class FacebookWebClient:
                         "facebook_diagnostic_screenshot_path": str(paths[0]),
                     },
                 )
+                if attempt_id:
+                    self.repository.update_publication_attempt(
+                        attempt_id,
+                        status="UNCERTAIN" if publish_clicked else "FAILED",
+                        error_message=str(exc),
+                        diagnostic_paths=[str(paths[0])] if paths else None,
+                        completed=not publish_clicked,
+                    )
             return FacebookPublishResult(
                 success=False,
                 status="PUBLICATION_UNCERTAIN" if publish_clicked else "PUBLISH_ACTION_FAILED",
@@ -469,13 +522,36 @@ class FacebookWebClient:
                         "facebook_verification_method": result.verification_method,
                     },
                 )
-                return result
+                attempt_id = job.data.get("facebook_attempt_id")
+                if attempt_id:
+                    self.repository.update_publication_attempt(
+                        attempt_id,
+                        status="VERIFIED",
+                        post_id=result.post_id,
+                        permalink=permalink,
+                        verification_method=result.verification_method,
+                        completed=True,
+                    )
+                return replace(result, attempt_id=attempt_id) if attempt_id else result
+            # Here we know reconciliation didn't find the post. If we passed the timeout threshold, transition to FAILED.
+            target_state = WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN
+            if datetime.now(UTC) - started > timedelta(minutes=15):
+                target_state = WorkflowStatus.FACEBOOK_PUBLISH_FAILED
             self.repository.transition(
-                job_id, WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+                job_id, target_state,
                 event_type="FACEBOOK_PUBLICATION_RECONCILIATION_REQUIRED",
-                details={"verification_signals": signals, "publish_clicked": False},
-                data_patch={"facebook_publication_uncertain": True},
+                details={"verification_signals": signals, "publish_clicked": False, "reason": "not_found"},
+                data_patch={
+                    "facebook_publication_uncertain": target_state == WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+                },
             )
+            attempt_id = job.data.get("facebook_attempt_id")
+            if attempt_id:
+                self.repository.update_publication_attempt(
+                    attempt_id,
+                    status="FAILED" if target_state == WorkflowStatus.FACEBOOK_PUBLISH_FAILED else "UNCERTAIN",
+                    completed=target_state == WorkflowStatus.FACEBOOK_PUBLISH_FAILED,
+                )
             return FacebookPublishResult(
                 success=False,
                 status="PUBLICATION_UNCERTAIN",
@@ -897,7 +973,140 @@ class FacebookWebClient:
                         best = (score, candidate)
             except Exception:
                 continue
-        return best[1] if best else None
+        if best:
+            return best[1]
+        return await self._find_page_layout_post(
+            page,
+            approved_text,
+            expected_images,
+            before_ids,
+        )
+
+    @classmethod
+    def _pcb_post_permalink(cls, href: str, *, base_url: str) -> str | None:
+        absolute = urljoin(base_url, str(href or "").strip())
+        parsed = urlsplit(absolute)
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        match = re.fullmatch(r"pcb\.(\d+)", str(query.get("set") or ""))
+        if not match:
+            return None
+        post_id = match.group(1)
+
+        base = urlsplit(base_url)
+        base_query = dict(parse_qsl(base.query, keep_blank_values=True))
+        actor_id = str(base_query.get("id") or "").strip()
+        if not actor_id:
+            segments = [segment for segment in base.path.split("/") if segment]
+            if segments and segments[0] not in {"profile.php", "me"}:
+                actor_id = segments[0]
+        if not actor_id:
+            return None
+        return f"https://www.facebook.com/{actor_id}/posts/{post_id}"
+
+    @staticmethod
+    def _page_layout_match_tokens(approved_text: str) -> list[str]:
+        return [
+            value.rstrip(".,);]").casefold()
+            for value in re.findall(r"https?://[^\s]+", approved_text)
+        ]
+
+    async def _find_page_layout_post(
+        self,
+        page: Any,
+        approved_text: str,
+        expected_images: int,
+        before_ids: set[str],
+    ) -> dict[str, Any] | None:
+        """Find Page-owner timeline posts that omit ``role=article``.
+
+        Facebook exposes the durable post ID in image links as
+        ``set=pcb.<post-id>``. The surrounding post is matched using the source
+        and analysis URLs from the approved text, after expanding collapsed
+        post bodies.
+        """
+        links = page.locator('a[href*="set=pcb."]')
+        if await links.count() == 0:
+            try:
+                await page.mouse.wheel(0, 700)
+                await page.wait_for_timeout(1_000)
+            except Exception:
+                pass
+
+        for label in ("Xem thêm", "See more"):
+            try:
+                buttons = page.get_by_role("button", name=label, exact=True)
+                for index in range(min(await buttons.count(), 10)):
+                    button = buttons.nth(index)
+                    if await button.is_visible():
+                        await button.click()
+            except Exception:
+                continue
+
+        match_tokens = self._page_layout_match_tokens(approved_text)
+        if not match_tokens:
+            return None
+
+        links = page.locator('a[href*="set=pcb."]')
+        seen_post_ids: set[str] = set()
+        for index in range(await links.count()):
+            link = links.nth(index)
+            try:
+                href = await link.get_attribute("href")
+                permalink = self._pcb_post_permalink(
+                    str(href or ""),
+                    base_url=str(page.url),
+                )
+                if not permalink:
+                    continue
+                post_id = self.extract_post_id(permalink) or ""
+                if (
+                    not post_id
+                    or post_id in seen_post_ids
+                    or post_id in before_ids
+                ):
+                    continue
+                seen_post_ids.add(post_id)
+                match = await link.evaluate(
+                    """(node, args) => {
+                        let current = node;
+                        for (let depth = 0; current && depth < 18; depth += 1) {
+                            const text = (current.innerText || "")
+                                .replace(/\\s+/g, " ")
+                                .trim()
+                                .toLowerCase();
+                            if (args.tokens.every(token => text.includes(token))) {
+                                const photoIds = new Set();
+                                for (const anchor of current.querySelectorAll('a[href*="set=pcb."]')) {
+                                    try {
+                                        const url = new URL(anchor.href);
+                                        if (url.searchParams.get("set") === `pcb.${args.postId}`) {
+                                            const photoId = url.searchParams.get("fbid");
+                                            if (photoId) photoIds.add(photoId);
+                                        }
+                                    } catch (_) {}
+                                }
+                                return {imageCount: photoIds.size};
+                            }
+                            current = current.parentElement;
+                        }
+                        return null;
+                    }""",
+                    {"tokens": match_tokens, "postId": post_id},
+                )
+                if not match:
+                    continue
+                image_count = int(match.get("imageCount") or 0)
+                return {
+                    "url": permalink,
+                    "post_id": post_id,
+                    "text_match": True,
+                    "recent": False,
+                    "image_count": image_count,
+                    "method": "content-urls+pcb-post-id+image-count",
+                }
+            except Exception:
+                continue
+        return None
 
     async def _article_links(self, article: Any) -> list[str]:
         links: list[str] = []

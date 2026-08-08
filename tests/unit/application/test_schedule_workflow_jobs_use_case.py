@@ -65,3 +65,49 @@ async def test_publish_confirmation_only_accepts_manual_gate(tmp_path):
 
     assert await scheduler.schedule_publish_confirmation("job-2") is True
     assert await scheduler.schedule_publish_confirmation("job-2") is False
+
+
+@pytest.mark.asyncio
+async def test_automatic_scheduler_recovers_both_configured_gate_states(tmp_path):
+    database = tmp_path / "automatic-gates.sqlite3"
+    repository = JobRepository(database)
+    repository.initialize()
+    queue = SQLiteJobQueue(str(database))
+    repository.create_job("https://www.facebook.com/reel/review", job_id="review")
+    repository.create_job("https://www.facebook.com/reel/publish", job_id="publish")
+
+    before_review = (
+        JobStatus.DOWNLOADREEL_RUNNING,
+        JobStatus.DOWNLOADED,
+        JobStatus.AI_ANALYZING,
+        JobStatus.CLINICAL_FACTORS_GENERATED,
+        JobStatus.CDHA_OPENING,
+        JobStatus.CDHA_UPLOADING,
+        JobStatus.CDHA_ANALYZING,
+        JobStatus.CDHA_ANALYZED,
+        JobStatus.SCREENSHOTS_CAPTURING,
+        JobStatus.SCREENSHOTS_CAPTURED,
+        JobStatus.WAITING_FOR_REVIEW,
+    )
+    for status in before_review:
+        repository.transition("review", status)
+        repository.transition("publish", status)
+    for status in (
+        JobStatus.APPROVED,
+        JobStatus.FACEBOOK_PREPARING,
+        JobStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW,
+    ):
+        repository.transition("publish", status)
+
+    scheduler = ScheduleWorkflowJobsUseCase(
+        repository,
+        queue,
+        auto_approve_review=True,
+        require_facebook_confirmation=False,
+    )
+
+    assert await scheduler.schedule_once() == 2
+    assert {record["job_id"] for record in await queue.list_records()} == {
+        "review:WAITING_FOR_REVIEW",
+        "publish:FACEBOOK_WAITING_FOR_MANUAL_REVIEW",
+    }

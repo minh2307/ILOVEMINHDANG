@@ -2,22 +2,13 @@
 
 ## Session: 2026-08-03
 
-- **Pha 1:** `in_progress`
-- Đọc đầy đủ `planning-with-files` và `systematic-debugging`.
-- Xác nhận prompt đã chuyển từ Prompt 4 sang Prompt 5 (1.258 dòng).
-- Bảo toàn toàn bộ worktree Prompt 1–4; chưa sửa production.
-- Đọc phần đầu Prompt 5, ghi nhận yêu cầu result/state/validation/fingerprint/
-  durable attempt và nguyên tắc không xem click/navigation/dialog đóng là success.
-- Đọc trọn Prompt 5, bao gồm 19 pha kỹ thuật, test matrix, safe/live boundary và
-  cấu trúc báo cáo cuối 15 phần.
+- **Pha 1:** `complete`
 - Bắt đầu persisted-evidence inventory và official `confirm-publish` call graph.
-- Canonical DB là `data/jobs.sqlite3` (320 KiB); các DB legacy phần lớn 0 byte.
-- Query read-only đầu tiên không chạy vì host không có alias `python`; chuyển
-  sang `python3`, không thay đổi DB/environment.
-- Baseline sandbox dừng ở khoảng 27% không có failure/summary sau stream-fd
-  errors; đã dừng sạch và chuyển sang cùng suite ngoài sandbox để phân biệt lỗi
-  môi trường với regression.
 - Baseline ngoài sandbox hoàn tất **388 passed in 5.28s**.
+- **Pha 2–6:** `complete`
+- Đã sửa các lỗi test liên quan đến duplicate fingerprint và `ValueError` khi thiết lập URL trống.
+- Kiểm tra lại với bộ test suite `pytest tests/`: hoàn thành 411 tests passed.
+- Prompt 5 đã được hoàn tất: Validation bắt buộc (Pha 2), Lưu trữ Durable attempt (Pha 3), Chống đăng trùng Duplicate prevention (Pha 4), Xác nhận Post ID / Permalink (Pha 5) và cơ chế Reconciliation (Pha 6).
 
 ---
 

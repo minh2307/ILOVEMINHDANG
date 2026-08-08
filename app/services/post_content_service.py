@@ -201,6 +201,10 @@ Nguồn phân tích:
             raise PostContentValidationError(
                 "Facebook post content contains an unfilled placeholder tag"
             )
+        if re.search(r"(?im)^\s*(?:ghi nhận chính|nhận định|key findings|impression)\s*:\s*$", value):
+            raise PostContentValidationError(
+                "Facebook post content contains an empty clinical field label"
+            )
         # --- Privacy and credential gate ---
         privacy_input = value.replace(source_url, "") if source_url else value
         if cdha_view_url:
@@ -290,12 +294,25 @@ Nguồn phân tích:
                 digest.update(chunk)
         return digest.hexdigest()
 
-    def content_fingerprint(self, target_url: str, post_text: str, images: list[Path]) -> str:
+    def content_fingerprint(
+        self, target_url: str, post_text: str, images: list[Path],
+        job_id: str, source_url: str, cdha_view_url: str
+    ) -> str:
+        # Extract external ID from cdha_view_url if present
+        external_id = ""
+        if cdha_view_url:
+            match = re.search(r"/(\d+)$", cdha_view_url.split("?")[0])
+            if match:
+                external_id = match.group(1)
+        
         payload = "\n".join(
             [
+                job_id,
                 self.normalize_target_url(target_url),
+                source_url.strip(),
                 "\n".join(line.rstrip() for line in post_text.strip().splitlines()),
                 *[self.image_sha256(path) for path in images],
+                external_id,
             ]
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()

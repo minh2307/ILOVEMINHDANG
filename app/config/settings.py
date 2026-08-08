@@ -564,8 +564,6 @@ class Settings:
         missing = []
         if not self.facebook_target_url and not self.test_mode:
             missing.append("FACEBOOK_TARGET_URL is required in non-test mode.")
-        if not self.gemini_url:
-            missing.append("GEMINI_URL is required.")
         if not self.cdha_url:
             missing.append("CDHA_URL is required.")
         if self.job_heartbeat_seconds >= self.job_lease_seconds:

@@ -251,6 +251,14 @@ def test_cdha_analysis_timeout_is_bounded(tmp_path: Path) -> None:
         asyncio.run(client._wait_for_analysis(CDHAWaitPage()))
 
 
+def test_cdha_view_url_is_terminal_without_result_container(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, cdha_result_timeout_seconds=0)
+    client = CDHAWebClient(settings, object(), object(), resolver=KeyResolver())
+    page = type("Page", (), {"url": "https://cdha.ai/dash?view=44088"})()
+
+    asyncio.run(client._wait_for_analysis(page))
+
+
 def test_cdha_error_message_stops_analysis(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     resolver = KeyResolver(

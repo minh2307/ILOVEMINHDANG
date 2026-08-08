@@ -52,7 +52,7 @@ class RetryJobUseCase:
             )
         retry_step = self.RETRY_STEP.get(job.status)
         if retry_step is None:
-            if job.status is JobStatus.FACEBOOK_PUBLISH_UNCERTAIN:
+            if job.status in {JobStatus.FACEBOOK_PUBLISH_UNCERTAIN, JobStatus.PUBLISH_RECONCILIATION_REQUIRED}:
                 message = (
                     "Facebook publication is uncertain; reconcile it before any retry."
                 )

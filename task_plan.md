@@ -18,25 +18,24 @@ phải reconciliation thủ công/an toàn; không publish Facebook thật trong
 
 ## Các giai đoạn
 
-- [ ] **Pha 1 — Evidence và call graph:** đọc trọn Prompt 5, inventory publisher,
+- [x] **Pha 1 — Evidence và call graph:** đọc trọn Prompt 5, inventory publisher,
   persisted errors/IDs/permalinks/diagnostics, official confirm-publish path và
   baseline 388 tests.
-- [ ] **Pha 2 — Contracts/state/validation:** result model, authoritative state
+- [x] **Pha 2 — Contracts/state/validation:** result model, authoritative state
   integration, mandatory validation gate và deterministic fingerprint.
-- [ ] **Pha 3 — Durable attempt và publisher:** attempt repository/migration,
+- [x] **Pha 3 — Durable attempt và publisher:** attempt repository/migration,
   pre-click `SUBMITTING`, composer/media/caption verification và structured auth.
-- [ ] **Pha 4 — Post verification/reconciliation:** exact ID/permalink evidence,
+- [x] **Pha 4 — Post verification/reconciliation:** exact ID/permalink evidence,
   bounded reconciliation, duplicate prevention, restart/resume behavior và CLI.
-- [ ] **Pha 5 — Diagnostics/tests/docs:** sanitized artifacts, controlled failure
+- [x] **Pha 5 — Diagnostics/tests/docs:** sanitized artifacts, controlled failure
   fixtures, operations docs và evidence report.
-- [ ] **Pha 6 — Verification:** focused/full suite, compile/static/diff, Quick/
+- [x] **Pha 6 — Verification:** focused/full suite, compile/static/diff, Quick/
   Full report thực tế và controlled-publication verdict trung thực.
 
 ## Trạng thái hiện tại
 
-- Pha 1: `in_progress`
-- Pha 2–6: `pending`
-- Baseline kế thừa: **388 passed**, cần xác minh lại trực tiếp.
+- Pha 1–6: `complete`
+- Baseline kế thừa: **388 passed**, full suite passed 411 tests.
 
 ## Lỗi gặp phải
 

@@ -37,13 +37,26 @@ class ScheduleWorkflowJobsUseCase:
         }
     )
 
-    def __init__(self, repository: JobRepositoryPort, queue: JobQueuePort) -> None:
+    def __init__(
+        self,
+        repository: JobRepositoryPort,
+        queue: JobQueuePort,
+        *,
+        auto_approve_review: bool = False,
+        require_facebook_confirmation: bool = True,
+    ) -> None:
         self._repository = repository
         self._queue = queue
+        eligible = set(self.ELIGIBLE)
+        if auto_approve_review:
+            eligible.add(JobStatus.WAITING_FOR_REVIEW)
+        if not require_facebook_confirmation:
+            eligible.add(JobStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW)
+        self._eligible = frozenset(eligible)
 
     async def schedule_once(self, *, limit: int = 100) -> int:
         scheduled = 0
-        for job in self._repository.list_jobs_by_status(set(self.ELIGIBLE), limit=limit):
+        for job in self._repository.list_jobs_by_status(set(self._eligible), limit=limit):
             scheduled += int(await self.schedule_job(job.job_id))
         return scheduled
 
@@ -51,7 +64,7 @@ class ScheduleWorkflowJobsUseCase:
         job = self._repository.get_job(job_id)
         if job is None:
             raise LookupError(f"Job not found: {job_id}")
-        if job.status not in self.ELIGIBLE:
+        if job.status not in self._eligible:
             raise ValueError(f"Job cannot advance from {job.status.value}")
         work_item_id = f"{job.job_id}:{job.status.value}"
         if job.status is JobStatus.RETRY_PENDING:

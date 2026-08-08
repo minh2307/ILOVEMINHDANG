@@ -1078,6 +1078,13 @@ class CDHAWebClient:
             raise
         if snapshot.state is CDHAState.RESULT_READY:
             return
+        if snapshot.state is CDHAState.ANALYSIS_COMPLETED:
+            current_url = str(snapshot.current_url or "")
+            external_id = dict(
+                parse_qsl(urlsplit(current_url).query, keep_blank_values=True)
+            ).get("view")
+            if external_id:
+                return
         if snapshot.state is CDHAState.ANALYSIS_FAILED:
             raise CDHARenderError(
                 str(snapshot.details.get("message") or "CDHA analysis failed"),

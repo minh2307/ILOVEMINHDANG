@@ -61,7 +61,7 @@ class OllamaClient:
         *,
         base_url: str = "http://localhost:11434",
         model: str,
-        timeout_seconds: int = 300,
+        timeout_seconds: int = 900,
         keep_alive: str = "10m",
         temperature: float = 0.1,
         max_retries: int = 2,
@@ -196,7 +196,7 @@ class OllamaClient:
             "keep_alive": self._keep_alive,
             "options": {
                 "temperature": self._temperature,
-                "num_ctx": 8192
+                "num_ctx": 16384
             },
         }
         response = await self._post(
@@ -225,7 +225,7 @@ class OllamaClient:
             "keep_alive": self._keep_alive,
             "options": {
                 "temperature": self._temperature,
-                "num_ctx": 8192
+                "num_ctx": 16384
             },
         }
         if images:

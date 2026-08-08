@@ -12,12 +12,12 @@ Reel URL
       → verified DownloadReel adapter (non-empty video + metadata/checksum)
       → configured local analyzer (validated Clinical Factors)
       → CDHA Playwright client (parsed result + screenshots)
-      → WAITING_FOR_REVIEW
+      → WAITING_FOR_REVIEW (auto-traversed when AUTO_APPROVE_REVIEW=true)
   → operator review
       → APPROVED or REJECTED/retry
   → orchestrator/worker
       → Facebook preparation (content/privacy/duplicate validation)
-      → FACEBOOK_WAITING_FOR_MANUAL_REVIEW
+      → FACEBOOK_WAITING_FOR_MANUAL_REVIEW (auto-traversed when FACEBOOK_FINAL_CONFIRMATION=false)
   → operator types PUBLISH <job-id>
   → worker publishes and verifies exact post/permalink
   → worker adds exact permalink comment idempotently

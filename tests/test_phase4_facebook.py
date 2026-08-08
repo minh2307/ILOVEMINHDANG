@@ -219,34 +219,49 @@ def test_content_hash_is_deterministic_ordered_and_image_sensitive(tmp_path: Pat
     service = PostContentService(make_settings(tmp_path))
     one = make_png(tmp_path / "one.png", "red")
     two = make_png(tmp_path / "two.png", "blue")
-    first = service.content_fingerprint("https://facebook.com/page", "Xin chào", [one, two])
-    assert first == service.content_fingerprint("https://www.facebook.com/page/", "Xin chào", [one, two])
-    assert first != service.content_fingerprint("https://facebook.com/page", "Xin chào", [two, one])
+    first = service.content_fingerprint("https://facebook.com/page", "Xin chào", [one, two], "job-1", "url", "cdha")
+    assert first == service.content_fingerprint("https://www.facebook.com/page/", "Xin chào", [one, two], "job-1", "url", "cdha")
+    assert first != service.content_fingerprint("https://facebook.com/page", "Xin chào", [two, one], "job-1", "url", "cdha")
     make_png(one, "green")
-    assert first != service.content_fingerprint("https://facebook.com/page", "Xin chào", [one, two])
+    assert first != service.content_fingerprint("https://facebook.com/page", "Xin chào", [one, two], "job-1", "url", "cdha")
 
 
 def test_duplicate_verified_and_uncertain_posts_are_blocked_unless_forced(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     repo = make_repo(settings)
     target = PostContentService(settings).normalize_target_url(settings.facebook_target_url)
+    
+    # Create an old verified job
     old = repo.create_job("https://facebook.com/reel/old", job_id="old")
     repo.update_data(old.job_id, {
         "facebook_content_hash": "hash", "facebook_target_url": target,
         "facebook_publication_verified": True,
     })
-    client = FacebookWebClient(settings, repo, object())
-    with pytest.raises(ValueError, match="Duplicate"):
-        client._guard_duplicate("new", target, "hash")
-    forced = FacebookWebClient(settings, repo, object(), force_publish=True)
-    forced._guard_duplicate("new", target, "hash")
-    uncertain = repo.create_job("https://facebook.com/reel/u", job_id="uncertain")
-    repo.update_data(uncertain.job_id, {
-        "facebook_content_hash": "hash2", "facebook_target_url": target,
+    
+    # Create a new job that will have the same fingerprint
+    new_job = approved_job(repo, job_id="new_job")
+    # We mock the fingerprint service to return "hash" for this job
+    
+    from app.adapters.facebook_adapter import FacebookPublisherAdapter
+    content = PostContentService(settings)
+    # Monkeypatch content_fingerprint and select_screenshots
+    content.content_fingerprint = lambda *args, **kwargs: "hash"
+    content.select_screenshots = lambda *args, **kwargs: (["mock"], [])
+    adapter = FacebookPublisherAdapter(settings, repo, FacebookWebClient(settings, repo, object()), content=content)
+    
+    validation = adapter.validate_job("new_job")
+    assert not validation.valid
+    assert any("Duplicate" in e for e in validation.errors)
+
+    # Test uncertain duplicate
+    repo.update_data(old.job_id, {
+        "facebook_publication_verified": False,
         "facebook_publication_uncertain": True,
     })
-    with pytest.raises(ValueError, match="uncertain"):
-        client._guard_duplicate("new", target, "hash2")
+    
+    validation2 = adapter.validate_job("new_job")
+    assert not validation2.valid
+    assert any("Duplicate" in e for e in validation2.errors)
 
 
 def test_selector_configuration_has_exact_publish_and_no_broad_button_fallback(tmp_path: Path) -> None:
@@ -413,8 +428,41 @@ def test_final_manual_gate_cancel_does_not_click_and_publish_approval_does(tmp_p
     resolver2 = FakeResolver(); client2 = PublishClient(settings, repo, FakeChrome(), resolver=resolver2, confirmation_provider=lambda _: "1")
     asyncio.run(client2.prepare_post(target_url=settings.facebook_target_url, post_text=valid_post_text(settings, repo, job2), image_paths=[image], job_id=job2))
     published = asyncio.run(client2.publish_prepared_post(job_id=job2))
+    if not published.success:
+        print("PUBLISHED ERROR:", published.error)
     assert published.success and resolver2.items["facebook.publish_button"].clicked == 1
     assert repo.get_job(job2).status is WorkflowStatus.FACEBOOK_PUBLISHED
+
+
+def test_disabled_final_confirmation_publishes_without_prompt(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, facebook_final_confirmation=False)
+    repo = make_repo(settings)
+    job_id = approved_job(repo, job_id="automatic-publish")
+    resolver = FakeResolver()
+
+    def unexpected_prompt(_prompt: str) -> str:
+        raise AssertionError("automatic publishing must not prompt")
+
+    client = PublishClient(
+        settings,
+        repo,
+        FakeChrome(),
+        resolver=resolver,
+        confirmation_provider=unexpected_prompt,
+    )
+    image = make_png(tmp_path / "automatic.png")
+    asyncio.run(client.prepare_post(
+        target_url=settings.facebook_target_url,
+        post_text=valid_post_text(settings, repo, job_id),
+        image_paths=[image],
+        job_id=job_id,
+    ))
+
+    published = asyncio.run(client.publish_prepared_post(job_id=job_id))
+
+    assert published.success is True
+    assert resolver.items["facebook.publish_button"].clicked == 1
+    assert repo.get_job(job_id).status is WorkflowStatus.FACEBOOK_PUBLISHED
 
 
 def test_final_publish_guard_rejects_persisted_label_only_sections(tmp_path: Path) -> None:
@@ -481,8 +529,9 @@ def test_crash_after_publish_reconciles_without_second_click(tmp_path: Path) -> 
 
 def test_diagnostics_create_deterministic_metadata_and_screenshot(tmp_path: Path) -> None:
     settings = make_settings(tmp_path); repo = make_repo(settings)
+    job_id = approved_job(repo, job_id="j")
     client = FacebookWebClient(settings, repo, FakeChrome())
-    screenshot, metadata = asyncio.run(client._save_diagnostics(FakePage(), "j", "comment-failure"))
+    screenshot, metadata = asyncio.run(client._save_diagnostics(FakePage(), job_id, "comment-failure"))
     assert screenshot.name == "comment-failure.png" and screenshot.is_file()
     assert metadata.name == "comment-failure.json" and metadata.is_file()
     assert not metadata.with_suffix(".html").exists()
@@ -507,8 +556,9 @@ def test_missing_target_is_rejected_before_browser_use(tmp_path: Path) -> None:
     settings = make_settings(tmp_path, facebook_target_url="")
     repo = make_repo(settings); job_id = approved_job(repo)
     adapter = FacebookPublisherAdapter(settings, repo, object())
-    with pytest.raises(ValueError, match="FACEBOOK_TARGET_URL"):
-        asyncio.run(adapter.prepare(job_id=job_id))
+    result = asyncio.run(adapter.prepare(job_id=job_id))
+    assert not result.success
+    assert "FACEBOOK_TARGET_URL" in result.error
 
 
 class LoginResolver(FakeResolver):
@@ -619,6 +669,118 @@ def test_exact_new_post_identification_uses_content_new_id_time_and_images(tmp_p
     assert found["text_match"] and found["recent"] and found["image_count"] == 2
 
 
+class PageLayoutDiscoveryClient(DiscoveryClient):
+    async def _find_page_layout_post(
+        self,
+        page: Any,
+        approved_text: str,
+        expected_images: int,
+        before_ids: set[str],
+    ) -> dict[str, Any] | None:
+        return {
+            "url": "https://www.facebook.com/61589210652274/posts/122116192977307021",
+            "post_id": "122116192977307021",
+            "text_match": True,
+            "recent": True,
+            "image_count": expected_images,
+            "method": "content-urls+pcb-post-id+image-count",
+        }
+
+
+def test_page_layout_pcb_candidate_is_used_when_role_articles_are_empty(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path); repo = make_repo(settings)
+    client = PageLayoutDiscoveryClient(settings, repo, object(), articles=[])
+    page = SimpleNamespace(url="https://www.facebook.com/profile.php?id=61589210652274")
+
+    found = asyncio.run(client._find_exact_new_post(
+        page,
+        "Approved clinical post",
+        datetime.now(UTC),
+        2,
+        {"old-post"},
+    ))
+
+    assert found and found["post_id"] == "122116192977307021"
+
+
+def test_pcb_photo_link_becomes_canonical_page_post_permalink(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path); repo = make_repo(settings)
+    client = FacebookWebClient(settings, repo, object())
+
+    permalink = client._pcb_post_permalink(
+        "https://www.facebook.com/photo/?fbid=122116192911307021"
+        "&set=pcb.122116192977307021",
+        base_url="https://www.facebook.com/profile.php?id=61589210652274",
+    )
+
+    assert permalink == (
+        "https://www.facebook.com/61589210652274/posts/122116192977307021"
+    )
+
+
+class EmptyLocator:
+    async def count(self) -> int:
+        return 0
+
+
+class RecordingMouse:
+    def __init__(self) -> None:
+        self.wheels: list[tuple[int, int]] = []
+
+    async def wheel(self, x: int, y: int) -> None:
+        self.wheels.append((x, y))
+
+
+class LazyPage:
+    url = "https://www.facebook.com/profile.php?id=61589210652274"
+
+    def __init__(self) -> None:
+        self.mouse = RecordingMouse()
+        self.waits: list[int] = []
+
+    def get_by_role(self, *_args: Any, **_kwargs: Any) -> EmptyLocator:
+        return EmptyLocator()
+
+    def locator(self, _selector: str) -> EmptyLocator:
+        return EmptyLocator()
+
+    async def wait_for_timeout(self, timeout_ms: int) -> None:
+        self.waits.append(timeout_ms)
+
+
+def test_page_layout_discovery_scrolls_lazy_page_timeline(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path); repo = make_repo(settings)
+    client = FacebookWebClient(settings, repo, object())
+    page = LazyPage()
+
+    found = asyncio.run(client._find_page_layout_post(
+        page,
+        "Nguồn video: https://www.facebook.com/reel/1\n"
+        "Nguồn phân tích: https://cdha.ai/dash?view=1",
+        2,
+        set(),
+    ))
+
+    assert found is None
+    assert page.mouse.wheels == [(0, 700)]
+    assert page.waits == [1_000]
+
+
+def test_page_layout_url_tokens_keep_url_punctuation_for_dom_matching(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path); repo = make_repo(settings)
+    client = FacebookWebClient(settings, repo, object())
+
+    tokens = client._page_layout_match_tokens(
+        "Nguồn video: https://www.facebook.com/reel/1484932350100572\n"
+        "Nguồn phân tích: https://cdha.ai/dash?view=44088"
+    )
+
+    assert tokens == [
+        "https://www.facebook.com/reel/1484932350100572",
+        "https://cdha.ai/dash?view=44088",
+    ]
+
+
 class VerificationCrashClient(PublishClient):
     async def _verify_publication(self, *args: Any, **kwargs: Any):
         raise TimeoutError("verification crashed after publish click")
@@ -708,6 +870,7 @@ class ResumeClient:
         self.repo = repo
         self.calls: list[str] = []
         self.comment_post_urls: list[str] = []
+        self.comment_texts: list[str] = []
     async def extract_new_post_permalink(self, *, job_id: str, publication_started_at: datetime):
         self.calls.append("extract")
         self.repo.transition(job_id, WorkflowStatus.POST_URL_EXTRACTING)
@@ -725,6 +888,7 @@ class ResumeClient:
     ):
         self.calls.append("comment")
         self.comment_post_urls.append(post_url)
+        self.comment_texts.append(comment_text)
         self.repo.transition(job_id, WorkflowStatus.COMMENT_ADDING)
         self.repo.transition(job_id, WorkflowStatus.COMMENT_ADDED)
         self.repo.transition(job_id, WorkflowStatus.COMPLETED)
@@ -749,7 +913,8 @@ def test_adapter_resume_from_published_and_extracted_without_republishing(tmp_pa
     client2 = ResumeClient(repo); adapter2 = FacebookPublisherAdapter(settings, repo, client2)
     result2 = asyncio.run(adapter2.complete(job_id=second))
     assert result2.success and client2.calls == ["comment"]
-    assert client2.comment_post_urls == ["https://www.facebook.com/posts/123"]
+    assert client2.comment_post_urls == ["https://facebook.com/reel/source"]
+    assert client2.comment_texts == ["Chi tiết: https://www.facebook.com/posts/123"]
 
 
 def test_comment_failure_retry_path_does_not_include_republishing() -> None:

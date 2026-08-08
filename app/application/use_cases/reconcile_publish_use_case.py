@@ -43,8 +43,14 @@ class ReconcilePublishUseCase:
                 f"Current status: {job.status.value}"
             )
 
-        # reconcile_interrupted_publication now accepts PUBLISH_RECONCILIATION_REQUIRED and
-        # FACEBOOK_PUBLISH_UNCERTAIN directly — no unsafe intermediate transition needed.
+        if job.status is WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN:
+            self.repository.transition(
+                job_id,
+                WorkflowStatus.PUBLISH_RECONCILIATION_REQUIRED,
+                event_type="FACEBOOK_PUBLICATION_RECONCILIATION_STARTED",
+                details={"publish_clicked": False},
+            )
+
         try:
             result = await self.publisher.reconcile_publication(job_id=job_id)
             return result

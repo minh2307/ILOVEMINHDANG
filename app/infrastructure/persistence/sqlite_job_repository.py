@@ -94,6 +94,31 @@ class JobRepository:
                 );
                 CREATE INDEX IF NOT EXISTS idx_job_events_job_id
                     ON job_events(job_id, event_id);
+                
+                CREATE TABLE IF NOT EXISTS facebook_publication_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    content_fingerprint TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    target_url TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    worker_id TEXT,
+                    caption_hash TEXT,
+                    media_hashes_json TEXT NOT NULL DEFAULT '[]',
+                    post_id TEXT,
+                    permalink TEXT,
+                    verification_method TEXT,
+                    error_code TEXT,
+                    error_message TEXT,
+                    diagnostic_paths_json TEXT NOT NULL DEFAULT '[]',
+                    FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_fb_attempts_job_id
+                    ON facebook_publication_attempts(job_id);
+                CREATE INDEX IF NOT EXISTS idx_fb_attempts_fingerprint
+                    ON facebook_publication_attempts(content_fingerprint);
                 """
             )
             columns = {
@@ -579,5 +604,103 @@ class JobRepository:
             completed_at=row["completed_at"],
         )
 
+    def create_publication_attempt(
+        self,
+        job_id: str,
+        content_fingerprint: str,
+        target_url: str,
+        *,
+        status: str = "CREATED",
+        worker_id: str | None = None,
+        caption_hash: str | None = None,
+        media_hashes: list[str] | None = None,
+    ) -> str:
+        attempt_id = uuid.uuid4().hex
+        now = _utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO facebook_publication_attempts (
+                    attempt_id, job_id, content_fingerprint, status, target_url,
+                    started_at, updated_at, worker_id, caption_hash, media_hashes_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt_id, job_id, content_fingerprint, status, target_url,
+                    now, now, worker_id, caption_hash,
+                    json.dumps(media_hashes or []),
+                )
+            )
+            connection.commit()
+        return attempt_id
+
+    def update_publication_attempt(
+        self,
+        attempt_id: str,
+        *,
+        status: str | None = None,
+        post_id: str | None = None,
+        permalink: str | None = None,
+        verification_method: str | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        diagnostic_paths: list[str] | None = None,
+        completed: bool = False,
+    ) -> None:
+        now = _utc_now()
+        updates: list[str] = ["updated_at = ?"]
+        params: list[Any] = [now]
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if post_id is not None:
+            updates.append("post_id = ?")
+            params.append(post_id)
+        if permalink is not None:
+            updates.append("permalink = ?")
+            params.append(permalink)
+        if verification_method is not None:
+            updates.append("verification_method = ?")
+            params.append(verification_method)
+        if error_code is not None:
+            updates.append("error_code = ?")
+            params.append(error_code)
+        if error_message is not None:
+            updates.append("error_message = ?")
+            params.append(error_message)
+        if diagnostic_paths is not None:
+            updates.append("diagnostic_paths_json = ?")
+            params.append(json.dumps(diagnostic_paths))
+        if completed:
+            updates.append("completed_at = ?")
+            params.append(now)
+            
+        params.append(attempt_id)
+        with self._connection() as connection:
+            connection.execute(
+                f"UPDATE facebook_publication_attempts SET {', '.join(updates)} WHERE attempt_id = ?",
+                tuple(params)
+            )
+            connection.commit()
+
+    def get_latest_publication_attempt(self, job_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM facebook_publication_attempts WHERE job_id = ? ORDER BY started_at DESC LIMIT 1",
+                (job_id,)
+            ).fetchone()
+        if not row:
+            return None
+        return dict(row)
+        
+    def get_publication_attempt(self, attempt_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM facebook_publication_attempts WHERE attempt_id = ?",
+                (attempt_id,)
+            ).fetchone()
+        if not row:
+            return None
+        return dict(row)
 
 SQLiteJobRepository = JobRepository

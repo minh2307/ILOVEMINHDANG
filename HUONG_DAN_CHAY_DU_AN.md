@@ -115,12 +115,16 @@ Các thiết lập an toàn nên giữ khi chạy thử:
 ```dotenv
 HEADLESS=false
 FACEBOOK_BROWSER_HEADLESS=false
-FACEBOOK_FINAL_CONFIRMATION=true
+FACEBOOK_FINAL_CONFIRMATION=false
 DOWNLOADREEL_ENABLE_INTERACTIONS=false
 ENABLE_REEL_LIKE=false
 ENABLE_COMMENT_LIKE=false
-AUTO_APPROVE_REVIEW=false
+AUTO_APPROVE_REVIEW=true
 ```
+
+Hai giá trị trên bật chế độ tự động: không cần duyệt kết quả hoặc xác nhận publish
+thủ công. Pipeline vẫn dừng nếu Facebook yêu cầu đăng nhập/2FA/checkpoint hoặc kết
+quả publish không chắc chắn.
 
 Muốn chạy bằng Ollama:
 
@@ -135,6 +139,20 @@ ollama pull <ten-model>
 ```
 
 Giá trị `<ten-model>` phải giống `OLLAMA_MODEL` trong `.env`. Nếu cần phân tích hình ảnh từ frame, sử dụng model Ollama có khả năng vision.
+
+### Tạo model Ollama chuyên làm sạch văn bản
+
+Repository có sẵn một Modelfile dùng `minicpm-v:latest` làm model nền và gắn
+prompt làm sạch văn bản tiếng Việt:
+
+```bash
+ollama create vietnamese-text-cleaner -f ollama/Modelfile.text-cleaner
+ollama run vietnamese-text-cleaner
+```
+
+Khi chạy, nhập trực tiếp văn bản thô. Model chỉ trả về nội dung đã làm sạch.
+Model này tách biệt với `OLLAMA_MODEL` của pipeline phân tích y khoa để không
+xung đột với đầu ra JSON có cấu trúc.
 
 ## 6. Chuẩn bị xác thực Facebook
 
@@ -232,7 +250,7 @@ Trong cửa sổ Chrome:
 .venv/bin/python -m app.main preflight --mode full
 ```
 
-### 9.2 Tạo job và xử lý đến checkpoint duyệt
+### 9.2 Tạo job và xử lý tự động
 
 ```bash
 .venv/bin/python main.py create-job --url "https://www.facebook.com/reel/REEL_ID"
@@ -240,9 +258,13 @@ Trong cửa sổ Chrome:
 .venv/bin/python main.py worker --once
 ```
 
-Ghi lại `job_id` được in ra. Pipeline sẽ dừng tại `WAITING_FOR_REVIEW` và hiển thị lệnh tiếp theo.
+Ghi lại `job_id` được in ra. Với `AUTO_APPROVE_REVIEW=true` và
+`FACEBOOK_FINAL_CONFIRMATION=false`, worker tự đi qua bước duyệt, đăng Facebook,
+lấy permalink và bình luận vào Reel gốc.
 
-### 9.3 Duyệt kết quả y khoa
+### 9.3 Chế độ duyệt thủ công (tùy chọn)
+
+Muốn bật lại bước duyệt, đặt `AUTO_APPROVE_REVIEW=false`, rồi dùng:
 
 ```bash
 .venv/bin/python main.py review --job-id JOB_ID
@@ -260,7 +282,9 @@ Chương trình hiển thị các lựa chọn:
 
 Hãy kiểm tra nội dung, dữ liệu cá nhân, kết quả CDHA và ảnh trước khi chọn duyệt.
 
-### 9.4 Chuẩn bị, xác nhận và hoàn tất publish
+### 9.4 Xác nhận publish thủ công (tùy chọn)
+
+Muốn bật lại xác nhận publish, đặt `FACEBOOK_FINAL_CONFIRMATION=true`, rồi dùng:
 
 ```bash
 .venv/bin/python main.py worker --once
@@ -269,7 +293,9 @@ Hãy kiểm tra nội dung, dữ liệu cá nhân, kết quả CDHA và ảnh tr
 .venv/bin/python main.py worker --once
 ```
 
-Worker chuẩn bị composer rồi dừng tại `FACEBOOK_WAITING_FOR_MANUAL_REVIEW`. `confirm-publish` yêu cầu nhập đúng `PUBLISH JOB_ID`; không có tùy chọn nào bỏ qua cổng này.
+Khi cờ này bật, worker chuẩn bị composer rồi dừng tại
+`FACEBOOK_WAITING_FOR_MANUAL_REVIEW`; `confirm-publish` yêu cầu nhập đúng
+`PUBLISH JOB_ID`.
 
 ## 10. Lệnh stage-only legacy không còn được chạy
 

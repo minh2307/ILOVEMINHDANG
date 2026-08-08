@@ -10,9 +10,10 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
+from math import ceil
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
@@ -465,8 +466,14 @@ def _legacy_warning(settings: Settings) -> PreflightCheckResult:
 
 async def _full_ollama_checks(settings: Settings) -> list[PreflightCheckResult]:
     from app.ai.provider_factory import build_analyzer
-    analyzer = build_analyzer(settings, job_data_dir=settings.job_data_dir)
     timeout = settings.preflight_ollama_timeout_seconds
+    transport_settings = replace(
+        settings,
+        ollama_timeout_seconds=max(1, ceil(timeout)),
+    )
+    analyzer = build_analyzer(
+        transport_settings, job_data_dir=settings.job_data_dir
+    )
     checks: list[PreflightCheckResult] = []
     started = time.monotonic()
     try:

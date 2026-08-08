@@ -324,6 +324,30 @@ def test_reconcile_use_case_accepts_uncertain_status(tmp_path: Path) -> None:
     assert publisher.calls == [job_id]
 
 
+def test_reconcile_use_case_enters_formal_reconciliation_state_before_lookup(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    repo = make_repo(settings)
+    job_id = approved_job(repo)
+    for st in (
+        WorkflowStatus.FACEBOOK_PREPARING,
+        WorkflowStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW,
+        WorkflowStatus.FACEBOOK_PUBLISHING,
+        WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+    ):
+        repo.transition(job_id, st)
+
+    class StatusCheckingPublisher(_FakePublisher):
+        async def reconcile_publication(self, *, job_id: str) -> FacebookPublishResult:
+            assert repo.get_job(job_id).status is WorkflowStatus.PUBLISH_RECONCILIATION_REQUIRED
+            return await super().reconcile_publication(job_id=job_id)
+
+    result = asyncio.run(
+        ReconcilePublishUseCase(repo, StatusCheckingPublisher()).execute(job_id)
+    )
+
+    assert result.success
+
+
 def test_reconcile_use_case_accepts_reconciliation_required_status(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     repo = make_repo(settings)
@@ -351,8 +375,8 @@ def test_fingerprint_stable_across_url_normalizations(tmp_path: Path) -> None:
     svc = PostContentService(make_settings(tmp_path))
     img = make_png(tmp_path / "img.png")
     text = "Nội dung bài đăng"
-    h1 = svc.content_fingerprint("https://www.facebook.com/page", text, [img])
-    h2 = svc.content_fingerprint("https://facebook.com/page/", text, [img])
+    h1 = svc.content_fingerprint("https://www.facebook.com/page", text, [img], "job-1", "https://facebook.com/reel/1", "https://cdha.ai/1")
+    h2 = svc.content_fingerprint("https://facebook.com/page/", text, [img], "job-1", "https://facebook.com/reel/1", "https://cdha.ai/1")
     assert h1 == h2
 
 
@@ -362,16 +386,16 @@ def test_fingerprint_changes_with_different_image_contents(tmp_path: Path) -> No
     img2 = make_png(tmp_path / "b.png", "blue")
     # Write different bytes to distinguish them
     img2.write_bytes(img2.read_bytes() + b"\x00\x01\x02")
-    h1 = svc.content_fingerprint("https://www.facebook.com/page", "text", [img1])
-    h2 = svc.content_fingerprint("https://www.facebook.com/page", "text", [img2])
+    h1 = svc.content_fingerprint("https://www.facebook.com/page", "text", [img1], "job-1", "https://facebook.com/reel/1", "https://cdha.ai/1")
+    h2 = svc.content_fingerprint("https://www.facebook.com/page", "text", [img2], "job-1", "https://facebook.com/reel/1", "https://cdha.ai/1")
     assert h1 != h2
 
 
 def test_fingerprint_changes_with_different_post_text(tmp_path: Path) -> None:
     svc = PostContentService(make_settings(tmp_path))
     img = make_png(tmp_path / "img.png")
-    h1 = svc.content_fingerprint("https://www.facebook.com/page", "text A", [img])
-    h2 = svc.content_fingerprint("https://www.facebook.com/page", "text B", [img])
+    h1 = svc.content_fingerprint("https://www.facebook.com/page", "text A", [img], "job-1", "https://facebook.com/reel/1", "https://cdha.ai/1")
+    h2 = svc.content_fingerprint("https://www.facebook.com/page", "text B", [img], "job-1", "https://facebook.com/reel/1", "https://cdha.ai/1")
     assert h1 != h2
 
 
@@ -608,9 +632,17 @@ def test_duplicate_verified_fingerprint_blocks_new_publish(tmp_path: Path) -> No
         "facebook_publication_verified": True,
     })
 
-    client = FacebookWebClient(settings, repo, object())
-    with pytest.raises(ValueError, match="(?i)duplicate"):
-        client._guard_duplicate("new-job", target, "abc123")
+    from app.adapters.facebook_adapter import FacebookPublisherAdapter
+    content = PostContentService(settings)
+    content.content_fingerprint = lambda *args, **kwargs: "abc123"
+    content.select_screenshots = lambda *args, **kwargs: (["mock"], [])
+    adapter = FacebookPublisherAdapter(settings, repo, FacebookWebClient(settings, repo, object()), content=content)
+    job_id = approved_job(repo, job_id="new-job", source_url="https://facebook.com/reel/old")
+    repo.update_data(job_id, {"facebook_target_url": target})
+    
+    validation = adapter.validate_job(job_id)
+    assert not validation.valid
+    assert any("Duplicate" in e for e in validation.errors)
 
 
 def test_duplicate_uncertain_fingerprint_also_blocks(tmp_path: Path) -> None:
@@ -626,6 +658,14 @@ def test_duplicate_uncertain_fingerprint_also_blocks(tmp_path: Path) -> None:
         "facebook_publication_uncertain": True,
     })
 
-    client = FacebookWebClient(settings, repo, object())
-    with pytest.raises(ValueError, match="(?i)duplicate|uncertain"):
-        client._guard_duplicate("new-job", target, "hash-uncertain")
+    from app.adapters.facebook_adapter import FacebookPublisherAdapter
+    content = PostContentService(settings)
+    content.content_fingerprint = lambda *args, **kwargs: "hash-uncertain"
+    content.select_screenshots = lambda *args, **kwargs: (["mock"], [])
+    adapter = FacebookPublisherAdapter(settings, repo, FacebookWebClient(settings, repo, object()), content=content)
+    job_id = approved_job(repo, job_id="new-job", source_url="https://facebook.com/reel/old")
+    repo.update_data(job_id, {"facebook_target_url": target})
+
+    validation = adapter.validate_job(job_id)
+    assert not validation.valid
+    assert any("Duplicate" in e for e in validation.errors)

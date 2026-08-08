@@ -91,14 +91,16 @@ authenticate through the persistent Chrome profile; they do not import that file
 .venv/bin/python -m app.main retry --job-id "<job-id>"
 .venv/bin/python -m app.main cancel --job-id "<job-id>"
 
-# Manual gates
+# Optional manual gates (only when their configuration flags are enabled)
 .venv/bin/python -m app.main review --job-id "<job-id>"
 .venv/bin/python -m app.main confirm-publish --job-id "<job-id>"
 ```
 
-`confirm-publish` requires the operator to type `PUBLISH <job-id>`. Automated
-tests never invoke that gate and never publish real content. CAPTCHA, 2FA,
-checkpoint, and login challenges remain manual.
+With `AUTO_APPROVE_REVIEW=true` and `FACEBOOK_FINAL_CONFIRMATION=false`, the
+worker validates the clinical summary and text privacy scan, then automatically
+continues through Facebook preparation, publication, permalink extraction, and
+the source-Reel comment. CAPTCHA, 2FA, checkpoint, uncertain publication
+outcomes, and login challenges remain manual.
 
 ## Process model
 
@@ -108,9 +110,10 @@ heartbeat, obtains the browser lock, invokes `ProcessJobUseCase`, persists the
 outcome, and releases resources in `finally` blocks. Recovery only requeues
 expired claims; a live worker's lease is never stolen.
 
-The workflow stops at `WAITING_FOR_REVIEW` and
-`FACEBOOK_WAITING_FOR_MANUAL_REVIEW`. Approval creates a new state-specific work
-item, so completed queue rows are never resurrected.
+The workflow still persists `WAITING_FOR_REVIEW` and
+`FACEBOOK_WAITING_FOR_MANUAL_REVIEW` for audit and resume compatibility. In
+automatic mode it traverses both states in the same claimed work item; in manual
+mode it stops and waits for the corresponding CLI command.
 
 Retry requests always persist `RETRY_PENDING`, the previous failure state,
 failure stage, reason, requester, timestamps, and the bounded attempt count

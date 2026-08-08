@@ -12,9 +12,7 @@ class ProcessJobUseCase:
 
     _MANUAL_BOUNDARIES = frozenset(
         {
-            JobStatus.WAITING_FOR_REVIEW,
             JobStatus.WAITING_FOR_AUTH_REVIEW,
-            JobStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW,
             JobStatus.FACEBOOK_PUBLISH_UNCERTAIN,
             JobStatus.BLOCKED,
             JobStatus.REJECTED,
@@ -53,14 +51,21 @@ class ProcessJobUseCase:
         stages: WorkflowStagePort,
         *,
         max_steps_per_run: int = 12,
+        auto_approve_review: bool = False,
+        require_facebook_confirmation: bool = True,
     ) -> None:
         self._repository = repository
         self._stages = stages
         self._max_steps = max(1, int(max_steps_per_run))
+        self._auto_approve_review = bool(auto_approve_review)
+        self._require_facebook_confirmation = bool(require_facebook_confirmation)
 
     async def execute(
         self, job_id: str, *, allow_facebook_publish: bool = False
     ) -> JobResult:
+        effective_publish_permission = (
+            allow_facebook_publish or not self._require_facebook_confirmation
+        )
         for _ in range(self._max_steps):
             job = self._repository.get_job(job_id)
             if job is None:
@@ -72,15 +77,15 @@ class ProcessJobUseCase:
                 return JobResult.failure_result(
                     job_id, job.error_message or f"Workflow stopped at {job.status.value}"
                 )
-            if job.status in self._MANUAL_BOUNDARIES:
-                if not (
-                    allow_facebook_publish
-                    and job.status is JobStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW
-                ):
-                    return self._success(job_id, job.status, manual=True)
+            if self._requires_manual_action(
+                job.status, effective_publish_permission
+            ):
+                return self._success(job_id, job.status, manual=True)
 
             before = job.status
-            result = await self._advance(job_id, job.status, allow_facebook_publish)
+            result = await self._advance(
+                job_id, job.status, effective_publish_permission
+            )
             if not result.success:
                 message = result.error or f"Stage failed from {before.value}"
                 current = self._repository.get_job(job_id)
@@ -119,7 +124,9 @@ class ProcessJobUseCase:
                 return JobResult.failure_result(
                     job_id, message
                 )
-            if refreshed.status in self._MANUAL_BOUNDARIES:
+            if self._requires_manual_action(
+                refreshed.status, effective_publish_permission
+            ):
                 return self._success(job_id, refreshed.status, manual=True)
 
         current = self._repository.get_job(job_id)
@@ -153,6 +160,10 @@ class ProcessJobUseCase:
         if status is JobStatus.SCREENSHOTS_CAPTURED:
             self._repository.transition(job_id, JobStatus.WAITING_FOR_REVIEW)
             return StageExecutionResult(True)
+        if status is JobStatus.WAITING_FOR_REVIEW:
+            if self._auto_approve_review:
+                return await self._stages.approve_review(job_id)
+            return StageExecutionResult(True, pending_manual_action="Review analysis")
         if status is JobStatus.APPROVED:
             return await self._stages.facebook(job_id)
         if status is JobStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW:
@@ -173,6 +184,15 @@ class ProcessJobUseCase:
             retry_step = str(job.data.get("retry_step", "download")) if job else "download"
             return await self._retry_stage(job_id, retry_step)
         return StageExecutionResult(False, error=f"Cannot process status {status.value}")
+
+    def _requires_manual_action(
+        self, status: JobStatus, allow_facebook_publish: bool
+    ) -> bool:
+        if status is JobStatus.WAITING_FOR_REVIEW:
+            return not self._auto_approve_review
+        if status is JobStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW:
+            return not allow_facebook_publish
+        return status in self._MANUAL_BOUNDARIES
 
     async def _retry_stage(self, job_id: str, retry_step: str) -> StageExecutionResult:
         if retry_step == "download":

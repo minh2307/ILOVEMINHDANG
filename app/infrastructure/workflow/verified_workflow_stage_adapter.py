@@ -42,6 +42,9 @@ class VerifiedWorkflowStageAdapter:
     async def capture_screenshots(self, job_id: str) -> StageExecutionResult:
         return await self._run(self._pipeline.execute_screenshot_stage, job_id)
 
+    async def approve_review(self, job_id: str) -> StageExecutionResult:
+        return await self._run(self._pipeline.execute_review_stage, job_id)
+
     async def facebook(self, job_id: str) -> StageExecutionResult:
         return await self._run(self._pipeline.execute_facebook_stage, job_id)
 

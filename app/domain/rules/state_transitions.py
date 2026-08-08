@@ -46,10 +46,11 @@ class JobStateTransitions:
             JobStatus.FACEBOOK_PUBLISH_UNCERTAIN,
         }),
         # PUBLISH_RECONCILIATION_REQUIRED: can resolve to PUBLISHED (post found)
-        # or fall back to UNCERTAIN (post not found, try again later).
+        # or fall back to UNCERTAIN (post not found, try again later), or FAILED.
         JobStatus.PUBLISH_RECONCILIATION_REQUIRED: frozenset({
             JobStatus.FACEBOOK_PUBLISHED,
             JobStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+            JobStatus.FACEBOOK_PUBLISH_FAILED,
         }),
         JobStatus.AUTHENTICATION_REQUIRED: frozenset({JobStatus.FACEBOOK_PREPARING, JobStatus.FACEBOOK_PUBLISHING, JobStatus.WAITING_FOR_AUTH_REVIEW}),
         JobStatus.RETRY_PENDING: frozenset({JobStatus.DOWNLOADREEL_RUNNING, JobStatus.GEMINI_OPENING, JobStatus.AI_ANALYZING, JobStatus.CDHA_OPENING, JobStatus.SCREENSHOTS_CAPTURING, JobStatus.FACEBOOK_PREPARING, JobStatus.POST_URL_EXTRACTING, JobStatus.COMMENT_ADDING}),

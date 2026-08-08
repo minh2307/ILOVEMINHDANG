@@ -5,7 +5,7 @@ Architecture
 * The orchestrator delegates to accepted Phase 1–4 adapter interfaces.
 * It contains no raw Playwright selectors, SQL, or hard-coded file paths.
 * Every external action is idempotent: completed artifacts are reused.
-* Two explicit manual gates are enforced and may never be bypassed.
+* Review and final-publish gates are controlled by explicit settings.
 * Signal handling ensures safe shutdown and resume.
 """
 from __future__ import annotations
@@ -297,6 +297,17 @@ class VerifiedWorkflowStages:
 
     async def execute_screenshot_stage(self, job_id: str) -> PipelineResult:
         return await self._step_screenshots(job_id)
+
+    async def execute_review_stage(self, job_id: str) -> PipelineResult:
+        try:
+            ReviewService(self.settings, self.repository).approve(
+                job_id, automatic=True
+            )
+        except Exception as exc:
+            return self._make_pipeline_result(
+                job_id, False, error=f"Automatic review approval failed: {exc}"
+            )
+        return self._make_pipeline_result(job_id, True)
 
     async def execute_facebook_stage(self, job_id: str) -> PipelineResult:
         return await self._step_facebook(job_id)
@@ -590,7 +601,7 @@ class VerifiedWorkflowStages:
             if not self.auto_continue:
                 return self._make_pipeline_result(job_id, True)
 
-        # Publish (requires operator confirmation inside publish_prepared_post)
+        # Publish interactively or automatically according to configuration.
         if self.repository.get_job(job_id).status is WorkflowStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW:
             published = await adapter.publish(job_id=job_id)
             if not published.success:

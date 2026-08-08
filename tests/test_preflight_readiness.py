@@ -189,6 +189,34 @@ async def test_full_ollama_timeout_is_required_failure(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_full_ollama_bounds_transport_timeout_to_preflight(tmp_path, monkeypatch):
+    settings = replace(
+        _settings(tmp_path),
+        ollama_timeout_seconds=300,
+        preflight_ollama_timeout_seconds=0.2,
+    )
+    configured_timeouts = []
+
+    class Analyzer:
+        async def list_models(self):
+            return ("minicpm-v",)
+
+        async def minimal_inference(self, _prompt):
+            return "PREFLIGHT_OK"
+
+    def build_analyzer(configured, **_kwargs):
+        configured_timeouts.append(configured.ollama_timeout_seconds)
+        return Analyzer()
+
+    monkeypatch.setattr("app.ai.provider_factory.build_analyzer", build_analyzer)
+
+    checks = await _full_ollama_checks(settings)
+
+    assert all(check.status is CheckStatus.PASSED for check in checks)
+    assert configured_timeouts == [1]
+
+
+@pytest.mark.asyncio
 async def test_live_browser_lock_is_reported_and_never_deleted(tmp_path):
     settings = _settings(tmp_path)
     config = FacebookBrowserConfig.from_settings(settings)

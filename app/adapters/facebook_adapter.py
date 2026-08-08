@@ -91,7 +91,12 @@ class FacebookPublisherAdapter:
             
         if not errors and target_url and post_text and images:
             try:
-                fingerprint = self.content.content_fingerprint(target_url, post_text, images)
+                fingerprint = self.content.content_fingerprint(
+                    target_url, post_text, images, job_id, job.source_url, str(job.data.get("cdha_view_url") or "")
+                )
+                duplicates = self.repository.find_facebook_duplicates(fingerprint, target_url, exclude_job_id=job_id)
+                if duplicates:
+                    errors.append("Duplicate publication detected for this content fingerprint and target")
             except Exception as e:
                 errors.append(f"Fingerprint generation failed: {str(e)}")
                 
@@ -174,10 +179,13 @@ class FacebookPublisherAdapter:
 
     async def add_permalink_comment(self, *, job_id: str) -> FacebookCommentResult:
         job = self._job(job_id)
-        post_url = str(job.data.get("facebook_post_url") or "")
-        if not post_url:
+        published_post_url = str(job.data.get("facebook_post_url") or "")
+        if not published_post_url:
             raise ValueError("Exact Facebook post permalink is missing")
-        comment = self.content.build_permalink_comment(post_url)
+        source_url = str(job.source_url or "").strip()
+        if not source_url:
+            raise ValueError("Exact source Facebook post URL is missing")
+        comment = self.content.build_permalink_comment(published_post_url)
         comment_path = self.content.write_text_atomic(
             self.settings.job_data_dir / job_id / "facebook_comment.txt", comment
         )
@@ -189,7 +197,7 @@ class FacebookPublisherAdapter:
         ):
             self.repository.transition(job_id, WorkflowStatus.COMMENT_ADDING)
             result = FacebookCommentResult(
-                True, job_id, post_url, comment_text=comment,
+                True, job_id, source_url, comment_text=comment,
                 posted_at=datetime.now(UTC),
                 warnings=["Facebook permalink comments are disabled by configuration or test mode"],
                 reused=True,
@@ -203,7 +211,7 @@ class FacebookPublisherAdapter:
             return result
         image_path = self.settings.job_data_dir / job_id / "screenshots" / "01-detailed-analysis.png"
         return await self.client.add_permalink_comment(
-            post_url=post_url, comment_text=comment, job_id=job_id, image_path=image_path
+            post_url=source_url, comment_text=comment, job_id=job_id, image_path=image_path
         )
 
     async def complete(self, *, job_id: str) -> FacebookWorkflowResult:

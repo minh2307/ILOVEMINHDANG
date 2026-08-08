@@ -12,7 +12,6 @@ from app.adapters.downloadreel_adapter import DownloadReelAdapter, DownloadReelC
 from app.adapters.facebook_adapter import FacebookPublisherAdapter
 from app.browser.cdha_client import CDHAWebClient
 from app.browser.chrome_manager import ChromeManager, ProfileInUseError
-from app.browser.gemini_client import GeminiWebClient
 from app.browser.facebook_client import FacebookWebClient
 from app.browser.selector_resolver import SelectorResolver
 from app.logging_setup import configure_logging
@@ -51,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--generate-clinical-factors", metavar="JOB_ID")
     group.add_argument("--analyze-cdha", metavar="JOB_ID")
     group.add_argument("--process-cdha", metavar="JOB_ID", help="Run Phase 3 and stop at human review.")
-    group.add_argument("--login-setup", action="store_true", help="Open Gemini and CDHA for manual auth.")
+    group.add_argument("--login-setup", action="store_true", help="Open CDHA for manual auth.")
     group.add_argument("--review-job", metavar="JOB_ID", help="Review a WAITING_FOR_REVIEW job.")
 
     # Phase 4
@@ -466,6 +465,9 @@ def _run_official_command(
         if not job:
             print(json.dumps({"success": False, "error": f"Job not found: {args.job_id}"}))
             return 1
+        attempt = None
+        if hasattr(container.job_repository, "get_latest_publication_attempt"):
+            attempt = container.job_repository.get_latest_publication_attempt(args.job_id)
             
         print(json.dumps({
             "job_id": job.job_id,
@@ -475,7 +477,8 @@ def _run_official_command(
             "facebook_post_id": job.data.get("facebook_post_id"),
             "facebook_post_url": job.data.get("facebook_post_url"),
             "facebook_publication_started_at": job.data.get("facebook_publication_started_at"),
-            "facebook_error": job.data.get("facebook_error")
+            "facebook_error": job.data.get("facebook_error"),
+            "latest_attempt": attempt
         }, ensure_ascii=False, indent=2))
         return 0
 
@@ -636,7 +639,6 @@ def _run_check_config(settings: Settings, repository: JobRepository) -> int:
     check("selectors.yaml exists", settings.selectors_path.is_file(), str(settings.selectors_path))
 
     # URLs
-    check("Gemini URL configured", bool(settings.gemini_url), settings.gemini_url)
     check("CDHA URL configured", bool(settings.cdha_url), settings.cdha_url)
     check("Facebook target URL", bool(settings.facebook_target_url),
           "(not set — required for Facebook steps)" if not settings.facebook_target_url else settings.facebook_target_url,
@@ -759,40 +761,34 @@ async def _run_phase3_command(
 ) -> int:
     resolver = SelectorResolver(settings.selectors_path, save_html=settings.save_diagnostic_html)
     async with ChromeManager(settings) as chrome:
-        gemini = GeminiWebClient(settings, repository, chrome, resolver=resolver)
         cdha = CDHAWebClient(settings, repository, chrome, resolver=resolver)
         if args.login_setup:
-            return await _run_login_setup(settings, chrome, gemini, cdha)
+            return await _run_login_setup(settings, chrome, cdha)
         job_id = args.generate_clinical_factors or args.analyze_cdha or args.process_cdha
         job = repository.get_job(job_id)
         if job is None:
             raise LookupError(f"Job not found: {job_id}")
 
         if args.generate_clinical_factors:
-            result = await gemini.generate_clinical_factors(
-                caption=str(job.data.get("caption") or ""),
-                comments=list(job.data.get("comments") or []),
-                job_id=job_id,
-            )
+            # Use Ollama pipeline for AI analysis
+            from app.workflows.cdha_pipeline import VerifiedWorkflowStages
+            pipeline = VerifiedWorkflowStages(settings, repository, chrome=chrome, auto_continue=False)
+            result = await pipeline._step_ai(job_id)
             print(json.dumps({
                 "success": result.success, "job_id": job_id,
                 "status": repository.get_job(job_id).status.value,
-                "missing_fields": result.missing_fields,
-                "warnings": result.validation_warnings,
                 "error": result.error,
             }, ensure_ascii=False, indent=2))
             return 0 if result.success else 1
 
         if args.process_cdha and job.status in {
-            WorkflowStatus.DOWNLOADED, WorkflowStatus.GEMINI_FAILED, WorkflowStatus.AI_FAILED, WorkflowStatus.NEEDS_GEMINI_LOGIN,
+            WorkflowStatus.DOWNLOADED, WorkflowStatus.AI_FAILED,
         }:
-            generated = await gemini.generate_clinical_factors(
-                caption=str(job.data.get("caption") or ""),
-                comments=list(job.data.get("comments") or []),
-                job_id=job_id,
-            )
-            if not generated.success:
-                print(json.dumps({"success": False, "error": generated.error}, ensure_ascii=False))
+            from app.workflows.cdha_pipeline import VerifiedWorkflowStages
+            pipeline = VerifiedWorkflowStages(settings, repository, chrome=chrome, auto_continue=False)
+            ai_result = await pipeline._step_ai(job_id)
+            if not ai_result.success:
+                print(json.dumps({"success": False, "error": ai_result.error}, ensure_ascii=False))
                 return 1
             job = repository.get_job(job_id)
 
@@ -833,35 +829,23 @@ async def _run_review_retry(
 ) -> int:
     resolver = SelectorResolver(settings.selectors_path, save_html=settings.save_diagnostic_html)
     async with ChromeManager(settings) as chrome:
-        gemini = GeminiWebClient(settings, repository, chrome, resolver=resolver)
         cdha = CDHAWebClient(settings, repository, chrome, resolver=resolver)
         job = repository.get_job(job_id)
         if job is None:
             raise LookupError(f"Job not found: {job_id}")
         if action in {"retry_gemini", "retry_ollama"}:
-            # retry_ollama: re-run local Ollama AI, then fall through to CDHA
-            # retry_gemini: legacy path kept for backwards compat
-            if action == "retry_gemini":
-                generated = await gemini.generate_clinical_factors(
-                    caption=str(job.data.get("caption") or ""),
-                    comments=list(job.data.get("comments") or []),
-                    job_id=job_id,
-                )
-            else:
-                # Retained compatibility helper; official CLI uses RetryJobUseCase.
-                from app.workflows.cdha_pipeline import VerifiedWorkflowStages
-                pipeline = VerifiedWorkflowStages(settings, repository, chrome=chrome)
-                ai_result = await pipeline._step_ai(job_id)
-                if not ai_result.success:
-                    print(json.dumps(ai_result.to_dict(), ensure_ascii=False, indent=2))
-                    return 1
-                # _step_ai already chains into _step_cdha and _step_screenshots;
-                # display the updated review and exit so the user can re-decide.
-                ReviewService(settings, repository).display(job_id)
-                return 0
-            if action == "retry_gemini" and not generated.success:
+            # Both retry_gemini (legacy) and retry_ollama now use Ollama pipeline
+            from app.workflows.cdha_pipeline import VerifiedWorkflowStages
+            pipeline = VerifiedWorkflowStages(settings, repository, chrome=chrome)
+            ai_result = await pipeline._step_ai(job_id)
+            if not ai_result.success:
+                print(json.dumps(ai_result.to_dict(), ensure_ascii=False, indent=2))
                 return 1
-            job = repository.get_job(job_id)
+            # _step_ai already chains into _step_cdha and _step_screenshots;
+            # display the updated review and exit so the user can re-decide.
+            ReviewService(settings, repository).display(job_id)
+            return 0
+        job = repository.get_job(job_id)
         video_path = job.data.get("video_path")
         factors = job.data.get("clinical_factors")
         if not video_path or not factors:
@@ -876,24 +860,22 @@ async def _run_review_retry(
 
 async def _run_login_setup(
     settings: Settings, chrome: ChromeManager,
-    gemini: GeminiWebClient, cdha: CDHAWebClient,
+    cdha: CDHAWebClient,
 ) -> int:
-    gemini_page = await chrome.new_page()
     cdha_page = await chrome.new_page()
-    await gemini_page.goto(settings.gemini_url, wait_until="domcontentloaded")
     await cdha_page.goto(settings.cdha_url, wait_until="domcontentloaded")
 
-    async def both_authenticated() -> bool:
-        return await gemini.is_authenticated(gemini_page) and await cdha.is_authenticated(cdha_page)
+    async def cdha_authenticated() -> bool:
+        return await cdha.is_authenticated(cdha_page)
 
-    if not await both_authenticated():
+    if not await cdha_authenticated():
         await chrome.wait_for_manual_action(
-            "Log in to Gemini and CDHA manually. Complete any 2FA, CAPTCHA, checkpoint. No content will be submitted.",
-            both_authenticated,
+            "Log in to CDHA manually. Complete any 2FA, CAPTCHA, checkpoint. No content will be submitted.",
+            cdha_authenticated,
         )
-    if not await both_authenticated():
-        raise ValueError("Gemini and CDHA authenticated pages could not both be verified")
-    print("Gemini and CDHA login setup verified. No content was submitted.")
+    if not await cdha_authenticated():
+        raise ValueError("CDHA authenticated page could not be verified")
+    print("CDHA login setup verified. No content was submitted.")
     return 0
 
 if __name__ == "__main__":

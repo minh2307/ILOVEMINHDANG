@@ -62,43 +62,9 @@ class ReviewService:
             choice = choice_provider("Select [1-7]: ").strip()
 
         if choice == "1":
-            cdha = job.data.get("cdha_result") or {}
-            summary = self.post_content.validate_clinical_summary(
-                key_findings=list(cdha.get("key_findings") or []),
-                impression=cdha.get("impression"),
-                cdha_view_url=str(
-                    cdha.get("analysis_url") or job.data.get("cdha_view_url") or ""
-                ),
+            return self.approve(
+                job_id, automatic=self.settings.auto_approve_review
             )
-            combined = "\n".join(
-                (
-                    str(job.data.get("clinical_factors") or ""),
-                    str(job.data.get("facebook_post_text") or ""),
-                    *summary.key_findings,
-                    summary.impression,
-                )
-            )
-            privacy_scan = self.clinical_factors.privacy.scan(combined)
-            self.repository.update_data(
-                job_id,
-                {
-                    "review_privacy_risk_level": privacy_scan.risk_level,
-                    "review_privacy_categories": list(privacy_scan.detected_categories),
-                    "review_media_pii_acknowledged": True,
-                    "review_clinical_summary_validated_at": datetime.now(UTC).isoformat(),
-                    "review_clinical_summary": summary.to_dict(),
-                },
-            )
-            self.repository.transition(
-                job_id,
-                WorkflowStatus.APPROVED,
-                details={
-                    "review_decision": "approved_for_later_phase4",
-                    "privacy_risk_level": privacy_scan.risk_level,
-                    "media_pii_warning_acknowledged": True,
-                },
-            )
-            return ReviewDecision("approved")
         if choice == "2":
             self.repository.transition(
                 job_id,
@@ -151,7 +117,56 @@ class ReviewService:
             return ReviewDecision("show_screenshot_folder")
         if choice == "7":
             print("Review left pending. Resume later with --review-job.")
-            return ReviewDecision("resume_later")
+        return ReviewDecision("resume_later")
+
+    def approve(self, job_id: str, *, automatic: bool = False) -> ReviewDecision:
+        job = self.repository.get_job(job_id)
+        if job is None:
+            raise LookupError(f"Job not found: {job_id}")
+        if job.status is not WorkflowStatus.WAITING_FOR_REVIEW:
+            raise ValueError(
+                f"Review approval requires WAITING_FOR_REVIEW; got {job.status.value}"
+            )
+        cdha = job.data.get("cdha_result") or {}
+        summary = self.post_content.validate_clinical_summary(
+            key_findings=list(cdha.get("key_findings") or []),
+            impression=cdha.get("impression"),
+            cdha_view_url=str(
+                cdha.get("analysis_url") or job.data.get("cdha_view_url") or ""
+            ),
+        )
+        combined = "\n".join(
+            (
+                str(job.data.get("clinical_factors") or ""),
+                str(job.data.get("facebook_post_text") or ""),
+                *summary.key_findings,
+                summary.impression,
+            )
+        )
+        privacy_scan = self.clinical_factors.privacy.scan(combined)
+        self.repository.update_data(
+            job_id,
+            {
+                "review_privacy_risk_level": privacy_scan.risk_level,
+                "review_privacy_categories": list(privacy_scan.detected_categories),
+                "review_media_pii_acknowledged": not automatic,
+                "review_clinical_summary_validated_at": datetime.now(UTC).isoformat(),
+                "review_clinical_summary": summary.to_dict(),
+                "review_automatic": automatic,
+            },
+        )
+        self.repository.transition(
+            job_id,
+            WorkflowStatus.APPROVED,
+            details={
+                "review_decision": (
+                    "automatic_approval" if automatic else "approved_for_later_phase4"
+                ),
+                "privacy_risk_level": privacy_scan.risk_level,
+                "media_pii_warning_acknowledged": not automatic,
+            },
+        )
+        return ReviewDecision("approved")
         raise ValueError("Review selection must be a number from 1 to 7")
 
     def display(self, job_id: str) -> None:
