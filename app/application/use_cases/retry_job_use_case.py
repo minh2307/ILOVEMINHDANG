@@ -39,6 +39,21 @@ class RetryJobUseCase:
         job = self._repository.get_job(job_id)
         if job is None:
             return JobResult.failure_result(job_id, f"Job not found: {job_id}")
+        submitted = str(
+            job.data.get("facebook_publication_state") or ""
+        ) == "SUBMITTED_UNCONFIRMED" or str(
+            job.data.get("facebook_submission_status") or ""
+        ) in {"SUBMITTING", "SUBMITTED_UNCONFIRMED", "PUBLICATION_UNCERTAIN"}
+        if submitted and job.status in {
+            JobStatus.FACEBOOK_PUBLISH_FAILED,
+            JobStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+            JobStatus.PUBLISH_RECONCILIATION_REQUIRED,
+            JobStatus.RETRY_PENDING,
+        }:
+            return JobResult.failure_result(
+                job_id,
+                "Facebook publication was already submitted; reconciliation is required and publishing retry is blocked",
+            )
         if job.status is JobStatus.RETRY_PENDING:
             queued = await self._scheduler.schedule_job(job_id)
             return JobResult.success_result(

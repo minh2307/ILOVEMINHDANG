@@ -43,10 +43,19 @@ class PublishOutcomeStages:
 
     async def facebook(self, job_id: str) -> StageExecutionResult:
         self.repository.transition(job_id, JobStatus.FACEBOOK_PUBLISHING)
+        publication_state = (
+            "SUBMITTED_UNCONFIRMED"
+            if self.outcome is JobStatus.FACEBOOK_PUBLISH_UNCERTAIN
+            else "FAILED_BEFORE_SUBMIT"
+        )
         self.repository.transition(
             job_id,
             self.outcome,
             details={"error": "simulated publication outcome"},
+            data_patch={
+                "facebook_publication_state": publication_state,
+                "facebook_submission_status": publication_state,
+            },
         )
         return StageExecutionResult(False, error="simulated publication outcome")
 
@@ -105,6 +114,7 @@ async def test_definite_publish_failure_passes_through_retry_pending(tmp_path):
     assert result.success is True
     assert result.data["retry_scheduled"] is True
     persisted = repository.get_job("publish")
+    assert persisted.data["facebook_publication_state"] == "FAILED_BEFORE_SUBMIT"
     assert persisted.status is JobStatus.RETRY_PENDING
     assert persisted.attempt_count == 1
     assert persisted.data["previous_failure_state"] == "FACEBOOK_PUBLISH_FAILED"
@@ -114,13 +124,41 @@ async def test_definite_publish_failure_passes_through_retry_pending(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_uncertain_publish_is_never_automatically_retried(tmp_path):
+async def test_uncertain_publish_retries_reconciliation_without_enqueueing_publish(tmp_path):
     repository, queue, use_case, work_item = build_use_case(
         tmp_path, JobStatus.FACEBOOK_PUBLISH_UNCERTAIN
     )
 
-    result = await use_case.execute(work_item)
+    with pytest.raises(RuntimeError, match="reconciliation"):
+        await use_case.execute(work_item)
+
+    assert repository.get_job("publish").status is JobStatus.FACEBOOK_PUBLISH_UNCERTAIN
+    assert await queue.list_records() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("submission_status", ["SUBMITTING", "SUBMITTED_UNCONFIRMED"])
+async def test_retry_use_case_blocks_failed_job_that_was_already_submitted(
+    tmp_path, submission_status
+):
+    repository, queue, _use_case, _work_item = build_use_case(
+        tmp_path, JobStatus.FACEBOOK_PUBLISH_FAILED
+    )
+    repository.transition("publish", JobStatus.FACEBOOK_PUBLISHING)
+    repository.transition(
+        "publish",
+        JobStatus.FACEBOOK_PUBLISH_FAILED,
+        data_patch={
+            "facebook_submission_status": submission_status,
+        },
+    )
+    retry = RetryJobUseCase(
+        repository, ScheduleWorkflowJobsUseCase(repository, queue)
+    )
+
+    result = await retry.execute("publish", reason="operator retry")
 
     assert result.success is False
-    assert repository.get_job("publish").status is JobStatus.FACEBOOK_PUBLISH_UNCERTAIN
+    assert "reconcil" in (result.error or "").lower()
+    assert repository.get_job("publish").status is JobStatus.FACEBOOK_PUBLISH_FAILED
     assert await queue.list_records() == []

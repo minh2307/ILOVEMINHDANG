@@ -82,6 +82,9 @@ class DependencyContainer:
             self.job_queue,
             auto_approve_review=self.settings.auto_approve_review,
             require_facebook_confirmation=self.settings.facebook_final_confirmation,
+            max_facebook_reconciliation_attempts=(
+                self.settings.max_facebook_reconciliation_retries
+            ),
         )
         self.create_job = CreateJobUseCase(self.job_repository, self.scheduler)
         self.retry_job = RetryJobUseCase(self.job_repository, self.scheduler)
@@ -123,8 +126,9 @@ class DependencyContainer:
             dispatcher=self.dispatcher,
             lock_wait_timeout_seconds=self.settings.browser_lock_wait_timeout_seconds,
             lock_retry_interval_seconds=self.settings.browser_lock_retry_interval_seconds,
-            retry_base_seconds=5,
-            retry_max_seconds=40,
+            retry_base_seconds=self.settings.retry_initial_delay_seconds,
+            retry_multiplier=self.settings.retry_multiplier,
+            retry_max_seconds=self.settings.retry_max_delay_seconds,
             retry_jitter_seconds=self.settings.retry_jitter_seconds,
             queue_lease_seconds=self.settings.job_lease_seconds,
             queue_heartbeat_seconds=self.settings.job_heartbeat_seconds,

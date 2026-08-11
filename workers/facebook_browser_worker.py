@@ -33,6 +33,7 @@ class FacebookBrowserWorker:
         lock_wait_timeout_seconds: float = 180,
         lock_retry_interval_seconds: float = 5,
         retry_base_seconds: float = 5,
+        retry_multiplier: float = 2,
         retry_max_seconds: float = 40,
         retry_jitter_seconds: float = 1,
         worker_id: str | None = None,
@@ -50,6 +51,7 @@ class FacebookBrowserWorker:
         self._lock_wait_timeout = max(0.0, float(lock_wait_timeout_seconds))
         self._lock_retry_interval = max(0.001, float(lock_retry_interval_seconds))
         self._retry_base = max(0.0, float(retry_base_seconds))
+        self._retry_multiplier = max(1.0, float(retry_multiplier))
         self._retry_max = max(self._retry_base, float(retry_max_seconds))
         self._retry_jitter = max(0.0, float(retry_jitter_seconds))
         self._worker_id = worker_id or f"worker-{uuid.uuid4().hex}"
@@ -180,7 +182,11 @@ class FacebookBrowserWorker:
         return False
 
     def _retry_delay(self, attempt_count: int) -> float:
-        base = min(self._retry_max, self._retry_base * (2 ** max(0, attempt_count)))
+        base = min(
+            self._retry_max,
+            self._retry_base
+            * (self._retry_multiplier ** max(0, attempt_count)),
+        )
         return base + (random.uniform(0, self._retry_jitter) if self._retry_jitter else 0)
 
     async def _schedule_retry(self, job: Any, reason: str) -> None:

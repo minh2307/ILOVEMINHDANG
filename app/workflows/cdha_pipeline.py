@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 from app.adapters.downloadreel_adapter import DownloadReelAdapter, DownloadReelCoordinator
 from app.adapters.facebook_adapter import FacebookPublisherAdapter
+from app.application.use_cases.reconcile_publish_use_case import ReconcilePublishUseCase
 from app.browser.chrome_manager import ChromeManager
 from app.browser.facebook_client import FacebookWebClient
 from app.browser.selector_resolver import SelectorResolver
@@ -149,12 +150,12 @@ class VerifiedWorkflowStages:
                 pending="Review the content and create a new job if appropriate",
             )
 
-        if status is WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN:
-            return self._make_pipeline_result(
-                job_id, False,
-                error="Facebook publication outcome is uncertain; inspect Facebook manually",
-                pending="Inspect Facebook page, then contact operator for resolution",
-            )
+        if status in {
+            WorkflowStatus.FACEBOOK_PUBLISHING,
+            WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+            WorkflowStatus.PUBLISH_RECONCILIATION_REQUIRED,
+        }:
+            return await self.execute_facebook_reconciliation_stage(job_id)
 
         if status is WorkflowStatus.WAITING_FOR_AUTH_REVIEW:
             return self._make_pipeline_result(
@@ -210,8 +211,17 @@ class VerifiedWorkflowStages:
             WorkflowStatus.APPROVED,
             WorkflowStatus.FACEBOOK_PUBLISH_FAILED,
             WorkflowStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW,
-            WorkflowStatus.FACEBOOK_PUBLISHING,
         }:
+            if (
+                status is WorkflowStatus.FACEBOOK_PUBLISH_FAILED
+                and FacebookWebClient._publication_was_submitted(job.data)
+            ):
+                return self._make_pipeline_result(
+                    job_id,
+                    False,
+                    error="Facebook reconciliation attempts are exhausted; publishing retry is blocked",
+                    pending="Inspect the existing Facebook submission diagnostics",
+                )
             return await self._step_facebook(job_id)
 
         if status is WorkflowStatus.FACEBOOK_PUBLISHED:
@@ -241,6 +251,16 @@ class VerifiedWorkflowStages:
         job = self.repository.get_job(job_id)
         if job is None:
             return PipelineResult(False, job_id, "UNKNOWN", error="Job not found")
+        if (
+            job.status is WorkflowStatus.FACEBOOK_PUBLISH_FAILED
+            and FacebookWebClient._publication_was_submitted(job.data)
+        ):
+            return self._make_pipeline_result(
+                job_id,
+                False,
+                error="Facebook post was already submitted; prepare/publish retry is blocked",
+                pending="Run reconciliation or inspect the stored diagnostics",
+            )
 
         if job.status is WorkflowStatus.FACEBOOK_PUBLISHING:
             return await self.execute_facebook_reconciliation_stage(job_id)
@@ -329,7 +349,9 @@ class VerifiedWorkflowStages:
             confirmation_provider=self.confirmation_provider,
         )
         adapter = FacebookPublisherAdapter(self.settings, self.repository, client)
-        reconciled = await adapter.reconcile_publication(job_id=job_id)
+        reconciled = await ReconcilePublishUseCase(
+            self.repository, adapter, logger=self.logger
+        ).execute(job_id)
         if not reconciled.success:
             return self._make_pipeline_result(
                 job_id,

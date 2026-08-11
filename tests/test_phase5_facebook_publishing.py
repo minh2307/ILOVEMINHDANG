@@ -367,6 +367,31 @@ def test_reconcile_use_case_accepts_reconciliation_required_status(tmp_path: Pat
     assert result.success
 
 
+def test_reconcile_use_case_recovers_interrupted_publishing_without_publish_click(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    repo = make_repo(settings)
+    job_id = approved_job(repo, job_id="interrupted-submit")
+    for status in (
+        WorkflowStatus.FACEBOOK_PREPARING,
+        WorkflowStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW,
+        WorkflowStatus.FACEBOOK_PUBLISHING,
+    ):
+        repo.transition(job_id, status)
+    repo.update_data(job_id, {
+        "facebook_submission_status": "SUBMITTED_UNCONFIRMED",
+        "facebook_publication_state": "SUBMITTED_UNCONFIRMED",
+    })
+    publisher = _FakePublisher(success=True)
+
+    result = asyncio.run(
+        ReconcilePublishUseCase(repo, publisher).execute(job_id)  # type: ignore[arg-type]
+    )
+
+    assert result.success is True
+    assert publisher.calls == [job_id]
+    assert repo.get_job(job_id).status is WorkflowStatus.PUBLISH_RECONCILIATION_REQUIRED
+
+
 # ---------------------------------------------------------------------------
 # Section 5: Content fingerprinting determinism
 # ---------------------------------------------------------------------------
@@ -418,7 +443,8 @@ class FakeResolver:
     def __init__(self) -> None:
         self.items = {key: FakeLocator() for key in (
             "facebook.create_post_entry", "facebook.composer_dialog",
-            "facebook.composer_textbox", "facebook.file_input", "facebook.publish_button"
+            "facebook.composer_textbox", "facebook.file_input", "facebook.next_button",
+            "facebook.publish_now_indicator", "facebook.post_button",
         )}
 
     async def find_first(self, page: Any, key: str, **_: Any) -> FakeLocator:
@@ -440,6 +466,8 @@ class FakePage:
     def __init__(self) -> None: self.shots: list[str] = []
 
     async def goto(self, *_: Any, **__: Any) -> None: return None
+    async def reload(self, *_: Any, **__: Any) -> None: return None
+    async def close(self) -> None: return None
 
     async def screenshot(self, *, path: str, **_: Any) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -565,8 +593,310 @@ def test_uncertain_publish_persists_submission_status_and_uncertain_flag(monkeyp
     assert result.is_verified is False
     persisted = repo.get_job(job_id)
     assert persisted.status is WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN
-    assert persisted.data.get("facebook_submission_status") == "PUBLICATION_UNCERTAIN"
+    assert persisted.data.get("facebook_submission_status") == "SUBMITTED_UNCONFIRMED"
+    assert persisted.data.get("facebook_publication_state") == "SUBMITTED_UNCONFIRMED"
     assert persisted.data.get("facebook_publication_uncertain") is True
+
+
+def test_verification_retries_delayed_post_publish_upsell(tmp_path: Path) -> None:
+    """A late Facebook CTA must be dismissed during verification, not only once after click."""
+    settings = make_settings(tmp_path, facebook_publish_timeout_seconds=5)
+    repo = make_repo(settings)
+    job_id = approved_job(repo)
+    repo.update_data(job_id, {"facebook_target_url": settings.facebook_target_url})
+
+    dialog = FakeLocator()
+    dismiss = FakeLocator()
+
+    class DelayedUpsellResolver(FakeResolver):
+        def __init__(self) -> None:
+            super().__init__()
+            self.upsell_probes = 0
+
+        async def exists(self, page: Any, key: str, **_: Any) -> bool:
+            if key == "facebook.post_publish_upsell_dialog":
+                self.upsell_probes += 1
+                return self.upsell_probes == 2
+            if key in {"facebook.publish_success", "facebook.composer_dialog"}:
+                return False
+            return await super().exists(page, key)
+
+        async def find_first(self, page: Any, key: str, **_: Any) -> FakeLocator:
+            if key == "facebook.post_publish_upsell_dialog":
+                return dialog
+            if key == "facebook.post_publish_upsell_dismiss":
+                return dismiss
+            return await super().find_first(page, key)
+
+    class DelayedCandidateClient(FacebookWebClient):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.candidate_checks = 0
+
+        async def _find_exact_new_post(self, *_: Any, **__: Any) -> dict[str, Any] | None:
+            self.candidate_checks += 1
+            if self.candidate_checks < 2:
+                return None
+            return {
+                "url": "https://www.facebook.com/posts/123456789",
+                "text_match": True,
+                "recent": True,
+                "image_count": 1,
+            }
+
+    resolver = DelayedUpsellResolver()
+    client = DelayedCandidateClient(settings, repo, FakeChrome(), resolver=resolver)
+    result, _signals = asyncio.run(client._verify_publication(
+        FakePage(), job_id, "Nội dung", [tmp_path / "img.png"], datetime.now(UTC), set()
+    ))
+
+    assert result.success is True
+    assert resolver.upsell_probes >= 2
+    assert dismiss.clicked == 1
+
+
+def test_publish_settle_observes_posting_and_dismisses_late_interstitial(tmp_path: Path) -> None:
+    settings = make_settings(
+        tmp_path,
+        facebook_publish_settle_timeout_seconds=2,
+        facebook_publish_poll_interval_seconds=0.001,
+    )
+    repo = make_repo(settings)
+    job_id = approved_job(repo)
+    dialog = FakeLocator()
+    dismiss = FakeLocator()
+
+    class SettleResolver(FakeResolver):
+        def __init__(self) -> None:
+            super().__init__()
+            self.posting_probes = 0
+            self.dialog_probes = 0
+
+        async def exists(self, page: Any, key: str, **_: Any) -> bool:
+            if key == "facebook.post_publish_interstitial_dialog":
+                self.dialog_probes += 1
+                return self.dialog_probes >= 2 and dismiss.clicked == 0
+            if key == "facebook.posting_indicator":
+                self.posting_probes += 1
+                return self.posting_probes <= 2
+            if key == "facebook.composer_dialog":
+                return self.posting_probes <= 2
+            if key == "facebook.publish_success":
+                return False
+            return await super().exists(page, key)
+
+        async def find_first(self, page: Any, key: str, **_: Any) -> FakeLocator:
+            if key == "facebook.post_publish_interstitial_dialog":
+                return dialog
+            if key == "facebook.post_publish_interstitial_dismiss":
+                return dismiss
+            return await super().find_first(page, key)
+
+    resolver = SettleResolver()
+    client = FacebookWebClient(settings, repo, FakeChrome(), resolver=resolver)
+    settled = asyncio.run(client._wait_for_publish_to_settle(
+        FakePage(), job_id=job_id, submitted_at=datetime.now(UTC)
+    ))
+
+    assert settled.submitted is True
+    assert settled.posting_indicator_detected is True
+    assert settled.posting_indicator_cleared is True
+    assert settled.composer_closed is True
+    assert settled.interstitial_dismissed is True
+    assert dismiss.clicked == 1
+
+
+def test_post_publish_interstitial_absent_is_safe(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    repo = make_repo(settings)
+    job_id = approved_job(repo)
+    client = FacebookWebClient(settings, repo, FakeChrome(), resolver=FakeResolver())
+
+    dismissed = asyncio.run(client._dismiss_post_publish_interstitials(FakePage(), job_id))
+
+    assert dismissed is False
+
+
+def test_post_publish_interstitial_without_safe_button_records_diagnostics(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    repo = make_repo(settings)
+    job_id = approved_job(repo)
+    dialog = FakeLocator()
+
+    class UnsafeResolver(FakeResolver):
+        async def exists(self, page: Any, key: str, **_: Any) -> bool:
+            if key == "facebook.post_publish_interstitial_dialog":
+                return True
+            return await super().exists(page, key)
+
+        async def find_first(self, page: Any, key: str, **_: Any) -> FakeLocator:
+            if key == "facebook.post_publish_interstitial_dialog":
+                return dialog
+            if key == "facebook.post_publish_interstitial_dismiss":
+                raise KeyError("no safe dismiss button")
+            return await super().find_first(page, key)
+
+    page = FakePage()
+    client = FacebookWebClient(settings, repo, FakeChrome(), resolver=UnsafeResolver())
+    dismissed = asyncio.run(client._dismiss_post_publish_interstitials(page, job_id))
+
+    assert dismissed is False
+    assert any("interstitial-no-safe-dismiss" in path for path in page.shots)
+    event_types = [event.event_type for event in repo.list_events(job_id)]
+    assert "late_interstitial_detected" in event_types
+    assert "late_interstitial_dismiss_failed" in event_types
+
+
+def test_caption_matching_normalizes_unicode_whitespace_and_newlines() -> None:
+    approved = "CA LÂM SÀNG\nGhi nhận chính:   Tổn thương giảm âm\nNguồn: CDHA.AI"
+    rendered = "CA LÂM SÀNG  Ghi nhận chính:\nTổn thương giảm âm ... Nguồn: CDHA.AI"
+
+    match = FacebookWebClient._caption_match(approved, rendered)
+
+    assert match["matched"] is True
+    assert match["score"] >= 6
+    assert "prefix" in match["reason"] or "suffix" in match["reason"]
+
+
+def test_pfbid_permalink_is_normalized_and_id_is_retained() -> None:
+    raw = "https://facebook.com/CDHA.AI/posts/pfbid02AbCdEf123?ref=share"
+    normalized = FacebookWebClient.normalize_permalink(raw, base_url="https://facebook.com/CDHA.AI")
+
+    assert normalized == "https://www.facebook.com/CDHA.AI/posts/pfbid02AbCdEf123"
+    assert FacebookWebClient.extract_post_id(normalized) == "pfbid02AbCdEf123"
+
+
+def test_direct_post_submit_permalink_verifies_without_success_toast(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    repo = make_repo(settings)
+    approved_job(repo, job_id="direct-link")
+
+    class Link:
+        async def get_attribute(self, name: str) -> str | None:
+            assert name == "href"
+            return "/test.page/posts/pfbidDirect123?ref=notif"
+
+    class DirectLinkClient(FacebookWebClient):
+        async def _all_locators(self, page: Any, key: str) -> list[Any]:
+            if key == "facebook.publish_result_permalink":
+                return [Link()]
+            return []
+
+    client = DirectLinkClient(settings, repo, FakeChrome(), resolver=FakeResolver())
+    candidate = asyncio.run(client._find_direct_result_permalink(FakePage(), {"old"}))
+
+    assert candidate is not None
+    assert candidate["post_id"] == "pfbidDirect123"
+    assert candidate["method"] == "direct-post-submit-permalink"
+
+
+def _make_uncertain_publication(repo: JobRepository, job_id: str) -> None:
+    for status in (
+        WorkflowStatus.FACEBOOK_PREPARING,
+        WorkflowStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW,
+        WorkflowStatus.FACEBOOK_PUBLISHING,
+        WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+    ):
+        repo.transition(job_id, status)
+    now = datetime.now(UTC).isoformat()
+    repo.update_data(job_id, {
+        "facebook_target_url": "https://www.facebook.com/test.page",
+        "facebook_post_text": "CA LÂM SÀNG\nNguồn: https://cdha.ai/dash?view=late",
+        "facebook_image_paths": ["one.png"],
+        "facebook_known_post_ids": ["old"],
+        "facebook_publication_started_at": now,
+        "facebook_click_timestamp": now,
+        "facebook_submission_status": "SUBMITTED_UNCONFIRMED",
+        "facebook_publication_state": "SUBMITTED_UNCONFIRMED",
+    })
+
+
+def test_reconciliation_finds_late_post_on_next_attempt_without_toast(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, max_facebook_reconciliation_retries=3)
+    repo = make_repo(settings)
+    job_id = approved_job(repo, job_id="late-reconcile")
+    _make_uncertain_publication(repo, job_id)
+
+    class SequencedClient(FacebookWebClient):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.calls = 0
+
+        async def _ensure_authenticated(self, *_: Any, **__: Any) -> None: return None
+
+        async def _verify_publication(self, *_: Any, **__: Any):
+            self.calls += 1
+            if self.calls == 1:
+                return FacebookPublishResult(
+                    False, "PUBLICATION_UNCERTAIN", job_id=job_id,
+                    error="not visible yet",
+                ), {"success_notification": False, "exact_post_match": False}
+            return FacebookPublishResult(
+                True,
+                "PUBLISHED_VERIFIED",
+                target_url=settings.facebook_target_url,
+                post_id="pfbidLate123",
+                permalink="https://www.facebook.com/test.page/posts/pfbidLate123",
+                verification_method="permalink+caption_prefix",
+                job_id=job_id,
+            ), {"success_notification": False, "exact_post_match": True, "text_match": True}
+
+    client = SequencedClient(settings, repo, FakeChrome(), resolver=FakeResolver())
+
+    class Publisher:
+        async def reconcile_publication(self, *, job_id: str) -> FacebookPublishResult:
+            return await client.reconcile_interrupted_publication(job_id=job_id)
+
+    use_case = ReconcilePublishUseCase(repo, Publisher())  # type: ignore[arg-type]
+    first = asyncio.run(use_case.execute(job_id))
+    assert first.success is False
+    assert repo.get_job(job_id).status is WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN
+    assert repo.get_job(job_id).data["facebook_reconciliation_attempt"] == 1
+    assert repo.get_job(job_id).data["facebook_submission_status"] == "SUBMITTED_UNCONFIRMED"
+
+    second = asyncio.run(use_case.execute(job_id))
+    persisted = repo.get_job(job_id)
+    assert second.success is True
+    assert persisted.status is WorkflowStatus.FACEBOOK_PUBLISHED
+    assert persisted.data["facebook_post_id"] == "pfbidLate123"
+    assert persisted.data["facebook_post_url"].endswith("/posts/pfbidLate123")
+    assert persisted.data["facebook_publication_state"] == "PUBLISHED_CONFIRMED"
+
+
+def test_reconciliation_exhaustion_is_controlled_and_keeps_submit_evidence(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, max_facebook_reconciliation_retries=2)
+    repo = make_repo(settings)
+    job_id = approved_job(repo, job_id="reconcile-exhausted")
+    _make_uncertain_publication(repo, job_id)
+
+    class NeverFoundClient(FacebookWebClient):
+        async def _ensure_authenticated(self, *_: Any, **__: Any) -> None: return None
+        async def _verify_publication(self, *_: Any, **__: Any):
+            return FacebookPublishResult(
+                False, "PUBLICATION_UNCERTAIN", job_id=job_id, error="not found"
+            ), {"success_notification": False, "exact_post_match": False}
+
+    client = NeverFoundClient(settings, repo, FakeChrome(), resolver=FakeResolver())
+
+    class Publisher:
+        async def reconcile_publication(self, *, job_id: str) -> FacebookPublishResult:
+            return await client.reconcile_interrupted_publication(job_id=job_id)
+
+    use_case = ReconcilePublishUseCase(repo, Publisher())  # type: ignore[arg-type]
+    assert asyncio.run(use_case.execute(job_id)).success is False
+    assert asyncio.run(use_case.execute(job_id)).success is False
+
+    persisted = repo.get_job(job_id)
+    assert persisted.status is WorkflowStatus.FACEBOOK_PUBLISH_FAILED
+    assert persisted.data["facebook_reconciliation_attempt"] == 2
+    assert persisted.data["facebook_reconciliation_exhausted"] is True
+    assert persisted.data["facebook_submission_status"] == "SUBMITTED_UNCONFIRMED"
+    assert persisted.data["facebook_publication_state"] == "SUBMITTED_UNCONFIRMED"
+    assert Path(persisted.data["facebook_reconciliation_diagnostic_path"]).is_file()
+    assert any(
+        event.event_type == "reconciliation_exhausted"
+        for event in repo.list_events(job_id)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -669,3 +999,9 @@ def test_duplicate_uncertain_fingerprint_also_blocks(tmp_path: Path) -> None:
     validation = adapter.validate_job(job_id)
     assert not validation.valid
     assert any("Duplicate" in e for e in validation.errors)
+
+
+def test_submitting_state_is_treated_as_possible_submit_for_duplicate_safety() -> None:
+    assert FacebookWebClient._publication_was_submitted(
+        {"facebook_submission_status": "SUBMITTING"}
+    )

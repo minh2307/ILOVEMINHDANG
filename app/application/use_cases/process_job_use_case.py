@@ -13,7 +13,6 @@ class ProcessJobUseCase:
     _MANUAL_BOUNDARIES = frozenset(
         {
             JobStatus.WAITING_FOR_AUTH_REVIEW,
-            JobStatus.FACEBOOK_PUBLISH_UNCERTAIN,
             JobStatus.BLOCKED,
             JobStatus.REJECTED,
             JobStatus.CANCELLED,
@@ -170,7 +169,11 @@ class ProcessJobUseCase:
             if allow_facebook_publish:
                 return await self._stages.facebook(job_id)
             return StageExecutionResult(True, pending_manual_action="Confirm Facebook publish")
-        if status is JobStatus.FACEBOOK_PUBLISHING:
+        if status in {
+            JobStatus.FACEBOOK_PUBLISHING,
+            JobStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+            JobStatus.PUBLISH_RECONCILIATION_REQUIRED,
+        }:
             return await self._stages.reconcile_facebook(job_id)
         if status is JobStatus.FACEBOOK_PUBLISHED:
             return await self._stages.extract_permalink(job_id)

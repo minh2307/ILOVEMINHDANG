@@ -38,12 +38,6 @@ class ResumeJobUseCase:
             return JobResult.success_result(
                 job_id, {"workflow_status": job.status.value, "queued": False}
             )
-        if job.status is JobStatus.FACEBOOK_PUBLISH_UNCERTAIN:
-            return JobResult.failure_result(
-                job_id,
-                "Facebook publication is uncertain and requires reconciliation; "
-                "automatic retry is blocked.",
-            )
         if job.status in self._FAILURES:
             return JobResult.failure_result(
                 job_id,
@@ -69,5 +63,13 @@ class ResumeJobUseCase:
             return JobResult.failure_result(job_id, str(exc))
         return JobResult.success_result(
             job_id,
-            {"workflow_status": job.status.value, "queued": queued},
+            {
+                "workflow_status": job.status.value,
+                "queued": queued,
+                "reconciliation_only": job.status in {
+                    JobStatus.FACEBOOK_PUBLISHING,
+                    JobStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+                    JobStatus.PUBLISH_RECONCILIATION_REQUIRED,
+                },
+            },
         )

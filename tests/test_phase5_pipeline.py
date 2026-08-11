@@ -253,7 +253,7 @@ def test_resume_rejected_job_does_not_continue(tmp_path: Path) -> None:
     assert "rejected" in (result.error or "").lower()
 
 
-def test_resume_uncertain_publication_requires_manual_action(tmp_path: Path) -> None:
+def test_resume_uncertain_publication_routes_to_reconciliation_only(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     repo = make_repo(settings)
     job = repo.create_job("https://fb.com/reel/uncertain")
@@ -271,9 +271,26 @@ def test_resume_uncertain_publication_requires_manual_action(tmp_path: Path) -> 
     ):
         repo.transition(job.job_id, status)
     pipeline = CDHAPipeline(settings, repo)
+    calls: list[str] = []
+
+    async def reconcile(job_id: str) -> PipelineResult:
+        calls.append(job_id)
+        return PipelineResult(
+            success=False,
+            job_id=job_id,
+            current_status=WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN.value,
+            error="reconciliation did not find the post yet",
+        )
+
+    async def forbidden_publish(_job_id: str) -> PipelineResult:
+        raise AssertionError("resume must not publish again")
+
+    pipeline.execute_facebook_reconciliation_stage = reconcile  # type: ignore[method-assign]
+    pipeline.execute_facebook_stage = forbidden_publish  # type: ignore[method-assign]
     result = asyncio.run(pipeline.resume(job_id=job.job_id))
     assert not result.success
-    assert "uncertain" in (result.error or "").lower()
+    assert "reconciliation" in (result.error or "").lower()
+    assert calls == [job.job_id]
 
 
 # ---------------------------------------------------------------------------

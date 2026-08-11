@@ -129,7 +129,7 @@ async def test_resume_schedules_from_persisted_boundary_without_repeating_downlo
 
 
 @pytest.mark.asyncio
-async def test_resume_never_republishes_uncertain_facebook_result(lifecycle):
+async def test_resume_queues_reconciliation_without_republishing_uncertain_result(lifecycle):
     repository, queue, scheduler = lifecycle
     repository.create_job("https://facebook.com/reel/uncertain", job_id="uncertain")
     current = "uncertain"
@@ -156,9 +156,12 @@ async def test_resume_never_republishes_uncertain_facebook_result(lifecycle):
 
     result = await ResumeJobUseCase(repository, scheduler).execute(current)
 
-    assert result.success is False
-    assert "reconcil" in (result.error or "").lower()
-    assert await queue.list_records() == []
+    assert result.success is True
+    assert result.data["reconciliation_only"] is True
+    records = await queue.list_records()
+    assert [record["job_id"] for record in records] == [
+        "uncertain:FACEBOOK_PUBLISH_UNCERTAIN"
+    ]
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,7 @@ from app.application.use_cases.retry_job_use_case import RetryJobUseCase
 from app.domain.enums.job_status import JobStatus
 from app.domain.models.facebook_job import FacebookJob
 from app.domain.models.job_result import JobResult
+from app.errors import FacebookReconciliationPendingError
 
 
 class ProcessQueuedJobUseCase:
@@ -34,6 +35,30 @@ class ProcessQueuedJobUseCase:
         if result.success or self._repository is None or self._retry_job is None:
             return result
         persisted = self._repository.get_job(workflow_job_id)
+        if persisted is not None:
+            submitted = str(
+                persisted.data.get("facebook_publication_state") or ""
+            ) == "SUBMITTED_UNCONFIRMED" or str(
+                persisted.data.get("facebook_submission_status") or ""
+            ) in {"SUBMITTING", "SUBMITTED_UNCONFIRMED", "PUBLICATION_UNCERTAIN"}
+            if submitted and persisted.status in {
+                JobStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+                JobStatus.PUBLISH_RECONCILIATION_REQUIRED,
+            }:
+                raise FacebookReconciliationPendingError(
+                    "Facebook reconciliation is pending; retry lookup without publishing",
+                    job_id=workflow_job_id,
+                    phase=persisted.status.value,
+                    operation="reconcile_publication",
+                    details={
+                        "reconciliation_attempt": persisted.data.get(
+                            "facebook_reconciliation_attempt", 0
+                        ),
+                        "publish_clicked": True,
+                    },
+                )
+            if submitted and persisted.status is JobStatus.FACEBOOK_PUBLISH_FAILED:
+                return result
         if persisted is None or persisted.status is not JobStatus.FACEBOOK_PUBLISH_FAILED:
             return result
         retry = await self._retry_job.execute(

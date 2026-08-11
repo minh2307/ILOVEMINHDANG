@@ -40,7 +40,9 @@ async def test_publish_confirmation_only_accepts_manual_gate(tmp_path):
     repository.initialize()
     queue = SQLiteJobQueue(str(database))
     repository.create_job("https://www.facebook.com/reel/123", job_id="job-2")
-    scheduler = ScheduleWorkflowJobsUseCase(repository, queue)
+    scheduler = ScheduleWorkflowJobsUseCase(
+        repository, queue, max_facebook_reconciliation_attempts=5
+    )
 
     with pytest.raises(ValueError):
         await scheduler.schedule_publish_confirmation("job-2")
@@ -65,6 +67,12 @@ async def test_publish_confirmation_only_accepts_manual_gate(tmp_path):
 
     assert await scheduler.schedule_publish_confirmation("job-2") is True
     assert await scheduler.schedule_publish_confirmation("job-2") is False
+    record = next(
+        item
+        for item in await queue.list_records()
+        if item["job_id"] == "job-2:CONFIRMED_FACEBOOK_PUBLISH"
+    )
+    assert record["max_attempts"] == 6
 
 
 @pytest.mark.asyncio

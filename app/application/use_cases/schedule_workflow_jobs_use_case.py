@@ -28,6 +28,8 @@ class ScheduleWorkflowJobsUseCase:
             JobStatus.APPROVED,
             JobStatus.FACEBOOK_PREPARING,
             JobStatus.FACEBOOK_PUBLISHING,
+            JobStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+            JobStatus.PUBLISH_RECONCILIATION_REQUIRED,
             JobStatus.FACEBOOK_PUBLISHED,
             JobStatus.POST_URL_EXTRACTING,
             JobStatus.POST_URL_EXTRACTED,
@@ -44,6 +46,7 @@ class ScheduleWorkflowJobsUseCase:
         *,
         auto_approve_review: bool = False,
         require_facebook_confirmation: bool = True,
+        max_facebook_reconciliation_attempts: int = 3,
     ) -> None:
         self._repository = repository
         self._queue = queue
@@ -53,6 +56,9 @@ class ScheduleWorkflowJobsUseCase:
         if not require_facebook_confirmation:
             eligible.add(JobStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW)
         self._eligible = frozenset(eligible)
+        self._max_facebook_reconciliation_attempts = max(
+            1, int(max_facebook_reconciliation_attempts)
+        )
 
     async def schedule_once(self, *, limit: int = 100) -> int:
         scheduled = 0
@@ -71,6 +77,24 @@ class ScheduleWorkflowJobsUseCase:
             work_item_id = (
                 f"{work_item_id}:attempt-{max(1, job.attempt_count)}"
             )
+        max_attempts = job.max_attempts
+        if job.status in {
+            JobStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+            JobStatus.PUBLISH_RECONCILIATION_REQUIRED,
+        }:
+            max_attempts = max(
+                max_attempts, self._max_facebook_reconciliation_attempts
+            )
+        elif job.status in {
+            JobStatus.APPROVED,
+            JobStatus.FACEBOOK_PREPARING,
+            JobStatus.FACEBOOK_PUBLISHING,
+        }:
+            # Reserve one queue claim for the publish attempt itself; all
+            # remaining claims are reconciliation-only.
+            max_attempts = max(
+                max_attempts, self._max_facebook_reconciliation_attempts + 1
+            )
         return await self._queue.enqueue(
             FacebookJob(
                 job_id=work_item_id,
@@ -79,7 +103,7 @@ class ScheduleWorkflowJobsUseCase:
                     "workflow_job_id": job.job_id,
                     "scheduled_from_status": job.status.value,
                 },
-                max_attempts=job.max_attempts,
+                max_attempts=max_attempts,
             )
         )
 
@@ -100,6 +124,9 @@ class ScheduleWorkflowJobsUseCase:
                     "workflow_job_id": job.job_id,
                     "confirm_facebook_publish": True,
                 },
-                max_attempts=job.max_attempts,
+                max_attempts=max(
+                    job.max_attempts,
+                    self._max_facebook_reconciliation_attempts + 1,
+                ),
             )
         )

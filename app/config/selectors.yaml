@@ -294,6 +294,7 @@ facebook:
     - css: 'div[role="dialog"] input[type="file"]'
   uploaded_preview:
     - css: 'div[role="dialog"] img[src^="blob:"]'
+    - css: 'div[role="dialog"] video'
     - css: 'div[role="dialog"] [data-visualcompletion="media-vc-image"] img'
     - css: 'div[role="dialog"] img[alt]'
   upload_progress:
@@ -304,25 +305,18 @@ facebook:
     - css: 'div[role="dialog"] [role="alert"]'
     - text: Couldn't upload
     - text: Không thể tải lên
-  publish_button:
-    - role: button
-      name: Đăng
-      exact: true
-    - role: button
-      name: Post
-      exact: true
+  next_button:
     - role: button
       name: Tiếp
       exact: true
     - role: button
       name: Next
       exact: true
-    - css: 'div[role="dialog"] div[role="button"]:has-text("Đăng")'
-    - css: 'div[role="dialog"] div[role="button"]:has-text("Post")'
-    - css: 'div[role="dialog"] div[role="button"]:has-text("Tiếp")'
-    - css: 'div[role="dialog"] div[role="button"]:has-text("Next")'
-    - css: 'div[role="dialog"] [data-testid="react-composer-post-button"]'
-    - css: 'div[role="dialog"] [data-testid="comet-post-button"]'
+  publish_now_indicator:
+    - text: Đăng ngay
+      exact: true
+    - text: Publish now
+      exact: true
   post_button:
     - role: button
       name: Đăng
@@ -330,6 +324,55 @@ facebook:
     - role: button
       name: Post
       exact: true
+  post_publish_upsell_dialog:
+    - css: 'div[role="dialog"]:has-text("Trò chuyện trực tiếp với mọi người")'
+    - css: 'div[role="dialog"]:has-text("Chat live with everyone")'
+  post_publish_upsell_dismiss:
+    - role: button
+      name: Lúc khác
+      exact: true
+    - role: button
+      name: Not now
+      exact: true
+  post_publish_interstitial_dialog:
+    - css: 'div[role="dialog"]:has-text("Trò chuyện trực tiếp với mọi người")'
+    - css: 'div[role="dialog"]:has-text("Chat live with everyone")'
+  post_publish_interstitial_dismiss:
+    - role: button
+      name: Lúc khác
+      exact: true
+    - role: button
+      name: Để sau
+      exact: true
+    - role: button
+      name: Không phải bây giờ
+      exact: true
+    - role: button
+      name: Đóng
+      exact: true
+    - role: button
+      name: Not now
+      exact: true
+    - role: button
+      name: Later
+      exact: true
+    - role: button
+      name: Close
+      exact: true
+  posting_indicator:
+    - text: Đang đăng
+      exact: true
+    - text: Posting
+      exact: true
+  publish_result_permalink:
+    - role: link
+      name: Xem bài viết
+      exact: true
+    - role: link
+      name: View post
+      exact: true
+    - css: 'div[role="dialog"] a[href*="/posts/"]'
+    - css: 'div[role="dialog"] a[href*="story_fbid="]'
   publish_success:
     - text: Bài viết của bạn đã được đăng
     - text: Your post has been published
@@ -356,6 +399,7 @@ facebook:
     - css: 'a[href*="/groups/"][href*="/posts/"]'
     - css: 'a[href*="photo.php?fbid="]'
     - css: 'a[href*="/reel/"]'
+    - css: 'a[href*="pfbid"]'
   post_image:
     - css: 'img[src]'
   comment_input:

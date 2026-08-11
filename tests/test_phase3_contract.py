@@ -247,9 +247,7 @@ def test_login_setup_only_navigates_and_verifies(tmp_path: Path) -> None:
     chrome = SetupChrome()
 
     result = asyncio.run(
-        _run_login_setup(
-            settings, chrome, AuthenticatedClient(), AuthenticatedClient()
-        )
+        _run_login_setup(settings, chrome, AuthenticatedClient())
     )
 
     assert result == 0

@@ -3,6 +3,9 @@ from __future__ import annotations
 from typing import Any
 
 from app.browser.facebook_job import FacebookJob, FacebookJobType
+from app.infrastructure.facebook.reel_engagement_service import (
+    FacebookReelEngagementService,
+)
 from app.infrastructure.legacy.facebook_integrations import selectors
 from app.infrastructure.legacy.facebook_integrations.comment_service import FacebookCommentService
 from app.infrastructure.legacy.facebook_integrations.group_service import FacebookGroupService
@@ -13,6 +16,7 @@ from app.infrastructure.legacy.facebook_integrations.reel_service import Faceboo
 class FacebookAutomationClient:
     def __init__(self) -> None:
         self.reels = FacebookReelService()
+        self.reel_engagement = FacebookReelEngagementService()
         self.posts = FacebookPostService()
         self.comments = FacebookCommentService()
         self.groups = FacebookGroupService()
@@ -26,6 +30,14 @@ class FacebookAutomationClient:
             return await self.reels.extract_metadata(page, str(payload["url"]))
         if job.job_type is FacebookJobType.EXTRACT_COMMENTS:
             return await self.reels.extract_comments(page, str(payload["url"]), int(payload.get("limit", 100)))
+        if job.job_type is FacebookJobType.ENGAGE_REEL:
+            return await self.reel_engagement.like_reel_and_comments(
+                page,
+                str(payload["reel_url"]),
+                like_reel=bool(payload.get("like_reel", True)),
+                like_comments=bool(payload.get("like_comments", True)),
+                like_replies=bool(payload.get("like_replies", False)),
+            )
         if job.job_type is FacebookJobType.CREATE_POST:
             return await self.posts.create(page, str(payload["target_url"]), str(payload["text"]), list(payload.get("image_paths") or []))
         if job.job_type is FacebookJobType.SHARE_POST:

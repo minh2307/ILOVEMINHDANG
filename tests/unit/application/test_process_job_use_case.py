@@ -60,6 +60,10 @@ class FakeStages:
 
     async def reconcile_facebook(self, job_id: str) -> StageExecutionResult:
         self.calls.append("facebook_reconcile")
+        if self.repository.get_job(job_id).status is JobStatus.FACEBOOK_PUBLISH_UNCERTAIN:
+            self.repository.transition(
+                job_id, JobStatus.PUBLISH_RECONCILIATION_REQUIRED
+            )
         self.repository.transition(job_id, JobStatus.FACEBOOK_PUBLISHED)
         return StageExecutionResult(True)
 
@@ -153,6 +157,36 @@ async def test_interrupted_stage_is_recorded_then_retried(repository):
     ]
     assert len(recovery_events) == 1
     assert recovery_events[0].details["reason"] == "interrupted_stage_recovery"
+
+
+@pytest.mark.asyncio
+async def test_submitted_unconfirmed_resumes_with_reconciliation_not_publish(repository):
+    repository.create_job("https://www.facebook.com/reel/late", job_id="job-late")
+    for status in (
+        JobStatus.DOWNLOADREEL_RUNNING, JobStatus.DOWNLOADED,
+        JobStatus.AI_ANALYZING, JobStatus.CLINICAL_FACTORS_GENERATED,
+        JobStatus.CDHA_OPENING, JobStatus.CDHA_UPLOADING,
+        JobStatus.CDHA_ANALYZING, JobStatus.CDHA_ANALYZED,
+        JobStatus.SCREENSHOTS_CAPTURING, JobStatus.SCREENSHOTS_CAPTURED,
+        JobStatus.WAITING_FOR_REVIEW, JobStatus.APPROVED,
+        JobStatus.FACEBOOK_PREPARING,
+        JobStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW,
+        JobStatus.FACEBOOK_PUBLISHING,
+        JobStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+    ):
+        repository.transition("job-late", status)
+    repository.update_data("job-late", {
+        "facebook_submission_status": "SUBMITTED_UNCONFIRMED",
+        "facebook_publication_state": "SUBMITTED_UNCONFIRMED",
+    })
+    stages = FakeStages(repository)
+
+    result = await ProcessJobUseCase(repository, stages).execute("job-late")
+
+    assert result.success is True
+    assert repository.get_job("job-late").status is JobStatus.COMPLETED
+    assert stages.calls == ["facebook_reconcile", "permalink", "comment"]
+    assert "facebook_publish" not in stages.calls
 
 
 @pytest.mark.asyncio

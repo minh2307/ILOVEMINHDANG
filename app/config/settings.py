@@ -82,8 +82,12 @@ class Settings:
     facebook_final_confirmation: bool
     facebook_comment_enabled: bool
     facebook_publish_timeout_seconds: int
+    facebook_publish_settle_timeout_seconds: float
+    facebook_publish_poll_interval_seconds: float
     facebook_upload_timeout_seconds: int
     facebook_post_discovery_timeout_seconds: int
+    facebook_reconciliation_reload_initial_seconds: float
+    facebook_reconciliation_reload_max_seconds: float
     facebook_max_image_count: int
     facebook_max_image_size_mb: int
     facebook_allowed_image_extensions: tuple[str, ...]
@@ -119,6 +123,7 @@ class Settings:
     max_gemini_retries: int
     max_cdha_retries: int
     max_facebook_prepare_retries: int
+    max_facebook_reconciliation_retries: int
     max_permalink_retries: int
     max_comment_retries: int
     retry_initial_delay_seconds: float
@@ -216,9 +221,21 @@ class Settings:
             facebook_final_confirmation=_bool_env("FACEBOOK_FINAL_CONFIRMATION", True),
             facebook_comment_enabled=_bool_env("FACEBOOK_COMMENT_ENABLED", True),
             facebook_publish_timeout_seconds=_int_env("FACEBOOK_PUBLISH_TIMEOUT_SECONDS", 180),
+            facebook_publish_settle_timeout_seconds=_float_env(
+                "FACEBOOK_PUBLISH_SETTLE_TIMEOUT_SECONDS", 30, 0.1
+            ),
+            facebook_publish_poll_interval_seconds=_float_env(
+                "FACEBOOK_PUBLISH_POLL_INTERVAL_SECONDS", 0.5, 0.001
+            ),
             facebook_upload_timeout_seconds=_int_env("FACEBOOK_UPLOAD_TIMEOUT_SECONDS", 180),
             facebook_post_discovery_timeout_seconds=_int_env(
                 "FACEBOOK_POST_DISCOVERY_TIMEOUT_SECONDS", 120
+            ),
+            facebook_reconciliation_reload_initial_seconds=_float_env(
+                "FACEBOOK_RECONCILIATION_RELOAD_INITIAL_SECONDS", 2, 0.01
+            ),
+            facebook_reconciliation_reload_max_seconds=_float_env(
+                "FACEBOOK_RECONCILIATION_RELOAD_MAX_SECONDS", 15, 0.01
             ),
             facebook_max_image_count=_int_env("FACEBOOK_MAX_IMAGE_COUNT", 10),
             facebook_max_image_size_mb=_int_env("FACEBOOK_MAX_IMAGE_SIZE_MB", 20),
@@ -284,6 +301,9 @@ class Settings:
             max_gemini_retries=_int_env("MAX_GEMINI_RETRIES", 2),
             max_cdha_retries=_int_env("MAX_CDHA_RETRIES", 2),
             max_facebook_prepare_retries=_int_env("MAX_FACEBOOK_PREPARE_RETRIES", 2),
+            max_facebook_reconciliation_retries=_int_env(
+                "MAX_FACEBOOK_RECONCILIATION_RETRIES", 3, 1
+            ),
             max_permalink_retries=_int_env("MAX_PERMALINK_RETRIES", 3),
             max_comment_retries=_int_env("MAX_COMMENT_RETRIES", 2),
             retry_initial_delay_seconds=_float_env("RETRY_INITIAL_DELAY_SECONDS", 0.5, 0.0),
@@ -520,6 +540,13 @@ class Settings:
                 "cdha_upload_seconds": self.cdha_upload_timeout_seconds,
                 "cdha_analysis_seconds": self.cdha_analysis_timeout_seconds,
                 "cdha_result_seconds": self.cdha_result_timeout_seconds,
+                "facebook_publish_seconds": self.facebook_publish_timeout_seconds,
+                "facebook_publish_settle_seconds": self.facebook_publish_settle_timeout_seconds,
+                "facebook_publish_poll_seconds": self.facebook_publish_poll_interval_seconds,
+                "facebook_post_discovery_seconds": self.facebook_post_discovery_timeout_seconds,
+                "facebook_reconciliation_reload_initial_seconds": self.facebook_reconciliation_reload_initial_seconds,
+                "facebook_reconciliation_reload_max_seconds": self.facebook_reconciliation_reload_max_seconds,
+                "facebook_reconciliation_max_attempts": self.max_facebook_reconciliation_retries,
                 "queue_lease_seconds": self.job_lease_seconds,
                 "worker_heartbeat_seconds": self.job_heartbeat_seconds,
                 "worker_stage_seconds": self.worker_stage_timeout_seconds,

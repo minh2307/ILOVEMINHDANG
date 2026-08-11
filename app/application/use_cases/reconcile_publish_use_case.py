@@ -18,6 +18,7 @@ class ReconcilePublishUseCase:
     """
 
     _ALLOWED_STATUSES = {
+        WorkflowStatus.FACEBOOK_PUBLISHING,
         WorkflowStatus.PUBLISH_RECONCILIATION_REQUIRED,
         WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN,
     }
@@ -43,12 +44,15 @@ class ReconcilePublishUseCase:
                 f"Current status: {job.status.value}"
             )
 
-        if job.status is WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN:
+        if job.status is not WorkflowStatus.PUBLISH_RECONCILIATION_REQUIRED:
             self.repository.transition(
                 job_id,
                 WorkflowStatus.PUBLISH_RECONCILIATION_REQUIRED,
                 event_type="FACEBOOK_PUBLICATION_RECONCILIATION_STARTED",
-                details={"publish_clicked": False},
+                details={
+                    "publish_clicked": False,
+                    "recovery_from_status": job.status.value,
+                },
             )
 
         try:

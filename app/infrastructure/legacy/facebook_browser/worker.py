@@ -14,6 +14,9 @@ from app.browser.facebook_job import FacebookJob, FacebookJobStatus, FacebookJob
 from app.browser.facebook_page_state import FacebookPageState, FacebookStateDetector
 from app.config.facebook_browser import FacebookBrowserConfig
 from app.infrastructure.browser.file_browser_lock import FileBrowserLock
+from app.infrastructure.facebook.reel_engagement_service import (
+    FacebookReelEngagementService,
+)
 
 
 JobHandler = Callable[[FacebookJob, Any], Awaitable[Any]]
@@ -22,13 +25,21 @@ JobHandler = Callable[[FacebookJob, Any], Awaitable[Any]]
 class FacebookBrowserWorker:
     """The sole serialized execution boundary for Facebook UI automation."""
 
-    def __init__(self, manager: FacebookBrowserManager | None = None, store: FacebookJobStore | None = None, *, config: FacebookBrowserConfig | None = None, logger: logging.Logger | None = None):
+    def __init__(
+        self,
+        manager: FacebookBrowserManager | None = None,
+        store: FacebookJobStore | None = None,
+        *,
+        config: FacebookBrowserConfig | None = None,
+        logger: logging.Logger | None = None,
+        engagement_service: FacebookReelEngagementService | None = None,
+    ):
         self.config = config or FacebookBrowserConfig.load()
-        self.manager = manager or FacebookBrowserManager(config=self.config)
         self.store = store or FacebookJobStore(self.config.queue_database_path)
         self.logger = logger or logging.getLogger("cdha_pipeline.facebook_worker")
         self._browser_lock = asyncio.Lock()
-        self._file_lock = FileBrowserLock(
+        manager_lock = getattr(manager, "browser_lock", None)
+        self._file_lock = manager_lock or FileBrowserLock(
             str(self.config.lock_path),
             process_name="cdha-facebook-browser-worker",
             browser_profile=str(self.config.profile_path),
@@ -36,9 +47,18 @@ class FacebookBrowserWorker:
             timeout_seconds=self.config.lock_timeout_seconds,
             heartbeat_seconds=self.config.lock_heartbeat_seconds,
         )
+        self.manager = manager or FacebookBrowserManager(
+            config=self.config, browser_lock=self._file_lock
+        )
         self._state_detector = FacebookStateDetector()
+        self._engagement_service = engagement_service or FacebookReelEngagementService(
+            logger=self.logger
+        )
         self._queue: asyncio.Queue[FacebookJob] = asyncio.Queue()
-        self._handlers: dict[FacebookJobType, JobHandler] = {FacebookJobType.CHECK_LOGIN: self._check_login}
+        self._handlers: dict[FacebookJobType, JobHandler] = {
+            FacebookJobType.CHECK_LOGIN: self._check_login,
+            FacebookJobType.ENGAGE_REEL: self._engage_reel,
+        }
         self._stopping = False
 
     def register_handler(self, job_type: FacebookJobType, handler: JobHandler) -> None:
@@ -49,6 +69,31 @@ class FacebookBrowserWorker:
         if persisted.job_id == job.job_id:
             await self._queue.put(persisted)
         return persisted
+
+    async def like_reel_and_comments(
+        self,
+        reel_url: str,
+        like_reel: bool = True,
+        like_comments: bool = True,
+        like_replies: bool = False,
+    ) -> dict[str, Any]:
+        """Run Reel engagement through this worker's serialized CDP session."""
+        job = FacebookJob(
+            FacebookJobType.ENGAGE_REEL,
+            {
+                "reel_url": reel_url,
+                "like_reel": bool(like_reel),
+                "like_comments": bool(like_comments),
+                "like_replies": bool(like_replies),
+            },
+        )
+        persisted = await asyncio.to_thread(self.store.create, job)
+        completed = await self.execute(persisted)
+        if completed.status is not FacebookJobStatus.SUCCESS:
+            raise RuntimeError(
+                completed.error_message or "Facebook Reel engagement failed"
+            )
+        return dict(completed.result or {})
 
     async def execute(self, job: FacebookJob) -> FacebookJob:
         started = time.monotonic()
@@ -159,6 +204,16 @@ class FacebookBrowserWorker:
             "url": detection.url,
         }
 
+    async def _engage_reel(self, job: FacebookJob, page: Any) -> dict[str, Any]:
+        payload = job.payload
+        return await self._engagement_service.like_reel_and_comments(
+            page,
+            str(payload["reel_url"]),
+            like_reel=bool(payload.get("like_reel", True)),
+            like_comments=bool(payload.get("like_comments", True)),
+            like_replies=bool(payload.get("like_replies", False)),
+        )
+
     async def _diagnose(self, job: FacebookJob, page: Any, stack: str) -> None:
         output = self.config.diagnostics_path / job.job_id
         output.mkdir(parents=True, exist_ok=True)
@@ -180,7 +235,12 @@ class FacebookBrowserWorker:
 
     @staticmethod
     def _tab_name(job_type: FacebookJobType) -> str:
-        if job_type in {FacebookJobType.DOWNLOAD_REEL, FacebookJobType.EXTRACT_REEL_METADATA, FacebookJobType.EXTRACT_COMMENTS}:
+        if job_type in {
+            FacebookJobType.DOWNLOAD_REEL,
+            FacebookJobType.EXTRACT_REEL_METADATA,
+            FacebookJobType.EXTRACT_COMMENTS,
+            FacebookJobType.ENGAGE_REEL,
+        }:
             return "facebook_reel"
         if job_type is FacebookJobType.JOIN_GROUP:
             return "facebook_group"

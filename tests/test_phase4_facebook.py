@@ -268,11 +268,31 @@ def test_selector_configuration_has_exact_publish_and_no_broad_button_fallback(t
     settings = make_settings(tmp_path)
     from app.browser.selector_resolver import SelectorResolver
     resolver = SelectorResolver(settings.selectors_path)
-    publish = resolver.candidates("facebook.publish_button")
-    assert any(item.get("name") == "Đăng" and item.get("exact") for item in publish if isinstance(item, dict))
-    rendered = json.dumps(publish, ensure_ascii=False).casefold()
+    next_button = resolver.candidates("facebook.next_button")
+    post_button = resolver.candidates("facebook.post_button")
+    publish_now = resolver.candidates("facebook.publish_now_indicator")
+    assert any(item.get("name") == "Tiếp" and item.get("exact") for item in next_button if isinstance(item, dict))
+    assert any(item.get("name") == "Đăng" and item.get("exact") for item in post_button if isinstance(item, dict))
+    assert not any(item.get("name") in {"Đăng", "Post"} for item in next_button if isinstance(item, dict))
+    assert any(item.get("text") == "Đăng ngay" and item.get("exact") for item in publish_now if isinstance(item, dict))
+    assert not any(item.get("role") == "button" for item in publish_now if isinstance(item, dict))
+    rendered = json.dumps(next_button, ensure_ascii=False).casefold()
+    rendered_now = json.dumps(publish_now, ensure_ascii=False).casefold()
     assert "first enabled" not in rendered
     assert "not(@aria-disabled" not in rendered
+    assert ":has-text" not in rendered
+    assert "lên lịch đăng sau" not in rendered
+    assert "schedule for later" not in rendered
+    assert "lên lịch đăng sau" not in rendered_now
+    assert "schedule for later" not in rendered_now
+    for forbidden_key in (
+        "facebook.publish_now_button",
+        "facebook.schedule_dialog",
+        "facebook.schedule_heading",
+        "facebook.schedule_back_button",
+    ):
+        with pytest.raises(KeyError):
+            resolver.candidates(forbidden_key)
 
 
 def test_publication_requires_strong_plus_supporting_signal() -> None:
@@ -358,11 +378,15 @@ class FakeLocator:
 
 class FakeResolver:
     def __init__(self) -> None:
+        self.scopes: dict[str, list[Any]] = {}
         self.items = {key: FakeLocator() for key in (
             "facebook.create_post_entry", "facebook.composer_dialog",
-            "facebook.composer_textbox", "facebook.file_input", "facebook.publish_button"
+            "facebook.composer_textbox", "facebook.file_input",
+            "facebook.next_button", "facebook.publish_now_indicator",
+            "facebook.post_button",
         )}
     async def find_first(self, page: Any, key: str, **_: Any) -> FakeLocator:
+        self.scopes.setdefault(key, []).append(page)
         return self.items[key]
     async def exists(self, page: Any, key: str, **_: Any) -> bool:
         if key in {"facebook.login_indicators", "facebook.checkpoint_indicators", "facebook.target_access_denied", "facebook.upload_error"}:
@@ -421,7 +445,7 @@ def test_final_manual_gate_cancel_does_not_click_and_publish_approval_does(tmp_p
     image = make_png(tmp_path / "one.png")
     asyncio.run(client.prepare_post(target_url=settings.facebook_target_url, post_text=valid_post_text(settings, repo, job_id), image_paths=[image], job_id=job_id))
     cancelled = asyncio.run(client.publish_prepared_post(job_id=job_id))
-    assert not cancelled.success and resolver.items["facebook.publish_button"].clicked == 0
+    assert not cancelled.success and resolver.items["facebook.next_button"].clicked == 0
     assert repo.get_job(job_id).status is WorkflowStatus.APPROVED
 
     job2 = approved_job(repo, job_id="approved2")
@@ -430,7 +454,7 @@ def test_final_manual_gate_cancel_does_not_click_and_publish_approval_does(tmp_p
     published = asyncio.run(client2.publish_prepared_post(job_id=job2))
     if not published.success:
         print("PUBLISHED ERROR:", published.error)
-    assert published.success and resolver2.items["facebook.publish_button"].clicked == 1
+    assert published.success and resolver2.items["facebook.next_button"].clicked == 1
     assert repo.get_job(job2).status is WorkflowStatus.FACEBOOK_PUBLISHED
 
 
@@ -461,8 +485,130 @@ def test_disabled_final_confirmation_publishes_without_prompt(tmp_path: Path) ->
     published = asyncio.run(client.publish_prepared_post(job_id=job_id))
 
     assert published.success is True
-    assert resolver.items["facebook.publish_button"].clicked == 1
+    assert resolver.items["facebook.next_button"].clicked == 1
     assert repo.get_job(job_id).status is WorkflowStatus.FACEBOOK_PUBLISHED
+
+
+def test_page_publish_flow_confirms_publish_now_without_opening_schedule(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, facebook_final_confirmation=False)
+    repo = make_repo(settings)
+    job_id = approved_job(repo, job_id="publish-now-not-schedule")
+    resolver = FakeResolver()
+    client = PublishClient(settings, repo, FakeChrome(), resolver=resolver)
+    image = make_png(tmp_path / "publish-now.png")
+
+    asyncio.run(client.prepare_post(
+        target_url=settings.facebook_target_url,
+        post_text=valid_post_text(settings, repo, job_id),
+        image_paths=[image],
+        job_id=job_id,
+    ))
+    result = asyncio.run(client.publish_prepared_post(job_id=job_id))
+
+    assert result.success is True
+    assert resolver.items["facebook.next_button"].clicked == 1
+    assert resolver.items["facebook.publish_now_indicator"].clicked == 0
+    assert resolver.items["facebook.post_button"].clicked == 1
+    composer = resolver.items["facebook.composer_dialog"]
+    assert resolver.scopes["facebook.next_button"][-1] is composer
+    assert resolver.scopes["facebook.publish_now_indicator"][-1] is composer
+    assert resolver.scopes["facebook.post_button"][-1] is composer
+
+
+def test_page_publish_flow_never_clicks_schedule_controls(tmp_path: Path) -> None:
+    class PersistentScheduleDialog(FakeLocator):
+        async def wait_for(self, **_: Any) -> None:
+            raise TimeoutError("Facebook reuses the same dialog node after going back")
+
+    class RememberedScheduleResolver(FakeResolver):
+        def __init__(self) -> None:
+            super().__init__()
+            self.items["facebook.schedule_heading"] = FakeLocator()
+            self.items["facebook.schedule_dialog"] = PersistentScheduleDialog()
+            self.items["facebook.schedule_back_button"] = FakeLocator()
+
+    settings = make_settings(tmp_path, facebook_final_confirmation=False)
+    repo = make_repo(settings)
+    job_id = approved_job(repo, job_id="remembered-schedule")
+    resolver = RememberedScheduleResolver()
+    client = PublishClient(settings, repo, FakeChrome(), resolver=resolver)
+    image = make_png(tmp_path / "remembered-schedule.png")
+
+    asyncio.run(client.prepare_post(
+        target_url=settings.facebook_target_url,
+        post_text=valid_post_text(settings, repo, job_id),
+        image_paths=[image],
+        job_id=job_id,
+    ))
+    result = asyncio.run(client.publish_prepared_post(job_id=job_id))
+
+    assert result.success is True
+    assert resolver.items["facebook.schedule_back_button"].clicked == 0
+    assert resolver.items["facebook.publish_now_indicator"].clicked == 0
+    assert "facebook.schedule_heading" not in resolver.scopes
+    assert "facebook.schedule_back_button" not in resolver.scopes
+
+
+def test_page_publish_flow_aborts_before_post_when_publish_now_is_not_visible(tmp_path: Path) -> None:
+    class MissingPublishNowResolver(FakeResolver):
+        async def find_first(self, page: Any, key: str, **kwargs: Any) -> FakeLocator:
+            if key == "facebook.publish_now_indicator":
+                self.scopes.setdefault(key, []).append(page)
+                raise KeyError(key)
+            return await super().find_first(page, key, **kwargs)
+
+    settings = make_settings(tmp_path, facebook_final_confirmation=False)
+    repo = make_repo(settings)
+    job_id = approved_job(repo, job_id="publish-now-not-visible")
+    resolver = MissingPublishNowResolver()
+    client = PublishClient(settings, repo, FakeChrome(), resolver=resolver)
+    image = make_png(tmp_path / "publish-now-not-visible.png")
+
+    asyncio.run(client.prepare_post(
+        target_url=settings.facebook_target_url,
+        post_text=valid_post_text(settings, repo, job_id),
+        image_paths=[image],
+        job_id=job_id,
+    ))
+    result = asyncio.run(client.publish_prepared_post(job_id=job_id))
+
+    assert result.success is False
+    assert result.status == "PUBLISH_ACTION_FAILED"
+    assert resolver.items["facebook.post_button"].clicked == 0
+    assert repo.get_job(job_id).status is WorkflowStatus.FACEBOOK_PUBLISH_FAILED
+
+
+def test_page_publish_flow_dismisses_post_publish_upsell_before_verification(tmp_path: Path) -> None:
+    class PostPublishUpsellResolver(FakeResolver):
+        def __init__(self) -> None:
+            super().__init__()
+            self.items["facebook.post_publish_upsell_dialog"] = FakeLocator()
+            self.items["facebook.post_publish_upsell_dismiss"] = FakeLocator()
+
+        async def exists(self, page: Any, key: str, **kwargs: Any) -> bool:
+            if key == "facebook.post_publish_upsell_dialog":
+                return True
+            return await super().exists(page, key, **kwargs)
+
+    settings = make_settings(tmp_path, facebook_final_confirmation=False)
+    repo = make_repo(settings)
+    job_id = approved_job(repo, job_id="post-publish-upsell")
+    resolver = PostPublishUpsellResolver()
+    client = PublishClient(settings, repo, FakeChrome(), resolver=resolver)
+    image = make_png(tmp_path / "post-publish-upsell.png")
+
+    asyncio.run(client.prepare_post(
+        target_url=settings.facebook_target_url,
+        post_text=valid_post_text(settings, repo, job_id),
+        image_paths=[image],
+        job_id=job_id,
+    ))
+    result = asyncio.run(client.publish_prepared_post(job_id=job_id))
+
+    assert result.success is True
+    assert resolver.items["facebook.post_publish_upsell_dismiss"].clicked == 1
+    upsell = resolver.items["facebook.post_publish_upsell_dialog"]
+    assert resolver.scopes["facebook.post_publish_upsell_dismiss"][-1] is upsell
 
 
 def test_final_publish_guard_rejects_persisted_label_only_sections(tmp_path: Path) -> None:
@@ -497,7 +643,7 @@ def test_final_publish_guard_rejects_persisted_label_only_sections(tmp_path: Pat
     with pytest.raises(PostContentValidationError):
         asyncio.run(client.publish_prepared_post(job_id=job_id))
 
-    assert resolver.items["facebook.publish_button"].clicked == 0
+    assert resolver.items["facebook.next_button"].clicked == 0
     assert repo.get_job(job_id).status is WorkflowStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW
 
 
@@ -521,7 +667,7 @@ def test_crash_after_publish_reconciles_without_second_click(tmp_path: Path) -> 
     result = asyncio.run(client.reconcile_interrupted_publication(job_id=job_id))
 
     assert result.success
-    assert resolver.items["facebook.publish_button"].clicked == 0
+    assert resolver.items["facebook.next_button"].clicked == 0
     persisted = repo.get_job(job_id)
     assert persisted.status is WorkflowStatus.FACEBOOK_PUBLISHED
     assert persisted.data["facebook_post_url"].endswith("/posts/new")
@@ -741,6 +887,9 @@ class LazyPage:
     def get_by_role(self, *_args: Any, **_kwargs: Any) -> EmptyLocator:
         return EmptyLocator()
 
+    def get_by_text(self, *_args: Any, **_kwargs: Any) -> EmptyLocator:
+        return EmptyLocator()
+
     def locator(self, _selector: str) -> EmptyLocator:
         return EmptyLocator()
 
@@ -766,7 +915,83 @@ def test_page_layout_discovery_scrolls_lazy_page_timeline(tmp_path: Path) -> Non
     assert page.waits == [1_000]
 
 
-def test_page_layout_url_tokens_keep_url_punctuation_for_dom_matching(tmp_path: Path) -> None:
+class NonmatchingPcbLocator:
+    async def count(self) -> int:
+        return 1
+
+    def nth(self, _index: int) -> "NonmatchingPcbLocator":
+        return self
+
+    async def get_attribute(self, _name: str) -> str:
+        return "https://www.facebook.com/photo/?fbid=1&set=pcb.999"
+
+    async def evaluate(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+class LoadedNonmatchingPage(LazyPage):
+    def locator(self, selector: str) -> EmptyLocator | NonmatchingPcbLocator:
+        if selector == 'a[href*="set=pcb."]':
+            return NonmatchingPcbLocator()
+        return EmptyLocator()
+
+
+def test_page_layout_scrolls_when_loaded_posts_do_not_match(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path); repo = make_repo(settings)
+    client = FacebookWebClient(settings, repo, object())
+    page = LoadedNonmatchingPage()
+
+    found = asyncio.run(client._find_page_layout_post(
+        page,
+        "Nguồn video: https://www.facebook.com/reel/1\n"
+        "Nguồn phân tích: https://cdha.ai/dash?view=1",
+        2,
+        set(),
+    ))
+
+    assert found is None
+    assert page.mouse.wheels == [(0, 700)]
+
+
+class SpanSeeMoreLocator:
+    def __init__(self) -> None:
+        self.evaluated = 0
+
+    async def count(self) -> int:
+        return 13
+
+    def nth(self, _index: int) -> "SpanSeeMoreLocator":
+        return self
+
+    async def is_visible(self) -> bool:
+        return True
+
+    async def evaluate(self, _script: str) -> None:
+        self.evaluated += 1
+
+
+class SpanSeeMorePage:
+    def __init__(self) -> None:
+        self.more = SpanSeeMoreLocator()
+
+    def get_by_role(self, *_args: Any, **_kwargs: Any) -> EmptyLocator:
+        return EmptyLocator()
+
+    def get_by_text(self, label: str, **_kwargs: Any) -> SpanSeeMoreLocator | EmptyLocator:
+        return self.more if label == "Xem thêm" else EmptyLocator()
+
+
+def test_page_layout_expands_span_see_more_when_it_is_not_a_button(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path); repo = make_repo(settings)
+    client = FacebookWebClient(settings, repo, object())
+    page = SpanSeeMorePage()
+
+    asyncio.run(client._expand_collapsed_posts(page))
+
+    assert page.more.evaluated == 13
+
+
+def test_page_layout_uses_stable_url_ids_when_facebook_truncates_links(tmp_path: Path) -> None:
     settings = make_settings(tmp_path); repo = make_repo(settings)
     client = FacebookWebClient(settings, repo, object())
 
@@ -776,8 +1001,8 @@ def test_page_layout_url_tokens_keep_url_punctuation_for_dom_matching(tmp_path: 
     )
 
     assert tokens == [
-        "https://www.facebook.com/reel/1484932350100572",
-        "https://cdha.ai/dash?view=44088",
+        "1484932350100572",
+        "44088",
     ]
 
 
@@ -833,7 +1058,7 @@ def test_exception_after_publish_click_is_uncertain_not_failed(tmp_path: Path) -
     ))
     result = asyncio.run(client.publish_prepared_post(job_id=job_id))
     assert not result.success
-    assert resolver.items["facebook.publish_button"].clicked == 1
+    assert resolver.items["facebook.next_button"].clicked == 1
     assert repo.get_job(job_id).status is WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN
 
 
@@ -940,7 +1165,7 @@ def test_manual_gate_edit_saves_exact_text_and_never_clicks(tmp_path: Path) -> N
         image_paths=[image], job_id=job_id,
     ))
     result = asyncio.run(client.publish_prepared_post(job_id=job_id))
-    assert not result.success and resolver.items["facebook.publish_button"].clicked == 0
+    assert not result.success and resolver.items["facebook.next_button"].clicked == 0
     job = repo.get_job(job_id)
     assert job.status is WorkflowStatus.APPROVED
     assert Path(job.data["facebook_post_text_path"]).read_text(encoding="utf-8") == edited_text

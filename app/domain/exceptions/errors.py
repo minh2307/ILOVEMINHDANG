@@ -165,6 +165,13 @@ class FacebookPublicationUncertainError(FacebookPublicationError):
     error_code = "FACEBOOK_PUBLICATION_UNCERTAIN"
 
 
+class FacebookReconciliationPendingError(PipelineError):
+    """A submitted Facebook post still needs read-only reconciliation."""
+
+    error_code = "FACEBOOK_RECONCILIATION_PENDING"
+    retryable = True
+
+
 class FacebookVerificationError(FacebookPublicationError):
     error_code = "FACEBOOK_VERIFICATION_ERROR"
 

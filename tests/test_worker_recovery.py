@@ -9,6 +9,7 @@ from app.domain.enums.facebook_job_type import FacebookJobType
 from app.domain.models.facebook_job import FacebookJob
 from app.domain.models.job_result import JobResult
 from app.infrastructure.persistence.sqlite_job_queue import SQLiteJobQueue
+from app.errors import FacebookReconciliationPendingError
 from workers.facebook_browser_worker import FacebookBrowserWorker
 
 
@@ -58,6 +59,14 @@ class CrashedBrowserDispatcher:
 class FailedResultDispatcher:
     async def dispatch(self, job):
         return JobResult.failure_result(job.job_id, "composer could not be opened")
+
+
+class ReconciliationPendingDispatcher:
+    async def dispatch(self, job):
+        raise FacebookReconciliationPendingError(
+            "Facebook reconciliation is pending; do not publish again",
+            job_id=job.job_id,
+        )
 
 
 @pytest.mark.asyncio
@@ -200,3 +209,32 @@ async def test_browser_crash_retries_with_limit_and_releases_lock(tmp_path):
     assert record["status"] == "RETRYABLE"
     assert record["attempt_count"] == 1
     assert lock.released == 1
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_pending_uses_queue_backoff_and_releases_lock(tmp_path):
+    queue = SQLiteJobQueue(str(tmp_path / "queue.db"))
+    job = FacebookJob(
+        "submitted-workflow",
+        FacebookJobType.PROCESS_WORKFLOW,
+        {"workflow_job_id": "submitted"},
+        max_attempts=3,
+    )
+    await queue.enqueue(job)
+    lock = OwnedLock()
+    worker = FacebookBrowserWorker(
+        queue,
+        lock,
+        ReconciliationPendingDispatcher(),
+        retry_base_seconds=0,
+        retry_max_seconds=0,
+        retry_jitter_seconds=0,
+    )
+
+    assert await worker.run_once() is True
+    record = await queue.get_record(job.job_id)
+    assert record["status"] == "RETRYABLE"
+    assert record["attempt_count"] == 1
+    assert lock.released == 1
+    events = await queue.list_events(job.job_id)
+    assert any(event["event_type"] == "PLAYWRIGHT_RETRY_SCHEDULED" for event in events)
