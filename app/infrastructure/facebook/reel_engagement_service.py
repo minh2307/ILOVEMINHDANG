@@ -41,6 +41,7 @@ class FacebookReelEngagementService:
 
     MAX_SCROLL_ROUNDS = 50
     MAX_NO_NEW_COMMENT_ROUNDS = 3
+    _REEL_SCOPE_ATTRIBUTE = "data-codex-active-reel-scope"
     _COMMENT_DOM_ATTRIBUTE = "data-codex-reel-comment-key"
     _REACTION_SELECTOR = (
         'button, [role="button"][aria-label], [role="button"][aria-pressed], '
@@ -58,9 +59,14 @@ class FacebookReelEngagementService:
         "unlike",
         "remove your like",
         "remove reaction",
+        "remove your reaction",
         "gỡ thích",
+        "gỡ lượt thích",
+        "gỡ cảm xúc",
         "bỏ thích",
+        "bỏ lượt thích",
         "xóa lượt thích",
+        "xóa cảm xúc",
     )
     _NOT_LIKED_TERMS = ("like", "thích")
 
@@ -201,8 +207,10 @@ class FacebookReelEngagementService:
                 self.logger.debug("Popup close control disappeared: %s", exc)
 
     async def _extract_reel_author(self, page: Any) -> FacebookActorIdentity:
+        if not await self._mark_active_reel_scope(page):
+            return FacebookActorIdentity()
         raw = await page.evaluate(
-            r"""() => {
+            r"""({scopeAttribute}) => {
                 const visible = (el) => {
                     const rect = el.getBoundingClientRect();
                     const style = window.getComputedStyle(el);
@@ -213,16 +221,17 @@ class FacebookReelEngagementService:
                     const article = el.closest('[role="article"]');
                     if (!article) return false;
                     const label = article.getAttribute('aria-label') || '';
-                    return /comment by|bình luận của/i.test(label) ||
-                        !!article.querySelector('a[href*="comment_id="]');
+                    if (/comment by|bình luận của/i.test(label) ||
+                        article.matches('[data-commentid], [data-comment-id]')) {
+                        return true;
+                    }
+                    return [...article.querySelectorAll(
+                        'a[href*="comment_id="], a[href*="reply_comment_id="]'
+                    )].some((link) => link.closest('[role="article"]') === article);
                 };
-                const scopes = [
-                    ...document.querySelectorAll('main, [role="main"], [role="dialog"]')
-                ].filter(visible);
-                const root = scopes.find((scope) =>
-                    scope.querySelector('a[href*="/reel/"]') ||
-                    scope.querySelector('video')
-                ) || document;
+                const root = [...document.querySelectorAll(`[${scopeAttribute}]`)]
+                    .find(visible);
+                if (!root) return {name: '', url: null, id: null};
                 const links = [...root.querySelectorAll('a[href]')].filter((link) => {
                     if (!visible(link) || isComment(link)) return false;
                     const href = link.getAttribute('href') || '';
@@ -252,7 +261,8 @@ class FacebookReelEngagementService:
                     url: link.href || link.getAttribute('href'),
                     id: idMatch ? idMatch[1] : null,
                 };
-            }"""
+            }""",
+            {"scopeAttribute": self._REEL_SCOPE_ATTRIBUTE},
         )
         raw = raw if isinstance(raw, dict) else {}
         return self._actor_identity(
@@ -279,7 +289,10 @@ class FacebookReelEngagementService:
     async def _find_reel_reaction_button(
         self, page: Any
     ) -> tuple[Any | None, ReactionState]:
-        controls = page.locator(self._REACTION_SELECTOR)
+        scope = await self._active_reel_scope(page)
+        if scope is None:
+            return None, "unknown"
+        controls = scope.locator(self._REACTION_SELECTOR)
         for index in range(min(await controls.count(), 80)):
             control = controls.nth(index)
             try:
@@ -290,8 +303,15 @@ class FacebookReelEngagementService:
                         const article = el.closest('[role="article"]');
                         if (!article) return false;
                         const label = article.getAttribute('aria-label') || '';
-                        return /comment by|bình luận của/i.test(label) ||
-                            !!article.querySelector('a[href*="comment_id="]');
+                        if (/comment by|bình luận của/i.test(label) ||
+                            article.matches('[data-commentid], [data-comment-id]')) {
+                            return true;
+                        }
+                        return [...article.querySelectorAll(
+                            'a[href*="comment_id="], a[href*="reply_comment_id="]'
+                        )].some((link) =>
+                            link.closest('[role="article"]') === article
+                        );
                     }"""
                 )
                 if inside_comment:
@@ -306,7 +326,10 @@ class FacebookReelEngagementService:
     async def _open_comment_panel(self, page: Any) -> None:
         if await self._discover_comments(page, like_replies=False):
             return
-        controls = page.locator(self._COMMENT_PANEL_SELECTOR)
+        scope = await self._active_reel_scope(page)
+        if scope is None:
+            raise RuntimeError("Active Reel container could not be located")
+        controls = scope.locator(self._COMMENT_PANEL_SELECTOR)
         for index in range(min(await controls.count(), 20)):
             control = controls.nth(index)
             try:
@@ -354,7 +377,10 @@ class FacebookReelEngagementService:
     async def _expand_comment_controls(
         self, page: Any, *, like_replies: bool
     ) -> int:
-        controls = page.locator(self._EXPAND_SELECTOR)
+        scope = await self._active_reel_scope(page)
+        if scope is None:
+            return 0
+        controls = scope.locator(self._EXPAND_SELECTOR)
         clicked = 0
         for index in range(min(await controls.count(), 120)):
             control = controls.nth(index)
@@ -371,24 +397,7 @@ class FacebookReelEngagementService:
                         if part
                     )
                 )
-                is_comment_expander = bool(
-                    re.search(
-                        r"(?:view|see|show)\s+(?:more|previous|earlier|all)\s+comments|"
-                        r"xem\s+(?:thêm|các)\s+bình luận|"
-                        r"hiển thị\s+thêm\s+bình luận",
-                        text,
-                    )
-                )
-                is_reply_expander = bool(
-                    re.search(
-                        r"(?:view|see|show)\s+(?:more\s+)?repl(?:y|ies)|"
-                        r"xem\s+(?:thêm\s+)?(?:phản hồi|câu trả lời)",
-                        text,
-                    )
-                )
-                if not is_comment_expander and not (
-                    like_replies and is_reply_expander
-                ):
+                if not self._is_expand_control(text, like_replies=like_replies):
                     continue
                 await control.click(timeout=self.click_timeout_ms)
                 clicked += 1
@@ -398,13 +407,18 @@ class FacebookReelEngagementService:
         return clicked
 
     async def _scroll_comment_region(self, page: Any) -> None:
+        if not await self._mark_active_reel_scope(page):
+            return
         await page.evaluate(
-            r"""() => {
+            r"""({scopeAttribute}) => {
                 const visible = (el) => {
                     const rect = el.getBoundingClientRect();
                     return rect.width > 0 && rect.height > 0;
                 };
-                const regions = [...document.querySelectorAll(
+                const root = [...document.querySelectorAll(`[${scopeAttribute}]`)]
+                    .find(visible);
+                if (!root) return false;
+                const regions = [root, ...root.querySelectorAll(
                     '[role="dialog"], [role="complementary"], [role="tabpanel"], '
                     '[aria-label*="comments" i], [aria-label*="bình luận" i]'
                 )].filter(visible);
@@ -424,14 +438,17 @@ class FacebookReelEngagementService:
                 }
                 window.scrollBy(0, Math.max(500, window.innerHeight * 0.8));
                 return false;
-            }"""
+            }""",
+            {"scopeAttribute": self._REEL_SCOPE_ATTRIBUTE},
         )
 
     async def _discover_comments(
         self, page: Any, *, like_replies: bool
     ) -> list[FacebookCommentSnapshot]:
+        if not await self._mark_active_reel_scope(page):
+            return []
         raw_comments = await page.evaluate(
-            r"""({includeReplies, domAttribute}) => {
+            r"""({includeReplies, domAttribute, scopeAttribute}) => {
                 const visible = (el) => {
                     const rect = el.getBoundingClientRect();
                     const style = window.getComputedStyle(el);
@@ -440,15 +457,23 @@ class FacebookReelEngagementService:
                 };
                 const commentLike = (el) => {
                     const label = el.getAttribute('aria-label') || '';
-                    if (/comment by|bình luận của/i.test(label)) return true;
-                    return !!el.querySelector(
+                    if (/comment by|bình luận của/i.test(label) ||
+                        el.matches('[data-commentid], [data-comment-id]')) {
+                        return true;
+                    }
+                    return [...el.querySelectorAll(
                         'a[href*="comment_id="], a[href*="reply_comment_id="]'
+                    )].some((link) =>
+                        link.closest('[role="article"]') === el
                     );
                 };
-                let candidates = [...document.querySelectorAll('[role="article"]')]
+                const root = [...document.querySelectorAll(`[${scopeAttribute}]`)]
+                    .find(visible);
+                if (!root) return [];
+                let candidates = [...root.querySelectorAll('[role="article"]')]
                     .filter((el) => visible(el) && commentLike(el));
                 if (!candidates.length) {
-                    candidates = [...document.querySelectorAll(
+                    candidates = [...root.querySelectorAll(
                         '[data-commentid], [data-comment-id]'
                     )].filter(visible);
                 }
@@ -457,10 +482,10 @@ class FacebookReelEngagementService:
                     const hrefs = [...container.querySelectorAll('a[href]')];
                     const permalink = hrefs.map((a) => a.href || a.getAttribute('href') || '')
                         .find((href) => /(?:comment_id|reply_comment_id)=/i.test(href)) || '';
-                    const nested = !!container.parentElement?.closest(
-                        '[role="article"][aria-label*="comment" i], '
-                        '[role="article"][aria-label*="bình luận" i]'
+                    const ancestorArticle = container.parentElement?.closest(
+                        '[role="article"], [data-commentid], [data-comment-id]'
                     );
+                    const nested = !!ancestorArticle && commentLike(ancestorArticle);
                     const ariaLevel = Number(container.getAttribute('aria-level') || '1');
                     const isReply = nested || ariaLevel > 1 || /reply_comment_id=/i.test(permalink);
                     if (isReply && !includeReplies) return null;
@@ -528,6 +553,7 @@ class FacebookReelEngagementService:
             {
                 "includeReplies": bool(like_replies),
                 "domAttribute": self._COMMENT_DOM_ATTRIBUTE,
+                "scopeAttribute": self._REEL_SCOPE_ATTRIBUTE,
             },
         )
         comments: list[FacebookCommentSnapshot] = []
@@ -591,6 +617,10 @@ class FacebookReelEngagementService:
                 )
                 if fresh is None:
                     raise RuntimeError("comment detached or no longer rendered")
+                if not self._has_actor_identity(fresh.author):
+                    raise RuntimeError(
+                        "comment author could not be identified safely"
+                    )
                 if self._same_actor(reel_author, fresh.author):
                     result["author_comments_skipped"] += 1
                     self.logger.info(
@@ -658,6 +688,38 @@ class FacebookReelEngagementService:
             try:
                 if not await control.is_visible():
                     continue
+                belongs_to_comment = await control.evaluate(
+                    r"""(el, {domAttribute}) => {
+                        const root = el.closest(`[${domAttribute}]`);
+                        if (!root) return false;
+                        const commentLike = (node) => {
+                            const label = node.getAttribute('aria-label') || '';
+                            if (/comment by|bình luận của/i.test(label) ||
+                                node.matches('[data-commentid], [data-comment-id]')) {
+                                return true;
+                            }
+                            return [...node.querySelectorAll(
+                                'a[href*="comment_id="], '
+                                'a[href*="reply_comment_id="]'
+                            )].some((link) =>
+                                link.closest('[role="article"]') === node
+                            );
+                        };
+                        for (let node = el.parentElement;
+                             node && node !== root;
+                             node = node.parentElement) {
+                            if ((node.matches('[role="article"]') ||
+                                 node.matches('[data-commentid], [data-comment-id]')) &&
+                                commentLike(node)) {
+                                return false;
+                            }
+                        }
+                        return true;
+                    }""",
+                    {"domAttribute": self._COMMENT_DOM_ATTRIBUTE},
+                )
+                if not belongs_to_comment:
+                    continue
                 state = await self._reaction_state(control)
                 if state != "unknown":
                     return control, state
@@ -682,8 +744,8 @@ class FacebookReelEngagementService:
         combined = " ".join(part for part in (label, text) if part)
         if pressed == "true" or any(term in combined for term in self._LIKED_TERMS):
             return "liked"
-        label_is_not_liked = label in self._NOT_LIKED_TERMS
-        text_is_not_liked = text in self._NOT_LIKED_TERMS
+        label_is_not_liked = self._is_not_liked_action(label)
+        text_is_not_liked = self._is_not_liked_action(text)
         has_not_liked_term = label_is_not_liked or text_is_not_liked
         if not has_not_liked_term:
             return "unknown"
@@ -708,6 +770,82 @@ class FacebookReelEngagementService:
         lower = self.action_delay_range[0] if minimum is None else max(0.0, minimum)
         upper = self.action_delay_range[1] if maximum is None else max(lower, maximum)
         await self._sleep(random.uniform(lower, upper))
+
+    async def _mark_active_reel_scope(self, page: Any) -> bool:
+        return bool(
+            await page.evaluate(
+                r"""({scopeAttribute}) => {
+                    const visible = (el) => {
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 &&
+                            style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    for (const old of document.querySelectorAll(`[${scopeAttribute}]`)) {
+                        old.removeAttribute(scopeAttribute);
+                    }
+                    const activeDialogs = [...document.querySelectorAll('[role="dialog"]')]
+                        .filter((dialog) => visible(dialog) && (
+                            dialog.querySelector('video') ||
+                            dialog.querySelector('a[href*="/reel/"]')
+                        ));
+                    let root = activeDialogs.at(-1) || null;
+                    if (!root) {
+                        const media = [...document.querySelectorAll('video')]
+                            .find(visible) || [...document.querySelectorAll(
+                                'a[href*="/reel/"]'
+                            )].find(visible);
+                        root = media?.closest('[role="article"]') ||
+                            media?.closest('main, [role="main"]') || null;
+                    }
+                    if (!root) return false;
+                    root.setAttribute(scopeAttribute, 'true');
+                    return true;
+                }""",
+                {"scopeAttribute": self._REEL_SCOPE_ATTRIBUTE},
+            )
+        )
+
+    async def _active_reel_scope(self, page: Any) -> Any | None:
+        if not await self._mark_active_reel_scope(page):
+            return None
+        scope = page.locator(f'[{self._REEL_SCOPE_ATTRIBUTE}="true"]')
+        if not await scope.count():
+            return None
+        return scope.first
+
+    @staticmethod
+    def _is_expand_control(text: str, *, like_replies: bool) -> bool:
+        comment_patterns = (
+            r"(?:view|see|show)\s+(?:\d[\d.,]*\s+)?"
+            r"(?:more|previous|earlier|all)\s+comments?",
+            r"(?:xem|hiển thị)\s+(?:thêm|các)\s+"
+            r"(?:\d[\d.,]*\s+)?bình luận",
+            r"(?:xem|hiển thị)\s+\d[\d.,]*\s+bình luận"
+            r"(?:\s+(?:trước|trước đó))?",
+            r"xem\s+bình luận\s+(?:trước|trước đó)",
+        )
+        if any(re.search(pattern, text) for pattern in comment_patterns):
+            return True
+        if not like_replies:
+            return False
+        reply_patterns = (
+            r"(?:view|see|show)\s+(?:\d[\d.,]*\s+)?"
+            r"(?:more\s+)?repl(?:y|ies)",
+            r"xem\s+(?:thêm\s+)?(?:\d[\d.,]*\s+)?"
+            r"(?:phản hồi|câu trả lời)",
+        )
+        return any(re.search(pattern, text) for pattern in reply_patterns)
+
+    @classmethod
+    def _is_not_liked_action(cls, value: str) -> bool:
+        if value in cls._NOT_LIKED_TERMS:
+            return True
+        patterns = (
+            r"^like\s+(?:this\s+)?(?:comment|reel|post|video)$",
+            r"^thích\s+(?:bình luận|thước phim|bài viết|video)(?:\s+này)?$",
+        )
+        return any(re.fullmatch(pattern, value) for pattern in patterns)
 
     @classmethod
     def _actor_identity(

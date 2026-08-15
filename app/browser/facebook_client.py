@@ -29,6 +29,11 @@ from app.models.results import (
 from app.models.workflow import WorkflowStatus
 from app.repositories.job_repository import JobRepository
 from app.services.post_content_service import PostContentService
+from app.domain.policies.external_side_effect_policy import (
+    facebook_submission_is_committed,
+    repository_facebook_submission_evidence,
+    verified_permalink,
+)
 
 
 class FacebookManualActionRequired(RuntimeError):
@@ -116,10 +121,9 @@ class FacebookWebClient:
     ) -> FacebookPostPreparationResult:
         target = self.content.normalize_target_url(target_url)
         job = self._require_job(job_id)
-        if (
-            job.status is WorkflowStatus.FACEBOOK_PUBLISH_FAILED
-            and self._publication_was_submitted(job.data)
-        ):
+        if repository_facebook_submission_evidence(
+            self.repository, job_id, job.data
+        ).committed:
             raise ValueError(
                 "Facebook publication was already submitted; run reconciliation instead of preparing another post"
             )
@@ -218,6 +222,12 @@ class FacebookWebClient:
 
     async def publish_prepared_post(self, *, job_id: str) -> FacebookPublishResult:
         job = self._require_job(job_id)
+        if repository_facebook_submission_evidence(
+            self.repository, job_id, job.data
+        ).committed:
+            raise ValueError(
+                "Facebook publication was already submitted; a second Publish is permanently blocked"
+            )
         if job.status is not WorkflowStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW:
             raise ValueError(
                 "Facebook publishing requires FACEBOOK_WAITING_FOR_MANUAL_REVIEW; "
@@ -337,6 +347,7 @@ class FacebookWebClient:
             },
         )
         publish_clicked = False
+        submit_checkpointed = False
         attempt_id = job.data.get("facebook_attempt_id")
         try:
             composer_dialog = await self.resolver.find_first(
@@ -369,29 +380,43 @@ class FacebookWebClient:
                 composer_dialog, "facebook.post_button", timeout_ms=10_000
             )
 
-            if attempt_id:
-                self.repository.update_publication_attempt(
-                    attempt_id, status="SUBMITTING"
-                )
-
             # Persist SUBMITTING immediately before the real final Post click.
-            self.repository.update_data(job_id, {
-                "facebook_submission_status": "SUBMITTING",
-                "facebook_submit_url": safe_browser_url(str(page.url)),
-                "facebook_submit_timestamp": datetime.now(UTC).isoformat(),
-            })
-            self.repository.record_event(
-                job_id, event_type="FACEBOOK_SUBMITTING",
-                details={
-                    "browser_url": safe_browser_url(str(page.url)),
-                    "timestamp": datetime.now(UTC).isoformat(),
-                    "submission_status": "SUBMITTING",
-                }
-            )
+            submitted_at = datetime.now(UTC)
+            marker = getattr(self.repository, "mark_facebook_submitting", None)
+            if callable(marker):
+                marker(
+                    job_id,
+                    submitted_at=submitted_at.isoformat(),
+                    content_fingerprint=str(
+                        job.data.get("facebook_content_hash") or ""
+                    ),
+                    target_url=target,
+                )
+            else:
+                if attempt_id:
+                    self.repository.update_publication_attempt(
+                        attempt_id, status="SUBMITTING"
+                    )
+                self.repository.update_data(job_id, {
+                    "facebook_submission_status": "SUBMITTING",
+                    "facebook_publication_state": "SUBMITTING",
+                    "facebook_submitted_at": submitted_at.isoformat(),
+                    "facebook_submit_url": safe_browser_url(str(page.url)),
+                    "facebook_submit_timestamp": submitted_at.isoformat(),
+                })
+                self.repository.record_event(
+                    job_id, event_type="FACEBOOK_SUBMITTING",
+                    details={
+                        "browser_url": safe_browser_url(str(page.url)),
+                        "timestamp": submitted_at.isoformat(),
+                        "submitted_at": submitted_at.isoformat(),
+                        "submission_status": "SUBMITTING",
+                    }
+                )
+            submit_checkpointed = True
 
             await final_post_button.click()
             publish_clicked = True
-            submitted_at = datetime.now(UTC)
 
             if attempt_id:
                 self.repository.update_publication_attempt(
@@ -533,7 +558,7 @@ class FacebookWebClient:
             if current.status is WorkflowStatus.FACEBOOK_PUBLISHING:
                 target_status = (
                     WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN
-                    if publish_clicked
+                    if publish_clicked or submit_checkpointed
                     else WorkflowStatus.FACEBOOK_PUBLISH_FAILED
                 )
                 self.repository.transition(
@@ -541,37 +566,45 @@ class FacebookWebClient:
                     target_status,
                     event_type=(
                         "FACEBOOK_PUBLICATION_RECONCILIATION_REQUIRED"
-                        if publish_clicked
+                        if publish_clicked or submit_checkpointed
                         else "JOB_STATE_CHANGED"
                     ),
-                    details={"error": str(exc), "publish_clicked": publish_clicked},
+                    details={
+                        "error": str(exc),
+                        "publish_clicked": publish_clicked,
+                        "submit_checkpointed": submit_checkpointed,
+                    },
                     data_patch={
                         "facebook_error": str(exc),
-                        "facebook_publication_uncertain": publish_clicked,
+                        "facebook_publication_uncertain": publish_clicked or submit_checkpointed,
                         "facebook_diagnostic_screenshot_path": str(paths[0]),
                         "facebook_submission_status": (
-                            "SUBMITTED_UNCONFIRMED" if publish_clicked else "FAILED_BEFORE_SUBMIT"
+                            "SUBMITTED_UNCONFIRMED" if publish_clicked or submit_checkpointed else "FAILED_BEFORE_SUBMIT"
                         ),
                         "facebook_publication_state": (
-                            "SUBMITTED_UNCONFIRMED" if publish_clicked else "FAILED_BEFORE_SUBMIT"
+                            "SUBMITTED_UNCONFIRMED" if publish_clicked or submit_checkpointed else "FAILED_BEFORE_SUBMIT"
                         ),
                     },
                 )
                 if attempt_id:
                     self.repository.update_publication_attempt(
                         attempt_id,
-                        status="UNCERTAIN" if publish_clicked else "FAILED",
+                        status="UNCERTAIN" if publish_clicked or submit_checkpointed else "FAILED",
                         error_message=str(exc),
                         diagnostic_paths=[str(paths[0])] if paths else None,
-                        completed=not publish_clicked,
+                        completed=not (publish_clicked or submit_checkpointed),
                     )
             return FacebookPublishResult(
                 success=False,
-                status="PUBLICATION_UNCERTAIN" if publish_clicked else "PUBLISH_ACTION_FAILED",
+                status="PUBLICATION_UNCERTAIN" if publish_clicked or submit_checkpointed else "PUBLISH_ACTION_FAILED",
                 target_url=target,
                 job_id=job_id,
                 diagnostic_screenshot_path=str(paths[0]),
-                diagnostics={"exception": str(exc), "publish_clicked": publish_clicked},
+                diagnostics={
+                    "exception": str(exc),
+                    "publish_clicked": publish_clicked,
+                    "submit_checkpointed": submit_checkpointed,
+                },
                 error=str(exc),
             )
 
@@ -582,6 +615,7 @@ class FacebookWebClient:
             WorkflowStatus.FACEBOOK_PUBLISHING,
             WorkflowStatus.PUBLISH_RECONCILIATION_REQUIRED,
             WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+            WorkflowStatus.FACEBOOK_SUBMITTED_UNCONFIRMED_EXHAUSTED,
         }
         if job.status not in allowed_reconcile_statuses:
             raise ValueError(
@@ -599,16 +633,17 @@ class FacebookWebClient:
             or ""
         )
         started = datetime.fromisoformat(raw_started.replace("Z", "+00:00")) if raw_started else datetime.now(UTC)
-        reconciliation_attempt = int(
-            job.data.get("facebook_reconciliation_attempt") or 0
-        ) + 1
+        reconciliation_attempt = max(
+            int(job.reconciliation_attempts or 0),
+            int(job.data.get("facebook_reconciliation_attempt") or 0),
+        )
+        if reconciliation_attempt < 1:
+            begin = getattr(self.repository, "begin_facebook_reconciliation", None)
+            if callable(begin):
+                reconciliation_attempt = begin(job_id)
+            else:
+                reconciliation_attempt = 1
         reconciliation_started_at = datetime.now(UTC)
-        self.repository.update_data(job_id, {
-            "facebook_reconciliation_attempt": reconciliation_attempt,
-            "facebook_reconciliation_last_started_at": reconciliation_started_at.isoformat(),
-            "facebook_submission_status": "SUBMITTED_UNCONFIRMED",
-            "facebook_publication_state": "SUBMITTED_UNCONFIRMED",
-        })
         self._record_publish_milestone(
             job_id,
             "reconciliation_started",
@@ -616,6 +651,7 @@ class FacebookWebClient:
             attempt=reconciliation_attempt,
             state_before=job.status.value,
             state_after=WorkflowStatus.PUBLISH_RECONCILIATION_REQUIRED.value,
+            persist=False,
         )
         page: Any = None
         try:
@@ -632,6 +668,21 @@ class FacebookWebClient:
                 )
             finally:
                 self._reload_feed_during_verification = False
+            if result.status == "POSSIBLE_DUPLICATE_REQUIRES_MANUAL_REVIEW":
+                matching = list(result.diagnostics.get("matching_permalinks") or [])
+                quarantine = getattr(
+                    self.repository, "quarantine_possible_duplicate", None
+                )
+                if callable(quarantine):
+                    quarantine(
+                        job_id,
+                        expected_fingerprint=str(
+                            job.data.get("facebook_content_hash") or ""
+                        ),
+                        reason="multiple reconciliation matches",
+                        matching_permalinks=matching,
+                    )
+                return result
             if result.success and (result.post_id or result.permalink or result.post_url):
                 permalink = result.permalink or result.post_url
                 verified_at = datetime.now(UTC)
@@ -682,7 +733,7 @@ class FacebookWebClient:
                 >= self.settings.max_facebook_reconciliation_retries
             )
             target_state = (
-                WorkflowStatus.FACEBOOK_PUBLISH_FAILED
+                WorkflowStatus.FACEBOOK_SUBMITTED_UNCONFIRMED_EXHAUSTED
                 if exhausted
                 else WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN
             )
@@ -730,8 +781,8 @@ class FacebookWebClient:
             if attempt_id:
                 self.repository.update_publication_attempt(
                     attempt_id,
-                    status="FAILED" if target_state == WorkflowStatus.FACEBOOK_PUBLISH_FAILED else "UNCERTAIN",
-                    completed=target_state == WorkflowStatus.FACEBOOK_PUBLISH_FAILED,
+                    status="FAILED" if target_state == WorkflowStatus.FACEBOOK_SUBMITTED_UNCONFIRMED_EXHAUSTED else "UNCERTAIN",
+                    completed=target_state == WorkflowStatus.FACEBOOK_SUBMITTED_UNCONFIRMED_EXHAUSTED,
                 )
             return FacebookPublishResult(
                 success=False,
@@ -758,7 +809,7 @@ class FacebookWebClient:
                     >= self.settings.max_facebook_reconciliation_retries
                 )
                 target_state = (
-                    WorkflowStatus.FACEBOOK_PUBLISH_FAILED
+                    WorkflowStatus.FACEBOOK_SUBMITTED_UNCONFIRMED_EXHAUSTED
                     if exhausted
                     else WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN
                 )
@@ -836,6 +887,52 @@ class FacebookWebClient:
         self, *, job_id: str, publication_started_at: datetime
     ) -> FacebookPermalinkResult:
         job = self._require_job(job_id)
+        persisted_permalink = verified_permalink(job.data)
+        if persisted_permalink:
+            try:
+                canonical = self.normalize_permalink(
+                    persisted_permalink, base_url=persisted_permalink
+                )
+            except ValueError as exc:
+                return FacebookPermalinkResult(
+                    False,
+                    job_id,
+                    error=f"Persisted verified permalink is invalid: {exc}",
+                )
+            post_id = self.extract_post_id(canonical)
+            expected_id = str(job.data.get("facebook_post_id") or "").strip()
+            if expected_id and post_id and expected_id != post_id:
+                return FacebookPermalinkResult(
+                    False,
+                    job_id,
+                    error="Verified permalink conflicts with persisted post ID",
+                )
+            if job.status is not WorkflowStatus.POST_URL_EXTRACTED:
+                self.repository.transition(
+                    job_id,
+                    WorkflowStatus.POST_URL_EXTRACTED,
+                    event_type="VERIFIED_PERMALINK_REUSED",
+                    details={"extraction_method": "persisted_verified_permalink"},
+                    data_patch={
+                        "facebook_post_url": canonical,
+                        "facebook_post_id": post_id or expected_id or None,
+                        "facebook_permalink_extraction_method": "persisted_verified_permalink",
+                        "facebook_permalink_error": None,
+                    },
+                )
+            elif canonical != persisted_permalink:
+                self.repository.update_data(
+                    job_id, {"facebook_post_url": canonical}
+                )
+            return FacebookPermalinkResult(
+                True,
+                job_id,
+                canonical,
+                post_id or expected_id or None,
+                "persisted_verified_permalink",
+                [],
+                None,
+            )
         if job.status is WorkflowStatus.POST_URL_EXTRACTION_FAILED:
             job = self.repository.transition(
                 job_id, WorkflowStatus.RETRY_PENDING,
@@ -1239,12 +1336,50 @@ class FacebookWebClient:
             signals["composer_closed"] = not await self.resolver.exists(
                 page, "facebook.composer_dialog", timeout_ms=300
             )
-            candidate = await self._find_direct_result_permalink(page, before_ids)
-            signals["direct_permalink"] = bool(candidate)
-            if candidate is None:
-                candidate = await self._find_exact_new_post(
+            direct_candidates = await self._find_direct_result_permalinks(
+                page, before_ids
+            )
+            if (
+                type(self)._find_exact_new_post
+                is not FacebookWebClient._find_exact_new_post
+            ):
+                legacy_candidate = await self._find_exact_new_post(
                     page, text, started, len(images), before_ids, job_id=job_id
                 )
+                feed_candidates = [legacy_candidate] if legacy_candidate else []
+            else:
+                feed_candidates = await self._find_exact_new_posts(
+                    page, text, started, len(images), before_ids, job_id=job_id
+                )
+            candidates: list[dict[str, Any]] = []
+            seen_urls: set[str] = set()
+            for item in [*direct_candidates, *feed_candidates]:
+                url = str(item.get("url") or "")
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    candidates.append(item)
+            if len(candidates) > 1:
+                matching_permalinks = [str(item["url"]) for item in candidates]
+                for item in candidates:
+                    self._record_candidate_observation(job_id, item, accepted=False)
+                signals["matching_post_count"] = len(candidates)
+                return FacebookPublishResult(
+                    success=False,
+                    status="POSSIBLE_DUPLICATE_REQUIRES_MANUAL_REVIEW",
+                    target_url=str(
+                        self._require_job(job_id).data.get(
+                            "facebook_target_url", ""
+                        )
+                    ),
+                    job_id=job_id,
+                    diagnostics={
+                        "signals": signals,
+                        "matching_permalinks": matching_permalinks,
+                    },
+                    error="Multiple matching Facebook posts require manual review",
+                ), signals
+            candidate = candidates[0] if candidates else None
+            signals["direct_permalink"] = bool(direct_candidates)
             signals["exact_post_match"] = bool(candidate)
             signals["text_match"] = bool(candidate and candidate.get("text_match"))
             signals["recent_timestamp"] = bool(candidate and candidate.get("recent"))
@@ -1374,13 +1509,13 @@ class FacebookWebClient:
         )
         return strong and supporting >= 1
 
-    async def _find_exact_new_post(
+    async def _find_exact_new_posts(
         self, page: Any, approved_text: str, started: datetime,
         expected_images: int, before_ids: set[str], *, job_id: str | None = None
-    ) -> dict[str, Any] | None:
+    ) -> list[dict[str, Any]]:
         articles = await self._all_locators(page, "facebook.feed_post")
         normalized_approved = self._normalize_text(approved_text)
-        best: tuple[int, dict[str, Any]] | None = None
+        matches: list[tuple[int, dict[str, Any]]] = []
         for article in articles:
             try:
                 body = self._normalize_text(await article.inner_text())
@@ -1409,27 +1544,54 @@ class FacebookWebClient:
                         "match_reason": caption_match["reason"],
                         "method": "normalized-caption+new-id+timestamp+image-count",
                     }
-                    if text_match and is_new and (best is None or score > best[0]):
-                        best = (score, candidate)
+                    if text_match and is_new:
+                        matches.append((score, candidate))
                     elif job_id:
                         self._record_candidate_observation(
                             job_id, candidate, accepted=False
                         )
             except Exception:
                 continue
-        if best:
-            return best[1]
-        return await self._find_page_layout_post(
+        if matches:
+            unique: dict[str, tuple[int, dict[str, Any]]] = {}
+            for score, candidate in matches:
+                url = str(candidate.get("url") or "")
+                if url not in unique or score > unique[url][0]:
+                    unique[url] = (score, candidate)
+            return [
+                candidate
+                for _score, candidate in sorted(
+                    unique.values(), key=lambda item: item[0], reverse=True
+                )
+            ]
+        page_layout = await self._find_page_layout_post(
             page,
             approved_text,
             expected_images,
             before_ids,
         )
+        return [page_layout] if page_layout else []
 
-    async def _find_direct_result_permalink(
-        self, page: Any, before_ids: set[str]
+    async def _find_exact_new_post(
+        self, page: Any, approved_text: str, started: datetime,
+        expected_images: int, before_ids: set[str], *, job_id: str | None = None
     ) -> dict[str, Any] | None:
+        matches = await self._find_exact_new_posts(
+            page,
+            approved_text,
+            started,
+            expected_images,
+            before_ids,
+            job_id=job_id,
+        )
+        return matches[0] if matches else None
+
+    async def _find_direct_result_permalinks(
+        self, page: Any, before_ids: set[str]
+    ) -> list[dict[str, Any]]:
         """Read a durable permalink exposed by Facebook's post-submit UI."""
+        matches: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
         for locator in await self._all_locators(
             page, "facebook.publish_result_permalink"
         ):
@@ -1439,7 +1601,10 @@ class FacebookWebClient:
                 post_id = self.extract_post_id(url) or ""
                 if post_id and post_id in before_ids:
                     continue
-                return {
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                matches.append({
                     "url": url,
                     "post_id": post_id,
                     "text_match": False,
@@ -1448,10 +1613,16 @@ class FacebookWebClient:
                     "match_score": 10,
                     "match_reason": "facebook_publish_result_permalink",
                     "method": "direct-post-submit-permalink",
-                }
+                })
             except (AttributeError, ValueError):
                 continue
-        return None
+        return matches
+
+    async def _find_direct_result_permalink(
+        self, page: Any, before_ids: set[str]
+    ) -> dict[str, Any] | None:
+        matches = await self._find_direct_result_permalinks(page, before_ids)
+        return matches[0] if matches else None
 
     def _record_candidate_observation(
         self, job_id: str, candidate: dict[str, Any], *, accepted: bool
@@ -1949,9 +2120,7 @@ class FacebookWebClient:
 
     @staticmethod
     def _publication_was_submitted(data: dict[str, Any]) -> bool:
-        return str(data.get("facebook_publication_state") or "") == "SUBMITTED_UNCONFIRMED" or str(
-            data.get("facebook_submission_status") or ""
-        ) in {"SUBMITTING", "SUBMITTED_UNCONFIRMED", "PUBLICATION_UNCERTAIN"}
+        return facebook_submission_is_committed(data)
 
     @classmethod
     def _same_comment(cls, left: str, right: str) -> bool:

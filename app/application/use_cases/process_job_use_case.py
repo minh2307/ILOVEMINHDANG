@@ -14,6 +14,9 @@ class ProcessJobUseCase:
         {
             JobStatus.WAITING_FOR_AUTH_REVIEW,
             JobStatus.BLOCKED,
+            JobStatus.BLOCKED_USER_APPROVAL,
+            JobStatus.FACEBOOK_SUBMITTED_UNCONFIRMED_EXHAUSTED,
+            JobStatus.POSSIBLE_DUPLICATE_REQUIRES_MANUAL_REVIEW,
             JobStatus.REJECTED,
             JobStatus.CANCELLED,
         }
@@ -24,6 +27,7 @@ class ProcessJobUseCase:
             JobStatus.GEMINI_FAILED,
             JobStatus.AI_FAILED,
             JobStatus.CDHA_FAILED,
+            JobStatus.SCREENSHOTS_FAILED,
             JobStatus.FACEBOOK_PUBLISH_FAILED,
             JobStatus.POST_URL_EXTRACTION_FAILED,
             JobStatus.COMMENT_FAILED,
@@ -70,6 +74,12 @@ class ProcessJobUseCase:
             if job is None:
                 return JobResult.failure_result(job_id, f"Job not found: {job_id}")
 
+            enforce_guard = getattr(
+                self._repository, "enforce_facebook_submission_guard", None
+            )
+            if callable(enforce_guard):
+                job = enforce_guard(job_id)
+
             if job.status is JobStatus.COMPLETED:
                 return self._success(job_id, job.status)
             if job.status in self._FAILURES:
@@ -108,6 +118,11 @@ class ProcessJobUseCase:
             if refreshed is None:
                 return JobResult.failure_result(job_id, "Job disappeared during processing")
             if refreshed.status is before:
+                if before in {
+                    JobStatus.FACEBOOK_PUBLISH_UNCERTAIN,
+                    JobStatus.PUBLISH_RECONCILIATION_REQUIRED,
+                }:
+                    return self._success(job_id, refreshed.status)
                 message = f"Workflow made no progress from {before.value}"
                 self._repository.transition(
                     job_id,
@@ -202,7 +217,7 @@ class ProcessJobUseCase:
             return await self._stages.download(job_id)
         if retry_step in {"ai", "gemini", "ai_analysis", "ai_analyzing"}:
             return await self._stages.analyze(job_id)
-        if retry_step in {"cdha", "cdha_opening"}:
+        if retry_step in {"cdha", "cdha_opening", "cdha_capture"}:
             return await self._stages.analyze_cdha(job_id)
         if retry_step == "screenshots":
             return await self._stages.capture_screenshots(job_id)

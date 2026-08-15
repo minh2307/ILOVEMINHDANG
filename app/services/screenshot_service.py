@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -73,17 +75,18 @@ class ScreenshotService:
 
         for section in self.SECTIONS:
             path = output_dir / section["filename"]
+            temporary = output_dir / f".{path.stem}.tmp-{uuid.uuid4().hex}{path.suffix}"
             try:
                 if section["mode"] == "scroll_top":
                     await self._capture_scroll_top(
-                        page, path,
+                        page, temporary,
                         anchor_sel=section["anchor"],
                         offset=section.get("offset", 80),
                     )
 
                 elif section["mode"] == "scroll_impression_bottom":
                     await self._capture_scroll_impression_bottom(
-                        page, path,
+                        page, temporary,
                         anchor_sel=section["anchor"],
                         bottom_gap=section.get("bottom_gap", 24),
                     )
@@ -96,9 +99,13 @@ class ScreenshotService:
                 warning = f"{key}: screenshot failed, full-page fallback used ({exc})"
                 warnings.append(warning)
                 self.logger.warning(warning)
-                await self._capture_fallback(page, path)
+                temporary.unlink(missing_ok=True)
+                await self._capture_fallback(page, temporary)
                 metadata = output_dir / f"{path.stem}-fallback.json"
-                metadata.write_text(
+                metadata_temporary = output_dir / (
+                    f".{metadata.stem}.tmp-{uuid.uuid4().hex}{metadata.suffix}"
+                )
+                metadata_temporary.write_text(
                     json.dumps(
                         {"section": path.stem, "fallback": True, "error_type": type(exc).__name__},
                         ensure_ascii=False,
@@ -106,7 +113,12 @@ class ScreenshotService:
                     ),
                     encoding="utf-8",
                 )
-                metadata.chmod(0o600)
+                metadata_temporary.chmod(0o600)
+                os.replace(metadata_temporary, metadata)
+
+            if not temporary.is_file():
+                raise RuntimeError(f"Screenshot was not created: {temporary}")
+            os.replace(temporary, path)
 
             paths.append(path.resolve())
 

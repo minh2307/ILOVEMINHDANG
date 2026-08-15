@@ -49,6 +49,29 @@ class StateButton:
         self._on_click()
 
 
+class ReactionControl:
+    def __init__(
+        self,
+        *,
+        label: str = "",
+        text: str = "",
+        pressed: str | None = None,
+        color: str = "rgb(0, 0, 0)",
+    ) -> None:
+        self._attributes = {"aria-label": label, "aria-pressed": pressed}
+        self._text = text
+        self._color = color
+
+    async def get_attribute(self, name: str) -> str | None:
+        return self._attributes.get(name)
+
+    async def inner_text(self) -> str:
+        return self._text
+
+    async def evaluate(self, _script: str) -> str:
+        return self._color
+
+
 def comment(
     comment_id: str,
     author: FacebookActorIdentity = OTHER_AUTHOR,
@@ -259,6 +282,59 @@ async def test_reel_without_comments_completes_without_error() -> None:
     assert result["comments_found"] == 0
     assert result["comments_processed"] == 0
     assert result["failed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_comment_with_unknown_author_is_not_clicked() -> None:
+    unknown_author = FacebookActorIdentity()
+    target = comment("unknown-author", author=unknown_author)
+    service = EngagementHarness(comments=[target])
+
+    result = await service.like_reel_and_comments(FakePage(), REEL_URL)
+
+    assert result["failed"] == 1
+    assert result["comments_liked"] == 0
+    assert target.identity_key not in service.comment_buttons
+
+
+@pytest.mark.parametrize(
+    ("label", "like_replies", "expected"),
+    [
+        ("View 12 more comments", False, True),
+        ("View previous comments", False, True),
+        ("Xem thêm 12 bình luận", False, True),
+        ("Xem bình luận trước", False, True),
+        ("View 3 more replies", False, False),
+        ("View 3 more replies", True, True),
+        ("Xem thêm 3 phản hồi", True, True),
+    ],
+)
+def test_comment_expander_labels_are_bilingual_and_reply_aware(
+    label: str, like_replies: bool, expected: bool
+) -> None:
+    normalized = FacebookReelEngagementService._normalize_text(label)
+
+    assert FacebookReelEngagementService._is_expand_control(
+        normalized, like_replies=like_replies
+    ) is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("control", "expected"),
+    [
+        (ReactionControl(label="Like this comment", pressed="false"), "not_liked"),
+        (ReactionControl(label="Thích bình luận này", pressed="false"), "not_liked"),
+        (ReactionControl(label="15 likes", pressed="false"), "unknown"),
+        (ReactionControl(label="Gỡ lượt thích"), "liked"),
+    ],
+)
+async def test_reaction_state_uses_explicit_accessible_actions_only(
+    control: ReactionControl, expected: str
+) -> None:
+    service = FacebookReelEngagementService()
+
+    assert await service._reaction_state(control) == expected
 
 
 @pytest.mark.asyncio

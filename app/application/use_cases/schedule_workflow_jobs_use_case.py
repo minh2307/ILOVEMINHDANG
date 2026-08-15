@@ -5,6 +5,11 @@ from app.application.ports.job_repository_port import JobRepositoryPort
 from app.domain.enums.job_status import JobStatus
 from app.domain.enums.job_type import JobType
 from app.domain.models.facebook_job import FacebookJob
+from app.domain.policies.external_side_effect_policy import (
+    large_upload_gate_required,
+    large_upload_is_authorized,
+    repository_facebook_submission_evidence,
+)
 
 
 class ScheduleWorkflowJobsUseCase:
@@ -47,6 +52,7 @@ class ScheduleWorkflowJobsUseCase:
         auto_approve_review: bool = False,
         require_facebook_confirmation: bool = True,
         max_facebook_reconciliation_attempts: int = 3,
+        cdha_large_file_threshold_bytes: int = 50 * 1024 * 1024,
     ) -> None:
         self._repository = repository
         self._queue = queue
@@ -59,6 +65,9 @@ class ScheduleWorkflowJobsUseCase:
         self._max_facebook_reconciliation_attempts = max(
             1, int(max_facebook_reconciliation_attempts)
         )
+        self._cdha_large_file_threshold_bytes = max(
+            1, int(cdha_large_file_threshold_bytes)
+        )
 
     async def schedule_once(self, *, limit: int = 100) -> int:
         scheduled = 0
@@ -70,8 +79,32 @@ class ScheduleWorkflowJobsUseCase:
         job = self._repository.get_job(job_id)
         if job is None:
             raise LookupError(f"Job not found: {job_id}")
+        evidence = repository_facebook_submission_evidence(
+            self._repository, job_id, job.data
+        )
+        if evidence.committed:
+            enforce = getattr(
+                self._repository, "enforce_facebook_submission_guard", None
+            )
+            if callable(enforce):
+                job = enforce(job_id)
+            if (
+                job.status
+                is JobStatus.POSSIBLE_DUPLICATE_REQUIRES_MANUAL_REVIEW
+            ):
+                return False
         if job.status not in self._eligible:
             raise ValueError(f"Job cannot advance from {job.status.value}")
+        if (
+            job.status is JobStatus.RETRY_PENDING
+            and large_upload_gate_required(
+                job, self._cdha_large_file_threshold_bytes
+            )
+            and not large_upload_is_authorized(
+                job, self._cdha_large_file_threshold_bytes
+            )
+        ):
+            return False
         work_item_id = f"{job.job_id}:{job.status.value}"
         if job.status is JobStatus.RETRY_PENDING:
             work_item_id = (

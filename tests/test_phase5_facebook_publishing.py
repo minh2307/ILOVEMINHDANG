@@ -887,7 +887,7 @@ def test_reconciliation_exhaustion_is_controlled_and_keeps_submit_evidence(tmp_p
     assert asyncio.run(use_case.execute(job_id)).success is False
 
     persisted = repo.get_job(job_id)
-    assert persisted.status is WorkflowStatus.FACEBOOK_PUBLISH_FAILED
+    assert persisted.status is WorkflowStatus.FACEBOOK_SUBMITTED_UNCONFIRMED_EXHAUSTED
     assert persisted.data["facebook_reconciliation_attempt"] == 2
     assert persisted.data["facebook_reconciliation_exhausted"] is True
     assert persisted.data["facebook_submission_status"] == "SUBMITTED_UNCONFIRMED"
@@ -1005,3 +1005,61 @@ def test_submitting_state_is_treated_as_possible_submit_for_duplicate_safety() -
     assert FacebookWebClient._publication_was_submitted(
         {"facebook_submission_status": "SUBMITTING"}
     )
+
+
+def test_reconciliation_detects_two_matching_posts_and_requires_manual_review(
+    tmp_path: Path,
+) -> None:
+    settings = make_settings(tmp_path)
+    repo = make_repo(settings)
+    job_id = approved_job(repo, job_id="two-matches")
+    repo.update_data(
+        job_id,
+        {
+            "facebook_target_url": "https://www.facebook.com/test.page",
+            "facebook_publish_settle_signals": {"composer_closed": True},
+        },
+    )
+
+    class TwoMatchClient(FacebookWebClient):
+        async def _find_direct_result_permalinks(
+            self, _page: Any, _before_ids: set[str]
+        ) -> list[dict[str, Any]]:
+            return []
+
+        async def _find_exact_new_posts(
+            self, *_args: Any, **_kwargs: Any
+        ) -> list[dict[str, Any]]:
+            return [
+                {
+                    "url": "https://www.facebook.com/test.page/posts/111",
+                    "post_id": "111",
+                    "text_match": True,
+                    "recent": True,
+                    "image_count": 2,
+                },
+                {
+                    "url": "https://www.facebook.com/test.page/posts/222",
+                    "post_id": "222",
+                    "text_match": True,
+                    "recent": True,
+                    "image_count": 2,
+                },
+            ]
+
+    client = TwoMatchClient(settings, repo, FakeChrome(), resolver=FakeResolver())
+    result, signals = asyncio.run(
+        client._verify_publication(
+            FakePage(),
+            job_id,
+            "Nội dung",
+            [tmp_path / "one.png", tmp_path / "two.png"],
+            datetime.now(UTC),
+            set(),
+        )
+    )
+
+    assert result.success is False
+    assert result.status == "POSSIBLE_DUPLICATE_REQUIRES_MANUAL_REVIEW"
+    assert signals["matching_post_count"] == 2
+    assert len(result.diagnostics["matching_permalinks"]) == 2

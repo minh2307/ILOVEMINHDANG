@@ -36,6 +36,8 @@ class Job:
     lease_expires_at: str | None = None
     last_heartbeat: str | None = None
     completed_at: str | None = None
+    publish_attempts: int = 0
+    reconciliation_attempts: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +58,8 @@ class Job:
             "lease_expires_at": self.lease_expires_at,
             "last_heartbeat": self.last_heartbeat,
             "completed_at": self.completed_at,
+            "publish_attempts": self.publish_attempts,
+            "reconciliation_attempts": self.reconciliation_attempts,
             "data": self.data,
             "created_at": self.created_at,
             "updated_at": self.updated_at,

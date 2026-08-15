@@ -4,7 +4,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -45,6 +47,11 @@ from app.errors import (
     SelectorNotFoundError,
 )
 from app.services.retry_service import RetryAttempt, RetryPolicy, retry_async
+from app.domain.policies.external_side_effect_policy import (
+    CDHACheckpoint,
+    LargeUploadApproval,
+    sha256_file,
+)
 
 
 SUPPORTED_VIDEO_EXTENSIONS = frozenset({".mp4", ".mkv", ".webm", ".mov"})
@@ -148,16 +155,17 @@ class CDHAWebClient:
                 job_id, {"cdha_submission_fingerprint": fingerprint}
             )
             view_url = self.existing_analysis_url(job)
+            existing_result_resume = bool(
+                view_url
+                and (
+                    job.data.get("cdha_result_json_path")
+                    or job.data.get("cdha_result")
+                    or job.data.get("cdha_external_analysis_id")
+                )
+            )
             if not view_url:
-                submission_state = str(
-                    job.data.get("cdha_submission_state") or ""
-                ).upper()
-                if submission_state in {
-                    "SUBMITTING",
-                    "UPLOADED",
-                    "SUBMITTED",
-                    "UNCERTAIN",
-                }:
+                checkpoint = CDHACheckpoint.from_data(job.data)
+                if checkpoint.reconciliation_only:
                     raise CDHAUploadError(
                         "A prior CDHA submission may already exist; reconcile it "
                         "before any resubmission",
@@ -168,7 +176,7 @@ class CDHAWebClient:
                         operation="reconcile_submission",
                         job_id=job_id,
                         details={
-                            "current_cdha_state": "UPLOAD_IN_PROGRESS",
+                            "current_cdha_state": checkpoint.value,
                             "submission_fingerprint": fingerprint,
                         },
                     )
@@ -180,13 +188,18 @@ class CDHAWebClient:
                 )
                 self.logger.info("Uploading local video file via CDHA iframe", extra={"job_id": job_id})
                 
-                await self._prepare_video_upload(
-                    page,
-                    video,
-                    job_id=job_id,
-                    diagnostics_dir=diagnostics_dir,
-                    submission_fingerprint=fingerprint,
-                )
+                if checkpoint is CDHACheckpoint.UPLOAD_NOT_STARTED:
+                    await self._prepare_video_upload(
+                        page,
+                        video,
+                        job_id=job_id,
+                        diagnostics_dir=diagnostics_dir,
+                        submission_fingerprint=fingerprint,
+                    )
+                elif checkpoint is CDHACheckpoint.UPLOAD_CONFIRMED:
+                    await self._wait_for_stable_upload_completion(
+                        page, video, job_id=job_id
+                    )
 
                 factors_input = await self.resolver.find_first(
                     page,
@@ -198,14 +211,9 @@ class CDHAWebClient:
                 await factors_input.fill(factors)
                 if await self._input_text(factors_input) != factors:
                     raise RuntimeError("CDHA Clinical Factors text verification failed")
-                analyze_button = await self.resolver.find_first(
-                    page,
-                    "cdha.analyze_button",
-                    timeout_ms=10_000,
-                    diagnostics_dir=diagnostics_dir,
-                    context=f"job_id={job_id} state=CDHA_UPLOADING action=start_analysis",
+                await self._request_analysis_once(
+                    page, job_id=job_id, diagnostics_dir=diagnostics_dir
                 )
-                await analyze_button.click()
                 self.repository.transition(
                     job_id,
                     WorkflowStatus.CDHA_ANALYZING,
@@ -223,6 +231,7 @@ class CDHAWebClient:
                         job_id,
                         {
                             "cdha_submission_state": "SUBMITTED",
+                            "cdha_checkpoint": CDHACheckpoint.ANALYSIS_CONFIRMED.value,
                             "cdha_external_analysis_id": external_id,
                             "cdha_view_url": analysis_url,
                             "cdha_submitted_at": datetime.now(UTC).isoformat(),
@@ -279,21 +288,6 @@ class CDHAWebClient:
                 warnings=extracted.warnings,
             )
             self._write_json_atomic(json_path, extracted.to_dict())
-            # --- Auto-share logic ---
-            try:
-                share_btn = await self.resolver.find_first(
-                    page, "cdha.share_button", timeout_ms=3_000
-                )
-                await share_btn.click()
-                
-                consult_btn = await self.resolver.find_first(
-                    page, "cdha.consultation", timeout_ms=3_000
-                )
-                await consult_btn.click()
-                self.logger.info("Successfully clicked Share -> Consultation")
-            except Exception as e:
-                self.logger.warning(f"Could not click Share -> Consultation: {e}")
-            
             self.repository.transition(
                 job_id,
                 WorkflowStatus.CDHA_ANALYZED,
@@ -305,19 +299,49 @@ class CDHAWebClient:
                     "cdha_result_html_path": str(html_path) if html_path else None,
                     "cdha_diagnostic_screenshot_path": str(diagnostic_path),
                     "cdha_view_url": original_view_url,
+                    "cdha_checkpoint": CDHACheckpoint.ANALYSIS_CONFIRMED.value,
                     "clinical_factors_path": str(masked_factors_path),
                     "clinical_factors": factors,
                     "cdha_completed_at": completed_at,
                 },
             )
 
+            # Share is a secondary action. The irreversible analysis checkpoint
+            # above is persisted first, and this action is never retried by the
+            # screenshot recovery loop.
+            try:
+                current_job = self.repository.get_job(job_id)
+                consultation_state = str(
+                    (current_job.data if current_job else {}).get(
+                        "cdha_consultation_state"
+                    )
+                    or ""
+                ).upper()
+                if existing_result_resume or consultation_state in {
+                    "REQUESTED",
+                    "COMPLETED",
+                }:
+                    self.logger.info(
+                        "Skipping previously attempted Share -> Consultation",
+                        extra={"job_id": job_id},
+                    )
+                else:
+                    page = await self._share_consultation_once(
+                        page, result_url=original_view_url, job_id=job_id
+                    )
+            except Exception as exc:
+                self.logger.warning(
+                    "Could not complete Share -> Consultation",
+                    extra={"job_id": job_id, "error_type": type(exc).__name__},
+                )
+
             self.repository.transition(
                 job_id,
                 WorkflowStatus.SCREENSHOTS_CAPTURING,
                 details={"action": "capture"},
             )
-            screenshot_paths, screenshot_warnings = await self.screenshots.capture_required(
-                page, job_dir
+            screenshot_paths, screenshot_warnings = await self._capture_result_screenshots(
+                page, job_dir, result_url=original_view_url
             )
             all_warnings = [*extracted.warnings, *screenshot_warnings]
             final_result = CDHAAnalysisResult(
@@ -455,8 +479,16 @@ class CDHAWebClient:
                         )
                     if html:
                         failure_patch["cdha_failure_html_path"] = str(html)
+                failure_status = (
+                    WorkflowStatus.SCREENSHOTS_FAILED
+                    if current.status is WorkflowStatus.SCREENSHOTS_CAPTURING
+                    else WorkflowStatus.CDHA_FAILED
+                )
                 self.repository.transition(
-                    job_id, WorkflowStatus.CDHA_FAILED, details=details, data_patch=failure_patch
+                    job_id,
+                    failure_status,
+                    details=details,
+                    data_patch=failure_patch,
                 )
             completed_at = datetime.now(UTC).isoformat()
             self.logger.error(
@@ -481,6 +513,83 @@ class CDHAWebClient:
                                 "error_type": type(release_error).__name__,
                             },
                         )
+
+    async def _share_consultation_once(
+        self, page: Any, *, result_url: str, job_id: str
+    ) -> Any:
+        share = await self.resolver.find_first(
+            page, "cdha.share_button", timeout_ms=3_000
+        )
+        await share.click(
+            timeout=int(self.settings.browser_action_timeout_seconds * 1000)
+        )
+        # Resolve Consultation only after Share; Share can replace the menu DOM.
+        consultation = await self.resolver.find_first(
+            page, "cdha.consultation", timeout_ms=3_000
+        )
+        self.repository.update_data(
+            job_id,
+            {
+                "cdha_consultation_state": "REQUESTED",
+                "cdha_consultation_requested_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        await consultation.click(
+            timeout=int(self.settings.browser_action_timeout_seconds * 1000)
+        )
+        try:
+            await page.wait_for_load_state(
+                "domcontentloaded",
+                timeout=int(self.settings.browser_navigation_timeout_seconds * 1000),
+            )
+        except Exception:
+            # An in-page route may not emit a new load event. The URL/result UI
+            # check below is the business readiness signal.
+            pass
+        if result_url and str(getattr(page, "url", "")) != result_url:
+            await page.goto(
+                result_url,
+                wait_until="domcontentloaded",
+                timeout=int(self.settings.browser_navigation_timeout_seconds * 1000),
+            )
+        await self.resolver.find_first(
+            page,
+            "cdha.result_container",
+            timeout_ms=int(self.settings.browser_action_timeout_seconds * 1000),
+        )
+        self.repository.update_data(
+            job_id,
+            {
+                "cdha_consultation_state": "COMPLETED",
+                "cdha_consultation_completed_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        self.logger.info("Completed Share -> Consultation", extra={"result_url": result_url})
+        return page
+
+    async def _capture_result_screenshots(
+        self, page: Any, job_dir: Path, *, result_url: str
+    ) -> tuple[list[Path], list[str]]:
+        deadline = time.monotonic() + self.settings.browser_navigation_timeout_seconds
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                await page.wait_for_load_state(
+                    "domcontentloaded",
+                    timeout=int(self.settings.browser_navigation_timeout_seconds * 1000),
+                )
+                return await self.screenshots.capture_required(page, job_dir)
+            except Exception:
+                if attempt >= 2 or time.monotonic() >= deadline:
+                    raise
+                # Reacquire only the result page and screenshot locators. Never
+                # repeat Share, upload, or Analyze from this recovery path.
+                await page.goto(
+                    result_url,
+                    wait_until="domcontentloaded",
+                    timeout=max(1, int((deadline - time.monotonic()) * 1000)),
+                )
 
     async def is_authenticated(self, page: Any) -> bool:
         return (
@@ -750,7 +859,146 @@ class CDHAWebClient:
             operation="wait_for_upload_acknowledgement",
         )
 
-    async def _upload_video_file(self, page: Any, file_input: Any, video: Path) -> None:
+    def _validate_video_metadata(
+        self, job_id: str, video: Path
+    ) -> tuple[int, str]:
+        job = self.repository.get_job(job_id)
+        if job is None:
+            raise LookupError(f"Job not found: {job_id}")
+        resolved = self.validate_video_path(video)
+        if not resolved.is_file():
+            raise CDHAUploadError(
+                "CDHA upload path is not a regular file",
+                retryable=False,
+                manual_action_required=True,
+                phase="CDHA_UPLOADING",
+                operation="validate_video_metadata",
+                job_id=job_id,
+            )
+        size = resolved.stat().st_size
+        expected_size = int(job.data.get("video_size_bytes") or 0)
+        expected_sha = str(job.data.get("checksum_sha256") or "").lower()
+        actual_sha = sha256_file(resolved)
+        if size != expected_size or not expected_sha or actual_sha != expected_sha:
+            raise CDHAUploadError(
+                "Local video size or SHA-256 does not match persisted metadata",
+                retryable=False,
+                manual_action_required=True,
+                phase="CDHA_UPLOADING",
+                operation="validate_video_metadata",
+                job_id=job_id,
+                details={
+                    "expected_size_bytes": expected_size,
+                    "actual_size_bytes": size,
+                    "expected_sha256_prefix": expected_sha[:12],
+                    "actual_sha256_prefix": actual_sha[:12],
+                },
+            )
+        return size, actual_sha
+
+    @staticmethod
+    def _find_cdp_marked_backend_node(
+        node: dict[str, Any], marker: str
+    ) -> int | None:
+        attributes = list(node.get("attributes") or [])
+        pairs = dict(zip(attributes[::2], attributes[1::2], strict=False))
+        if pairs.get("data-cdha-upload-token") == marker:
+            backend_id = node.get("backendNodeId")
+            return int(backend_id) if backend_id is not None else None
+        nested: list[dict[str, Any]] = list(node.get("children") or [])
+        content_document = node.get("contentDocument")
+        if isinstance(content_document, dict):
+            nested.append(content_document)
+        nested.extend(node.get("shadowRoots") or [])
+        for child in nested:
+            found = CDHAWebClient._find_cdp_marked_backend_node(child, marker)
+            if found is not None:
+                return found
+        return None
+
+    async def _set_large_file_input_via_cdp(
+        self, page: Any, input_locator: Any, file_path: Path
+    ) -> None:
+        host = str(self.settings.browser_cdp_host or "").strip().casefold()
+        if host not in {"127.0.0.1", "localhost", "::1"}:
+            raise CDHAUploadError(
+                "Large-file direct-path upload requires Chrome on the same host",
+                retryable=False,
+                manual_action_required=True,
+                phase="CDHA_UPLOADING",
+                operation="set_large_file_input_via_cdp",
+            )
+        resolved = Path(file_path).resolve(strict=True)
+        if not resolved.is_file() or not os.access(resolved, os.R_OK):
+            raise CDHAUploadError(
+                "Large-file direct path is not a regular file",
+                retryable=False,
+                manual_action_required=True,
+                phase="CDHA_UPLOADING",
+                operation="set_large_file_input_via_cdp",
+            )
+        context = getattr(page, "context", None)
+        if callable(context):
+            context = context()
+        if context is None or not hasattr(context, "new_cdp_session"):
+            raise CDHAUploadError(
+                "Existing browser context cannot create a CDP session",
+                retryable=False,
+                manual_action_required=True,
+                phase="CDHA_UPLOADING",
+                operation="set_large_file_input_via_cdp",
+            )
+        marker = uuid.uuid4().hex
+        session: Any = None
+        try:
+            await input_locator.evaluate(
+                "(element, token) => element.setAttribute('data-cdha-upload-token', token)",
+                marker,
+            )
+            cdp_target = page
+            if hasattr(input_locator, "element_handle"):
+                handle = await input_locator.element_handle()
+                if handle is not None and hasattr(handle, "owner_frame"):
+                    owner_frame = await handle.owner_frame()
+                    if owner_frame is not None:
+                        cdp_target = owner_frame
+            session = await context.new_cdp_session(cdp_target)
+            document = await session.send(
+                "DOM.getDocument", {"depth": -1, "pierce": True}
+            )
+            backend_node_id = self._find_cdp_marked_backend_node(
+                document["root"], marker
+            )
+            if backend_node_id is None:
+                raise CDHAUploadError(
+                    "CDP could not resolve the marked file input node",
+                    retryable=False,
+                    manual_action_required=True,
+                    phase="CDHA_UPLOADING",
+                    operation="set_large_file_input_via_cdp",
+                )
+            await session.send(
+                "DOM.setFileInputFiles",
+                {"files": [str(resolved)], "backendNodeId": backend_node_id},
+            )
+        finally:
+            try:
+                await input_locator.evaluate(
+                    "element => element.removeAttribute('data-cdha-upload-token')"
+                )
+            except Exception:
+                pass
+            if session is not None and hasattr(session, "detach"):
+                await session.detach()
+
+    async def _upload_video_file(
+        self,
+        page: Any,
+        file_input: Any,
+        video: Path,
+        *,
+        job_id: str | None = None,
+    ) -> None:
         state = await self._reconcile_existing_upload(page, video)
         if state == "complete":
             return
@@ -764,9 +1012,208 @@ class CDHAWebClient:
                 operation="upload_video_file",
                 details={"upload_state": state},
             )
-        await file_input.set_input_files(str(video))
+        resolved = Path(video).resolve()
+        size = resolved.stat().st_size
+        digest = ""
+        if job_id:
+            size, digest = self._validate_video_metadata(job_id, resolved)
+            self.repository.update_data(
+                job_id,
+                {
+                    "cdha_checkpoint": CDHACheckpoint.UPLOAD_IN_PROGRESS.value,
+                    "cdha_submission_state": "SUBMITTING",
+                },
+            )
+        threshold = int(self.settings.cdha_large_file_threshold_mb * 1024 * 1024)
+        if size > threshold:
+            if not job_id:
+                raise CDHAUploadError(
+                    "Large CDHA upload requires a durable job ID",
+                    retryable=False,
+                    manual_action_required=True,
+                    phase="CDHA_UPLOADING",
+                    operation="upload_video_file",
+                )
+            job = self.repository.get_job(job_id)
+            approval = (job.data if job else {}).get(LargeUploadApproval.DATA_KEY)
+            if not job or not LargeUploadApproval.matches(
+                job.data,
+                job_id=job_id,
+                sha256=digest,
+                size_bytes=size,
+            ):
+                raise CDHAUploadError(
+                    "Large CDHA upload lacks a matching one-shot approval",
+                    error_code="CDHA_LARGE_UPLOAD_APPROVAL_REQUIRED",
+                    retryable=False,
+                    manual_action_required=True,
+                    phase="CDHA_UPLOADING",
+                    operation="upload_video_file",
+                    job_id=job_id,
+                )
+            self.repository.update_data(
+                job_id,
+                {
+                    LargeUploadApproval.DATA_KEY: LargeUploadApproval.consumed_data(
+                        approval
+                    )
+                },
+            )
+            await self._set_large_file_input_via_cdp(page, file_input, resolved)
+            self.logger.info(
+                "Attached large CDHA upload through local direct-path CDP",
+                extra={
+                    "job_id": job_id,
+                    "size_bytes": size,
+                    "sha256_prefix": digest[:12],
+                    "strategy": "DOM.setFileInputFiles",
+                    "checkpoint": CDHACheckpoint.UPLOAD_IN_PROGRESS.value,
+                },
+            )
+        else:
+            await file_input.set_input_files(str(resolved))
         # We no longer wait for upload acknowledgement here because CDHA uses a 2-step process
         # where the file is processed locally first, then uploaded when we click btnComplete.
+
+    async def _request_analysis_once(
+        self,
+        page: Any,
+        *,
+        job_id: str,
+        diagnostics_dir: Path | None = None,
+    ) -> None:
+        job = self.repository.get_job(job_id)
+        if job is None:
+            raise LookupError(f"Job not found: {job_id}")
+        checkpoint = CDHACheckpoint.from_data(job.data)
+        if checkpoint is not CDHACheckpoint.UPLOAD_CONFIRMED:
+            message = (
+                "Analyze requires durable UPLOAD_CONFIRMED"
+                if checkpoint is CDHACheckpoint.UPLOAD_IN_PROGRESS
+                else "Analyze was already requested; reconciliation is required"
+            )
+            raise CDHAUploadError(
+                message,
+                error_code="CDHA_SUBMISSION_UNCERTAIN",
+                retryable=False,
+                manual_action_required=True,
+                phase="CDHA_ANALYZING",
+                operation="request_analysis_once",
+                job_id=job_id,
+                details={"current_cdha_state": checkpoint.value},
+            )
+        button = await self.resolver.find_first(
+            page,
+            "cdha.analyze_button",
+            timeout_ms=int(self.settings.browser_action_timeout_seconds * 1000),
+            diagnostics_dir=diagnostics_dir,
+            context=f"job_id={job_id} checkpoint={checkpoint.value} action=start_analysis",
+        )
+        if hasattr(button, "is_visible") and not await button.is_visible():
+            raise CDHAUploadError("Analyze is not visible", phase="CDHA_ANALYZING")
+        if hasattr(button, "is_enabled") and not await button.is_enabled():
+            raise CDHAUploadError("Analyze is not enabled", phase="CDHA_ANALYZING")
+        await button.click(
+            trial=True,
+            timeout=int(self.settings.browser_action_timeout_seconds * 1000),
+        )
+        self.repository.update_data(
+            job_id,
+            {
+                "cdha_checkpoint": CDHACheckpoint.ANALYSIS_REQUESTED.value,
+                "cdha_analysis_requested_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        await button.click(
+            timeout=int(self.settings.browser_action_timeout_seconds * 1000)
+        )
+
+    async def _upload_stability_signals(
+        self, page: Any, video: Path
+    ) -> dict[str, bool]:
+        view_url = await self._view_url_value(page)
+        frame: Any = None
+        try:
+            frame = await self._resolve_upload_frame(
+                page, timeout_ms=500, visible=False
+            )
+        except Exception:
+            pass
+        upload_complete = False
+        upload_in_progress = False
+        filename_matches = False
+        if frame is not None:
+            upload_complete = await self.resolver.exists(
+                frame, "cdha.upload_complete", timeout_ms=300
+            )
+            upload_in_progress = await self.resolver.exists(
+                frame, "cdha.upload_started", timeout_ms=300
+            )
+            filename = await self._optional_text(frame, "cdha.upload_filename")
+            filename_matches = bool(
+                filename and video.name.casefold() in filename.casefold()
+            )
+        analyze_actionable = False
+        try:
+            analyze = await self.resolver.find_first(
+                page, "cdha.analyze_button", timeout_ms=500
+            )
+            visible = not hasattr(analyze, "is_visible") or await analyze.is_visible()
+            enabled = not hasattr(analyze, "is_enabled") or await analyze.is_enabled()
+            if visible and enabled:
+                await analyze.click(trial=True, timeout=500)
+                analyze_actionable = True
+        except Exception:
+            analyze_actionable = False
+        return {
+            "completion": bool(view_url or upload_complete),
+            "file_identity": bool(view_url or filename_matches),
+            "progress_absent": not upload_in_progress,
+            "analyze_actionable": analyze_actionable,
+        }
+
+    async def _wait_for_stable_upload_completion(
+        self, page: Any, video: Path, *, job_id: str
+    ) -> None:
+        deadline = time.monotonic() + self.settings.cdha_upload_timeout_seconds
+        stable_observations = 0
+        final_signals: dict[str, bool] = {}
+        while time.monotonic() < deadline:
+            final_signals = await self._upload_stability_signals(page, video)
+            if all(final_signals.values()):
+                stable_observations += 1
+                if stable_observations >= 2:
+                    self.repository.update_data(
+                        job_id,
+                        {
+                            "cdha_checkpoint": CDHACheckpoint.UPLOAD_CONFIRMED.value,
+                            "cdha_submission_state": "UPLOADED",
+                            "cdha_upload_completed_at": datetime.now(UTC).isoformat(),
+                            "cdha_upload_confirmation_signals": final_signals,
+                        },
+                    )
+                    return
+            else:
+                stable_observations = 0
+            await asyncio.sleep(
+                min(
+                    max(0.001, float(self.settings.cdha_poll_interval_seconds)),
+                    max(0.0, deadline - time.monotonic()),
+                )
+            )
+        raise CDHAUploadError(
+            "CDHA upload was submitted but stable multi-signal completion was not confirmed",
+            error_code="CDHA_SUBMISSION_UNCERTAIN",
+            retryable=False,
+            manual_action_required=True,
+            phase="CDHA_UPLOADING",
+            operation="wait_for_stable_upload_completion",
+            job_id=job_id,
+            details={
+                "current_cdha_state": CDHACheckpoint.UPLOAD_IN_PROGRESS.value,
+                "completion_signals": final_signals,
+            },
+        )
 
     async def _completion_control_snapshot(
         self, page: Any, frame: Any
@@ -934,11 +1381,16 @@ class CDHAWebClient:
         file_input = await self._ensure_upload_dialog_open(
             page, job_id=job_id, diagnostics_dir=diagnostics_dir
         )
-        await self._upload_video_file(page, file_input, video)
+        await self._upload_video_file(
+            page, file_input, video, job_id=job_id
+        )
         await self._complete_upload(
             page,
             job_id=job_id,
             submission_fingerprint=submission_fingerprint,
+        )
+        await self._wait_for_stable_upload_completion(
+            page, video, job_id=job_id
         )
 
     async def _wait_for_upload(self, page: Any) -> str:

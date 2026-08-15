@@ -17,6 +17,9 @@ from app.models.results import (
 from app.models.workflow import WorkflowStatus
 from app.repositories.job_repository import JobRepository
 from app.services.post_content_service import PostContentService
+from app.domain.policies.external_side_effect_policy import (
+    repository_facebook_submission_evidence,
+)
 
 
 class FacebookPublisherAdapter:
@@ -108,6 +111,15 @@ class FacebookPublisherAdapter:
         )
 
     async def prepare(self, *, job_id: str) -> FacebookPostPreparationResult:
+        existing = self._job(job_id)
+        if repository_facebook_submission_evidence(
+            self.repository, job_id, existing.data
+        ).committed:
+            return FacebookPostPreparationResult(
+                False,
+                job_id,
+                error="Facebook submission checkpoint already exists; prepare/publish is permanently blocked",
+            )
         validation = self.validate_job(job_id)
         if not validation.valid:
             error_msg = "; ".join(validation.errors)
@@ -162,6 +174,16 @@ class FacebookPublisherAdapter:
         return result
 
     async def publish(self, *, job_id: str) -> FacebookPublishResult:
+        job = self._job(job_id)
+        if repository_facebook_submission_evidence(
+            self.repository, job_id, job.data
+        ).committed:
+            return FacebookPublishResult(
+                False,
+                "RECONCILIATION_REQUIRED",
+                job_id=job_id,
+                error="Facebook submission checkpoint already exists; a second Publish is blocked",
+            )
         return await self.client.publish_prepared_post(job_id=job_id)
 
     async def reconcile_publication(self, *, job_id: str) -> FacebookPublishResult:

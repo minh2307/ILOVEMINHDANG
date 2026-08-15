@@ -102,6 +102,7 @@ class Settings:
     cdha_result_timeout_seconds: float
     cdha_poll_interval_seconds: int
     cdha_result_stability_seconds: int
+    cdha_large_file_threshold_mb: float
     clinical_factors_max_chars: int
     clinical_factors_comment_max_chars: int
     clinical_factors_max_comments: int
@@ -267,6 +268,9 @@ class Settings:
             ),
             cdha_poll_interval_seconds=_int_env("CDHA_POLL_INTERVAL_SECONDS", 3),
             cdha_result_stability_seconds=_int_env("CDHA_RESULT_STABILITY_SECONDS", 5),
+            cdha_large_file_threshold_mb=_float_env(
+                "CDHA_LARGE_FILE_THRESHOLD_MB", 50, 0.001
+            ),
             clinical_factors_max_chars=_int_env(
                 "MAX_CLINICAL_FACTORS_CHARACTERS",
                 _int_env("CLINICAL_FACTORS_MAX_CHARS", 5000, 500),

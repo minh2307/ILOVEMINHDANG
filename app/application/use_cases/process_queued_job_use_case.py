@@ -7,6 +7,9 @@ from app.domain.enums.job_status import JobStatus
 from app.domain.models.facebook_job import FacebookJob
 from app.domain.models.job_result import JobResult
 from app.errors import FacebookReconciliationPendingError
+from app.domain.policies.external_side_effect_policy import (
+    repository_facebook_submission_evidence,
+)
 
 
 class ProcessQueuedJobUseCase:
@@ -28,6 +31,28 @@ class ProcessQueuedJobUseCase:
             return JobResult.failure_result(
                 work_item.job_id, "PROCESS_WORKFLOW payload requires workflow_job_id"
             )
+        if self._repository is not None:
+            persisted = self._repository.get_job(workflow_job_id)
+            if persisted is not None:
+                evidence = repository_facebook_submission_evidence(
+                    self._repository, workflow_job_id, persisted.data
+                )
+                scheduled_from = str(
+                    work_item.payload.get("scheduled_from_status") or ""
+                )
+                if evidence.committed and scheduled_from in {
+                    JobStatus.APPROVED.value,
+                    JobStatus.FACEBOOK_PREPARING.value,
+                    JobStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW.value,
+                    JobStatus.RETRY_PENDING.value,
+                }:
+                    enforce = getattr(
+                        self._repository,
+                        "enforce_facebook_submission_guard",
+                        None,
+                    )
+                    if callable(enforce):
+                        enforce(workflow_job_id)
         result = await self._process_job.execute(
             workflow_job_id,
             allow_facebook_publish=bool(work_item.payload.get("confirm_facebook_publish")),
@@ -36,11 +61,9 @@ class ProcessQueuedJobUseCase:
             return result
         persisted = self._repository.get_job(workflow_job_id)
         if persisted is not None:
-            submitted = str(
-                persisted.data.get("facebook_publication_state") or ""
-            ) == "SUBMITTED_UNCONFIRMED" or str(
-                persisted.data.get("facebook_submission_status") or ""
-            ) in {"SUBMITTING", "SUBMITTED_UNCONFIRMED", "PUBLICATION_UNCERTAIN"}
+            submitted = repository_facebook_submission_evidence(
+                self._repository, workflow_job_id, persisted.data
+            ).committed
             if submitted and persisted.status in {
                 JobStatus.FACEBOOK_PUBLISH_UNCERTAIN,
                 JobStatus.PUBLISH_RECONCILIATION_REQUIRED,

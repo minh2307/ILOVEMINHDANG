@@ -12,6 +12,7 @@ from app.application.use_cases.process_job_use_case import ProcessJobUseCase
 from app.application.use_cases.process_queued_job_use_case import ProcessQueuedJobUseCase
 from app.application.use_cases.reconcile_publish_use_case import ReconcilePublishUseCase
 from app.application.use_cases.resume_job_use_case import ResumeJobUseCase
+from app.application.use_cases.resolve_publication_decision_use_case import ResolvePublicationDecisionUseCase
 from app.application.use_cases.review_job_use_case import ReviewJobUseCase
 from app.application.use_cases.create_job_use_case import CreateJobUseCase
 from app.application.use_cases.retry_job_use_case import RetryJobUseCase
@@ -28,6 +29,11 @@ from app.infrastructure.workflow.verified_workflow_stage_adapter import (
 )
 from app.infrastructure.persistence.sqlite_job_repository import JobRepository
 from app.services.review_service import ReviewService
+from app.domain.policies.external_side_effect_policy import (
+    large_upload_gate_required,
+    large_upload_is_authorized,
+    repository_facebook_submission_evidence,
+)
 from app.workflows.cdha_pipeline import VerifiedWorkflowStages
 from workers.facebook_browser_worker import FacebookBrowserWorker
 
@@ -58,7 +64,40 @@ class DependencyContainer:
         # database file while retaining separate tables and event histories.
         self.job_repository = JobRepository(self.settings.database_path)
         self.job_repository.initialize()
-        self.job_queue = SQLiteJobQueue(str(self.settings.database_path))
+        large_threshold_bytes = int(
+            self.settings.cdha_large_file_threshold_mb * 1024 * 1024
+        )
+
+        def queue_claim_is_eligible(payload) -> bool:
+            workflow_job_id = str(payload.get("workflow_job_id") or "").strip()
+            job = self.job_repository.get_job(workflow_job_id)
+            if job is None:
+                return True
+            evidence = repository_facebook_submission_evidence(
+                self.job_repository, workflow_job_id, job.data
+            )
+            scheduled_from = str(payload.get("scheduled_from_status") or "")
+            if evidence.possible_duplicate:
+                return False
+            if evidence.committed and scheduled_from in {
+                "APPROVED",
+                "FACEBOOK_PREPARING",
+                "FACEBOOK_WAITING_FOR_MANUAL_REVIEW",
+                "RETRY_PENDING",
+                "RETRYABLE",
+                "PENDING",
+            }:
+                return False
+            return not (
+                job.status.value == "RETRY_PENDING"
+                and large_upload_gate_required(job, large_threshold_bytes)
+                and not large_upload_is_authorized(job, large_threshold_bytes)
+            )
+
+        self.job_queue = SQLiteJobQueue(
+            str(self.settings.database_path),
+            claim_eligibility=queue_claim_is_eligible,
+        )
 
         self.pipeline = VerifiedWorkflowStages(
             self.settings,
@@ -85,6 +124,7 @@ class DependencyContainer:
             max_facebook_reconciliation_attempts=(
                 self.settings.max_facebook_reconciliation_retries
             ),
+            cdha_large_file_threshold_bytes=large_threshold_bytes,
         )
         self.create_job = CreateJobUseCase(self.job_repository, self.scheduler)
         self.retry_job = RetryJobUseCase(self.job_repository, self.scheduler)
@@ -94,7 +134,14 @@ class DependencyContainer:
             self.retry_job,
         )
         self.cancel_job = CancelJobUseCase(self.job_repository)
-        self.resume_job = ResumeJobUseCase(self.job_repository, self.scheduler)
+        self.resume_job = ResumeJobUseCase(
+            self.job_repository,
+            self.scheduler,
+            cdha_large_file_threshold_bytes=large_threshold_bytes,
+        )
+        self.resolve_publication = ResolvePublicationDecisionUseCase(
+            self.job_repository
+        )
         self.confirm_publish = ConfirmPublishUseCase(
             self.job_repository, self.scheduler
         )

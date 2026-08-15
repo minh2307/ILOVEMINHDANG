@@ -79,3 +79,5 @@ List_Facebook.txt
 docs/
 
 ollama/
+
+*.txt

@@ -19,6 +19,10 @@ from app.legacy_cli import resolve_legacy_command
 from app.models.workflow import WorkflowStatus
 from app.repositories.job_repository import JobRepository
 from app.services.review_service import ReviewService
+from app.application.use_cases.resume_job_use_case import ResumeJobUseCase
+from app.application.use_cases.schedule_workflow_jobs_use_case import (
+    ScheduleWorkflowJobsUseCase,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -95,6 +99,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     resume = commands.add_parser("resume", help="Queue one resumable workflow job.")
     resume.add_argument("--job-id", required=True)
+    resume.add_argument("--large-upload-job-id")
+    resume.add_argument("--large-upload-sha256")
+    resume.add_argument("--large-upload-size-bytes", type=int)
+    resume.add_argument("--large-upload-confirmation")
 
     retry = commands.add_parser("retry", help="Move a failed job to RETRY_PENDING and queue it.")
     retry.add_argument("--job-id", required=True)
@@ -119,6 +127,19 @@ def build_parser() -> argparse.ArgumentParser:
         "publication-status", help="Dump current Facebook publication attempt state."
     )
     pub_status.add_argument("--job-id", required=True)
+
+    resolve_publication = commands.add_parser(
+        "resolve-publication",
+        help="Record an audited decision for an exhausted unverified publication.",
+    )
+    resolve_publication.add_argument("--job-id", required=True)
+    resolve_publication.add_argument(
+        "--decision",
+        required=True,
+        choices=("attach-permalink", "mark-unverified", "confirm-duplicate"),
+    )
+    resolve_publication.add_argument("--permalink")
+    resolve_publication.add_argument("--confirmation", required=True)
 
     worker = commands.add_parser("worker", help="Run the single official durable worker.")
     worker.add_argument("--once", action="store_true", help="Process at most one queue item.")
@@ -379,8 +400,48 @@ def _run_official_command(
         return 0 if result.success else 1
 
     if args.command == "resume":
-        container = DependencyContainer(settings)
-        result = asyncio.run(container.resume_job.execute(args.job_id))
+        if args.dry_run:
+            class _DryRunQueue:
+                async def enqueue(self, _item):
+                    return False
+
+            repository = JobRepository(settings.database_path)
+            scheduler = ScheduleWorkflowJobsUseCase(
+                repository,
+                _DryRunQueue(),
+                cdha_large_file_threshold_bytes=int(
+                    settings.cdha_large_file_threshold_mb * 1024 * 1024
+                ),
+            )
+            resume_use_case = ResumeJobUseCase(
+                repository,
+                scheduler,
+                cdha_large_file_threshold_bytes=int(
+                    settings.cdha_large_file_threshold_mb * 1024 * 1024
+                ),
+            )
+        else:
+            container = DependencyContainer(settings)
+            resume_use_case = container.resume_job
+        scoped_approval_requested = bool(
+            args.dry_run
+            or args.large_upload_job_id
+            or args.large_upload_sha256
+            or args.large_upload_size_bytes is not None
+            or args.large_upload_confirmation
+        )
+        if scoped_approval_requested:
+            resume_call = resume_use_case.execute(
+                args.job_id,
+                large_upload_job_id=args.large_upload_job_id,
+                large_upload_sha256=args.large_upload_sha256,
+                large_upload_size_bytes=args.large_upload_size_bytes,
+                confirmation=args.large_upload_confirmation,
+                dry_run=bool(args.dry_run),
+            )
+        else:
+            resume_call = resume_use_case.execute(args.job_id)
+        result = asyncio.run(resume_call)
         print(json.dumps({
             "success": result.success,
             "job_id": result.job_id,
@@ -468,7 +529,7 @@ def _run_official_command(
         attempt = None
         if hasattr(container.job_repository, "get_latest_publication_attempt"):
             attempt = container.job_repository.get_latest_publication_attempt(args.job_id)
-            
+
         print(json.dumps({
             "job_id": job.job_id,
             "status": job.status.value,
@@ -481,6 +542,26 @@ def _run_official_command(
             "latest_attempt": attempt
         }, ensure_ascii=False, indent=2))
         return 0
+
+    if args.command == "resolve-publication":
+        container = DependencyContainer(settings)
+        result = asyncio.run(
+            container.resolve_publication.execute(
+                args.job_id,
+                decision=args.decision,
+                permalink=args.permalink,
+                confirmation=args.confirmation,
+                requested_by="cli",
+            )
+        )
+        print(json.dumps({
+            "success": result.success,
+            "job_id": result.job_id,
+            "status": result.data.get("workflow_status"),
+            "decision": result.data.get("decision"),
+            "error": result.error,
+        }, ensure_ascii=False))
+        return 0 if result.success else 1
 
     if args.command == "worker":
         from app.config.facebook_browser import FacebookBrowserConfig

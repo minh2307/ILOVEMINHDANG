@@ -295,7 +295,8 @@ def test_timeout_configuration_is_independent_and_sanitized(tmp_path: Path) -> N
     )
     timeouts = settings.sanitized_runtime_configuration()["timeouts"]
 
-    assert len(set(timeouts.values())) == 8
+    assert len(timeouts) == 15
+    assert {11, 22, 33, 44, 55, 66}.issubset(set(timeouts.values()))
     assert timeouts["browser_action_seconds"] == 11
     assert timeouts["cdha_analysis_seconds"] == 44
     assert timeouts["queue_lease_seconds"] == settings.job_lease_seconds

@@ -39,6 +39,8 @@ _RESUME_REQUIRED = frozenset({
     WorkflowStatus.FACEBOOK_WAITING_FOR_MANUAL_REVIEW,
     WorkflowStatus.FACEBOOK_PUBLISH_UNCERTAIN,
     WorkflowStatus.FACEBOOK_PUBLISH_FAILED,
+    WorkflowStatus.FACEBOOK_SUBMITTED_UNCONFIRMED_EXHAUSTED,
+    WorkflowStatus.SCREENSHOTS_FAILED,
     WorkflowStatus.POST_URL_EXTRACTION_FAILED,
     WorkflowStatus.COMMENT_FAILED,
     WorkflowStatus.REJECTED,
@@ -227,9 +229,11 @@ class VerifiedWorkflowStages:
         if status is WorkflowStatus.FACEBOOK_PUBLISHED:
             return await self._step_permalink(job_id)
 
+        if status is WorkflowStatus.POST_URL_EXTRACTION_FAILED:
+            return await self._step_permalink(job_id)
+
         if status in {
             WorkflowStatus.POST_URL_EXTRACTED, WorkflowStatus.COMMENT_FAILED,
-            WorkflowStatus.POST_URL_EXTRACTION_FAILED,
         }:
             return await self._step_comment(job_id)
 

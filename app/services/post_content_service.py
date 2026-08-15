@@ -84,7 +84,7 @@ Nguồn video:
 {source_url.strip()}
 
 Nguồn phân tích:
-{summary.analysis_url}
+{summary.analysis_url}&ref=CD2ED52966
 
 {hashtags}"""
         self.validate_publish_ready(

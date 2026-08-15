@@ -6,6 +6,7 @@ from app.domain.enums.job_status import JobStatus
 from app.domain.enums.job_type import JobType
 from app.domain.models.job import Job
 from app.domain.models.job_event import JobEvent
+from app.domain.policies.external_side_effect_policy import FacebookSubmissionEvidence
 
 
 class JobRepositoryPort(Protocol):
@@ -60,6 +61,12 @@ class JobRepositoryPort(Protocol):
     ) -> JobEvent: ...
 
     def list_events(self, job_id: str) -> list[JobEvent]: ...
+
+    def get_facebook_submission_evidence(
+        self, job_id: str
+    ) -> FacebookSubmissionEvidence: ...
+
+    def enforce_facebook_submission_guard(self, job_id: str) -> Job: ...
 
 
 class LegacyDispatchRepositoryPort(Protocol):

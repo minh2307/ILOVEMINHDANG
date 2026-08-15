@@ -8,6 +8,9 @@ from app.application.use_cases.schedule_workflow_jobs_use_case import (
 )
 from app.domain.enums.job_status import JobStatus
 from app.domain.models.job_result import JobResult
+from app.domain.policies.external_side_effect_policy import (
+    repository_facebook_submission_evidence,
+)
 
 
 class RetryJobUseCase:
@@ -18,6 +21,7 @@ class RetryJobUseCase:
         JobStatus.GEMINI_FAILED: "ai",
         JobStatus.AI_FAILED: "ai",
         JobStatus.CDHA_FAILED: "cdha",
+        JobStatus.SCREENSHOTS_FAILED: "cdha_capture",
         JobStatus.FACEBOOK_PUBLISH_FAILED: "facebook_prepare",
         JobStatus.POST_URL_EXTRACTION_FAILED: "facebook_permalink",
         JobStatus.COMMENT_FAILED: "facebook_comment",
@@ -39,17 +43,23 @@ class RetryJobUseCase:
         job = self._repository.get_job(job_id)
         if job is None:
             return JobResult.failure_result(job_id, f"Job not found: {job_id}")
-        submitted = str(
-            job.data.get("facebook_publication_state") or ""
-        ) == "SUBMITTED_UNCONFIRMED" or str(
-            job.data.get("facebook_submission_status") or ""
-        ) in {"SUBMITTING", "SUBMITTED_UNCONFIRMED", "PUBLICATION_UNCERTAIN"}
-        if submitted and job.status in {
+        publish_retry_states = {
             JobStatus.FACEBOOK_PUBLISH_FAILED,
             JobStatus.FACEBOOK_PUBLISH_UNCERTAIN,
             JobStatus.PUBLISH_RECONCILIATION_REQUIRED,
-            JobStatus.RETRY_PENDING,
-        }:
+            JobStatus.FACEBOOK_SUBMITTED_UNCONFIRMED_EXHAUSTED,
+        }
+        retry_would_publish = (
+            job.status in publish_retry_states
+            or (
+                job.status is JobStatus.RETRY_PENDING
+                and str(job.data.get("retry_step") or "") == "facebook_prepare"
+            )
+        )
+        evidence = repository_facebook_submission_evidence(
+            self._repository, job_id, job.data
+        )
+        if evidence.committed and retry_would_publish:
             return JobResult.failure_result(
                 job_id,
                 "Facebook publication was already submitted; reconciliation is required and publishing retry is blocked",

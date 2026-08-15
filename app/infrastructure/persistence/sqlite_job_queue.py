@@ -6,7 +6,7 @@ import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from app.application.ports.job_queue_port import JobQueuePort
 from app.domain.enums.job_status import JobStatus, JobStatus as WorkflowStatus
@@ -18,8 +18,14 @@ class SQLiteJobQueue(JobQueuePort):
 
     INTERRUPTED_STATES = ("RUNNING", "ACQUIRING_BROWSER_LOCK", "WAITING_FOR_BROWSER_LOCK")
 
-    def __init__(self, db_path: str):
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        claim_eligibility: Callable[[dict[str, Any]], bool] | None = None,
+    ):
         self.db_path = str(db_path)
+        self._claim_eligibility = claim_eligibility
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._initialize_schema()
 
@@ -143,14 +149,19 @@ class SQLiteJobQueue(JobQueuePort):
         now = self._timestamp()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("""
+            rows = conn.execute("""
                 SELECT job_id, job_type, payload, status, attempt_count, max_attempts,
                        next_retry_at
                 FROM queue
                 WHERE status IN ('CREATED', 'PENDING', 'DOWNLOADREEL_RUNNING', 'FACEBOOK_PREPARING', 'RETRYABLE') AND next_retry_at <= ?
                 ORDER BY next_retry_at, rowid
-                LIMIT 1
-            """, (now_epoch,)).fetchone()
+            """, (now_epoch,)).fetchall()
+            row = None
+            for candidate in rows:
+                payload = json.loads(candidate["payload"])
+                if self._claim_eligibility is None or self._claim_eligibility(payload):
+                    row = candidate
+                    break
             if row is None:
                 return None
             changed = conn.execute("""

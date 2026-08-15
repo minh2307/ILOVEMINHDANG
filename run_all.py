@@ -3,13 +3,13 @@ import subprocess
 import time
 
 job_ids = [
-    "4a602461bd644a44887bf3512bbea012",
-    "91ba90ebb03c4afe9120b8e6a135822b",
-    "db17616569c74564bae3617cc70b8be4",
-    "b409f248bea94e42aee8f34f3a33facd",
-    "0c89bc1ea7534f7895750025be16a6aa",
-    "cc01779bcdac4029b66bc8983720ea69",
-    "c2a72b17283e4fdaa0b7f45e7733d4f2"
+    "62705d85a1ce44539be9bdf970ade303",
+    "a8664d44e24146eba26a881a36a0334e",
+    "2a73955d60014078ab6d1d323776a34a",
+    "5d5b0b98fb1d43a1bfd5674a85ce329e",
+    "de8e14b522264c95b71e6f603f39a786",
+    "d1c8b421430a472fa51150ef276c80e8",
+    "66a308c307d547dfa0df2e1cc8d4a159"
 ]
 
 db_path = 'data/jobs.sqlite3'
