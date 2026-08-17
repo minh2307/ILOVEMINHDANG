@@ -300,25 +300,11 @@ class OllamaOutputParser:
                     continue
             final_lines.append(line)
 
-        filtered_text = re.sub(r'\n{3,}', '\n\n', "\n".join(final_lines)).strip()
-        cf_text = filtered_text[:_MAX_FIELD_CHARS] if len(filtered_text) > _MAX_FIELD_CHARS else filtered_text
-
-        # Extract the NHẬN ĐỊNH CA BỆNH section as impression
-        impression = self._extract_section(filtered_text, "NHẬN ĐỊNH CA BỆNH")
-        if not impression:
-            # Fallback: look for the last non-empty paragraph as impression
-            paragraphs = [p.strip() for p in filtered_text.split("\n\n") if p.strip()]
-            if paragraphs:
-                impression = paragraphs[-1]
-
-        # Extract CHẨN ĐOÁN PHÂN BIỆT lines as findings
-        dd_text = self._extract_section(filtered_text, "CHẨN ĐOÁN PHÂN BIỆT")
-        differential: list[str] = []
-        if dd_text:
-            for dd_line in dd_text.splitlines():
-                dd_val = re.sub(r'^\s*[-•*]\s*', '', dd_line).strip()
-                if dd_val:
-                    differential.append(dd_val)
+        filtered_text = "\n".join(final_lines).strip()
+        # Ensure we return a single continuous block of text as requested
+        # Replace multiple newlines with spaces to enforce the single paragraph rule
+        cf_text = re.sub(r'\s+', ' ', filtered_text).strip()
+        cf_text = cf_text[:_MAX_FIELD_CHARS] if len(cf_text) > _MAX_FIELD_CHARS else cf_text
 
         return ClinicalAnalysisResult(
             success=not failures,
@@ -328,8 +314,8 @@ class OllamaOutputParser:
             visual_analysis_performed=frames_were_sent,
             prompt_version=prompt_version,
             clinical_factors_text=cf_text,
-            impression=[impression] if impression else [],
-            differential_diagnosis=differential,
+            impression=[],
+            differential_diagnosis=[],
             requires_human_review=True,
             validation_warnings=warnings,
             missing_fields=[],

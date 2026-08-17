@@ -145,6 +145,9 @@ class Settings:
     ollama_timeout_seconds: int
     ollama_keep_alive: str
     ollama_temperature: float
+    ollama_top_p: float
+    ollama_repeat_penalty: float
+    ollama_num_predict: int
     ollama_max_retries: int
     ollama_prompt_version: str
     ollama_prompt_max_chars: int
@@ -330,6 +333,9 @@ class Settings:
             ollama_timeout_seconds=_int_env("OLLAMA_TIMEOUT_SECONDS", 300),
             ollama_keep_alive=os.getenv("OLLAMA_KEEP_ALIVE", "10m").strip(),
             ollama_temperature=_float_env("OLLAMA_TEMPERATURE", 0.1, 0.0),
+            ollama_top_p=_float_env("OLLAMA_TOP_P", 0.8, 0.0),
+            ollama_repeat_penalty=_float_env("OLLAMA_REPEAT_PENALTY", 1.2, 0.0),
+            ollama_num_predict=_int_env("OLLAMA_NUM_PREDICT", 250, 1),
             ollama_max_retries=_int_env("OLLAMA_MAX_RETRIES", 2),
             ollama_prompt_version=os.getenv("OLLAMA_PROMPT_VERSION", "ollama-clinical-v1").strip(),
             ollama_prompt_max_chars=_int_env("OLLAMA_PROMPT_MAX_CHARS", 30_000),
