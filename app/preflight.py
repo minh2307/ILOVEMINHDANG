@@ -532,7 +532,7 @@ async def _full_ollama_checks(settings: Settings) -> list[PreflightCheckResult]:
             analyzer.minimal_inference("Reply with exactly: PREFLIGHT_OK"),
             timeout=timeout,
         )
-        normalized = str(response).strip()
+        normalized = str(response).strip(" .\n\r\t")
         if normalized != "PREFLIGHT_OK":
             status = CheckStatus.FAILED
             message = "Ollama minimal inference returned an invalid response"

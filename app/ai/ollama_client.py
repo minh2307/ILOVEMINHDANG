@@ -63,7 +63,10 @@ class OllamaClient:
         model: str,
         timeout_seconds: int = 900,
         keep_alive: str = "10m",
-        temperature: float = 0.1,
+        temperature: float = 0.15,
+        top_p: float = 0.85,
+        repeat_penalty: float = 1.2,
+        num_predict: int = 250,
         max_retries: int = 2,
         logger: logging.Logger | None = None,
     ) -> None:
@@ -72,6 +75,9 @@ class OllamaClient:
         self._timeout = timeout_seconds
         self._keep_alive = keep_alive
         self._temperature = temperature
+        self._top_p = top_p
+        self._repeat_penalty = repeat_penalty
+        self._num_predict = num_predict
         self._max_retries = max_retries
         self._logger = logger or logging.getLogger("cdha_pipeline.ollama_client")
 
@@ -196,6 +202,9 @@ class OllamaClient:
             "keep_alive": self._keep_alive,
             "options": {
                 "temperature": self._temperature,
+                "top_p": self._top_p,
+                "repeat_penalty": self._repeat_penalty,
+                "num_predict": self._num_predict,
                 "num_ctx": 16384
             },
         }
@@ -225,6 +234,9 @@ class OllamaClient:
             "keep_alive": self._keep_alive,
             "options": {
                 "temperature": self._temperature,
+                "top_p": self._top_p,
+                "repeat_penalty": self._repeat_penalty,
+                "num_predict": self._num_predict,
                 "num_ctx": 16384
             },
         }

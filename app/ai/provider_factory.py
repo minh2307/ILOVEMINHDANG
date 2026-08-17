@@ -36,6 +36,9 @@ def build_analyzer(
         timeout_seconds=settings.ollama_timeout_seconds,
         keep_alive=settings.ollama_keep_alive,
         temperature=settings.ollama_temperature,
+        top_p=settings.ollama_top_p,
+        repeat_penalty=settings.ollama_repeat_penalty,
+        num_predict=settings.ollama_num_predict,
         max_retries=settings.ollama_max_retries,
         logger=logger,
     )
