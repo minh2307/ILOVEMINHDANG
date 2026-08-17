@@ -252,20 +252,21 @@ class OllamaOutputParser:
         generated_at: Any,
         prompt_version: str,
     ) -> ClinicalAnalysisResult:
-        """Accept plain-text output when JSON parsing fails.
+        """Parse structured Vietnamese plain-text output (the primary format).
 
-        Checks for required Vietnamese headings and wraps as-is.
+        Extracts NHẬN ĐỊNH CA BỆNH as the impression and uses the full
+        text as clinical_factors_text for CDHA web submission.
         """
-        warnings = ["Model returned plain text instead of JSON; structural validation limited"]
+        warnings: list[str] = []
         failures: list[str] = []
 
         lowered = text.casefold()
-        missing_headings = []
 
         for marker in _INJECTION_OUTPUT_MARKERS:
             if marker in lowered:
                 failures.append(f"Output contains injection-like content: {marker!r}")
 
+        # Strip placeholder lines like "[Ghi tên cơ quan...]" that model echoed back
         cleaned_lines = []
         raw_lines = text.strip().splitlines()
         for line in raw_lines:
@@ -275,12 +276,15 @@ class OllamaOutputParser:
                 continue
             if clean_line.startswith("<") and clean_line.endswith(">"):
                 continue
-            lowered = clean_line.casefold()
-            if lowered in ("không được cung cấp", "null", "none", "không rõ", "không có", "n/a", "không"):
+            if clean_line.startswith("[") and clean_line.endswith("]"):
+                continue
+            lower_val = clean_line.casefold()
+            if lower_val in ("không được cung cấp", "null", "none", "không rõ", "không có", "n/a", "không"):
                 continue
             cleaned_lines.append(line)
 
-        final_lines = []
+        # Remove header lines that have no content following them
+        final_lines: list[str] = []
         for i, line in enumerate(cleaned_lines):
             if line.strip().endswith(":"):
                 has_content = False
@@ -299,20 +303,52 @@ class OllamaOutputParser:
         filtered_text = re.sub(r'\n{3,}', '\n\n', "\n".join(final_lines)).strip()
         cf_text = filtered_text[:_MAX_FIELD_CHARS] if len(filtered_text) > _MAX_FIELD_CHARS else filtered_text
 
+        # Extract the NHẬN ĐỊNH CA BỆNH section as impression
+        impression = self._extract_section(filtered_text, "NHẬN ĐỊNH CA BỆNH")
+        if not impression:
+            # Fallback: look for the last non-empty paragraph as impression
+            paragraphs = [p.strip() for p in filtered_text.split("\n\n") if p.strip()]
+            if paragraphs:
+                impression = paragraphs[-1]
+
+        # Extract CHẨN ĐOÁN PHÂN BIỆT lines as findings
+        dd_text = self._extract_section(filtered_text, "CHẨN ĐOÁN PHÂN BIỆT")
+        differential: list[str] = []
+        if dd_text:
+            for dd_line in dd_text.splitlines():
+                dd_val = re.sub(r'^\s*[-•*]\s*', '', dd_line).strip()
+                if dd_val:
+                    differential.append(dd_val)
+
         return ClinicalAnalysisResult(
             success=not failures,
             job_id=job_id,
             model=model,
             analysis_mode=ANALYSIS_MODE_TEXT if not frames_were_sent else ANALYSIS_MODE_VISION,
-            visual_analysis_performed=False,
+            visual_analysis_performed=frames_were_sent,
             prompt_version=prompt_version,
             clinical_factors_text=cf_text,
+            impression=[impression] if impression else [],
+            differential_diagnosis=differential,
             requires_human_review=True,
             validation_warnings=warnings,
-            missing_fields=missing_headings,
+            missing_fields=[],
             generated_at=generated_at,
             error="; ".join(failures) if failures else None,
         )
+
+    @staticmethod
+    def _extract_section(text: str, header: str) -> str:
+        """Extract the content of a Vietnamese plain-text section by header name."""
+        # Match header at start of line (case-insensitive, with optional colon)
+        pattern = re.compile(
+            rf"(?:^|\n){re.escape(header)}\s*:?\s*\n([\s\S]*?)(?:\n[A-ZÀ-ỹ][A-ZÀ-ỹ\s/]+:\s*\n|$)",
+            re.IGNORECASE,
+        )
+        match = pattern.search(text)
+        if match:
+            return match.group(1).strip()
+        return ""
 
     # ------------------------------------------------------------------
     # Helpers

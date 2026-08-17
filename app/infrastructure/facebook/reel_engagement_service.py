@@ -419,7 +419,7 @@ class FacebookReelEngagementService:
                     .find(visible);
                 if (!root) return false;
                 const regions = [root, ...root.querySelectorAll(
-                    '[role="dialog"], [role="complementary"], [role="tabpanel"], '
+                    '[role="dialog"], [role="complementary"], [role="tabpanel"], ' +
                     '[aria-label*="comments" i], [aria-label*="bình luận" i]'
                 )].filter(visible);
                 const scrollables = regions.flatMap((region) => [
@@ -502,8 +502,8 @@ class FacebookReelEngagementService:
                         (profile.innerText || profile.getAttribute('aria-label') || '').trim() : '';
                     const messageNodes = [
                         ...container.querySelectorAll(
-                            '[data-ad-preview="message"], '
-                            '[data-ad-comet-preview="message"], '
+                            '[data-ad-preview="message"], ' +
+                            '[data-ad-comet-preview="message"], ' +
                             'span[dir="auto"], div[dir="auto"]'
                         )
                     ].filter((node) => {
@@ -699,7 +699,7 @@ class FacebookReelEngagementService:
                                 return true;
                             }
                             return [...node.querySelectorAll(
-                                'a[href*="comment_id="], '
+                                'a[href*="comment_id="], ' +
                                 'a[href*="reply_comment_id="]'
                             )].some((link) =>
                                 link.closest('[role="article"]') === node

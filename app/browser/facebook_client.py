@@ -1050,6 +1050,21 @@ class FacebookWebClient:
                 await box.focus()
                 await box.press("Enter")
             await self._wait_for_visible_comment(page, comment_text)
+            
+            try:
+                from app.infrastructure.facebook.reel_engagement_service import FacebookReelEngagementService
+                engagement_service = FacebookReelEngagementService(logger=self.logger)
+                self.logger.info("Starting reel engagement (like reel and comments) for %s", normalized_url)
+                await engagement_service.like_reel_and_comments(
+                    page=page,
+                    reel_url=normalized_url,
+                    like_reel=True,
+                    like_comments=True,
+                    like_replies=False,
+                )
+            except Exception as eng_exc:
+                self.logger.warning("Reel engagement failed after commenting: %s", eng_exc)
+
             posted_at = datetime.now(UTC)
             result = FacebookCommentResult(
                 True, job_id, normalized_url, None, comment_text, posted_at, [], None, False

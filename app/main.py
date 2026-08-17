@@ -156,6 +156,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     orchestrator.add_argument("--once", action="store_true")
     orchestrator.add_argument("--interval", type=float, default=5.0)
+
+    dashboard = commands.add_parser(
+        "dashboard", help="Start the MinhDang Operations Dashboard."
+    )
+    dashboard.add_argument("--host", default="127.0.0.1")
+    dashboard.add_argument("--port", type=int, default=8080)
+
+    dashboard_migrate = commands.add_parser(
+        "dashboard-migrate", help="Run database migrations for the dashboard."
+    )
+    dashboard_migrate.add_argument("--dry-run", action="store_true", help="Preview the migration SQL")
+    dashboard_migrate.add_argument("--apply", action="store_true", help="Apply the migration")
+
     return parser
 
 
@@ -600,6 +613,30 @@ def _run_official_command(
                 await asyncio.sleep(max(0.1, args.interval))
 
         asyncio.run(schedule())
+        return 0
+
+    if args.command == "dashboard":
+        import uvicorn
+        from app.dashboard.server import app
+        print(f"Starting dashboard on http://{args.host}:{args.port}")
+        uvicorn.run(app, host=args.host, port=args.port)
+        return 0
+
+    if args.command == "dashboard-migrate":
+        from app.dashboard.operations_db import OperationsDB
+        if args.dry_run:
+            print("DRY RUN: The following tables and indexes will be created:")
+            print("- TABLE dashboard_operations")
+            print("- INDEX idx_ops_job ON dashboard_operations(job_id)")
+            return 0
+        if not args.apply:
+            print("Please specify --dry-run or --apply")
+            return 1
+            
+        print("Applying dashboard migrations...")
+        db = OperationsDB()
+        db.migrate()
+        print("Migrations applied successfully.")
         return 0
 
     raise AssertionError(f"Unhandled command: {args.command}")

@@ -25,6 +25,7 @@ class RetryJobUseCase:
         JobStatus.FACEBOOK_PUBLISH_FAILED: "facebook_prepare",
         JobStatus.POST_URL_EXTRACTION_FAILED: "facebook_permalink",
         JobStatus.COMMENT_FAILED: "facebook_comment",
+        JobStatus.NEEDS_CDHA_LOGIN: "cdha",
     }
 
     def __init__(
