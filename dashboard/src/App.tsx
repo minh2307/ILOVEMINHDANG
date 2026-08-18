@@ -5,6 +5,7 @@ import JobsList from './pages/JobsList';
 import JobDetail from './pages/JobDetail';
 import SystemHealth from './pages/SystemHealth';
 import ManualReviewCenter from './pages/ManualReviewCenter';
+import ProjectScheduler from './pages/ProjectScheduler';
 import { CommandPalette } from './components/ui/CommandPalette';
 import { useEffect, useState } from 'react';
 
@@ -68,8 +69,8 @@ function Layout({ children }: { children: React.ReactNode }) {
           <div>
             <h3 className="px-3 text-[10px] font-bold uppercase tracking-widest text-[var(--text-tertiary)] mb-2">System</h3>
             <nav className="space-y-0.5">
+              <NavItem to="/scheduler" icon={Settings} label="Scheduler" />
               <NavItem to="/system" icon={Server} label="System Health" />
-              <NavItem to="#" icon={Settings} label="Settings" />
             </nav>
           </div>
         </div>
@@ -127,6 +128,7 @@ function App() {
           <Route path="/jobs/:id" element={<JobDetail />} />
           <Route path="/manual-review" element={<ManualReviewCenter />} />
           <Route path="/system" element={<SystemHealth />} />
+          <Route path="/scheduler" element={<ProjectScheduler />} />
         </Routes>
       </Layout>
     </Router>

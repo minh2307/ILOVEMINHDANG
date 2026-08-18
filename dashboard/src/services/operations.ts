@@ -18,6 +18,19 @@ export interface OperationPreview {
 
 const OPS_BASE = '/api/operations/jobs';
 
+export const apiFetch = async (url: string, options?: RequestInit) => {
+    const res = await fetch(url, {
+        headers: { 'Content-Type': 'application/json', ...(options?.headers || {}) },
+        ...options
+    });
+    if (!res.ok) {
+        let err;
+        try { err = await res.json(); } catch(e) {}
+        throw new Error(err?.detail || err?.message || 'API request failed');
+    }
+    return res.json();
+};
+
 export const getOperations = async (jobId: string): Promise<OperationPolicy[]> => {
     const res = await fetch(`${OPS_BASE}/${jobId}/allowed`);
     if (!res.ok) throw new Error('Failed to fetch operations');

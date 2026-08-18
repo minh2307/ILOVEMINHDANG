@@ -3,7 +3,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.dashboard.routes import router
 from app.dashboard.operations_routes import router as operations_router
 from app.dashboard.operations_db import OperationsDB
+from app.dashboard.scheduler_routes import router as scheduler_router
 import os
+import threading
+import logging
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="MinhDang Operations Dashboard API",
@@ -26,6 +31,7 @@ from pathlib import Path
 
 app.include_router(router)
 app.include_router(operations_router)
+app.include_router(scheduler_router)
 
 from app.config.settings import Settings
 
@@ -47,6 +53,33 @@ if job_data_path.exists():
         if file_path.is_file():
             return FileResponse(file_path)
         return FileResponse(dist_path / "index.html")
+
+def _start_scheduler_background_thread() -> None:
+    """Run ProjectScheduler.tick() every 60 s in a daemon thread."""
+    import time
+    from pathlib import Path
+    try:
+        from app.config.settings import Settings
+        from app.scheduler.engine import ProjectScheduler
+        settings = Settings.from_env()
+        scheduler = ProjectScheduler(db_path=settings.database_path)
+        logger.info("[SCHEDULER] Background tick thread started.")
+        while True:
+            try:
+                scheduler.tick()
+            except Exception as exc:
+                logger.warning("[SCHEDULER] Tick error: %s", exc)
+            time.sleep(60)
+    except Exception as exc:
+        logger.error("[SCHEDULER] Background thread failed to start: %s", exc)
+
+
+@app.on_event("startup")
+async def on_startup():
+    t = threading.Thread(target=_start_scheduler_background_thread, daemon=True, name="scheduler-tick")
+    t.start()
+    logger.info("[SCHEDULER] Tick thread launched.")
+
 
 if __name__ == "__main__":
     import uvicorn

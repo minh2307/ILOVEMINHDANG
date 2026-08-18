@@ -169,6 +169,19 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard_migrate.add_argument("--dry-run", action="store_true", help="Preview the migration SQL")
     dashboard_migrate.add_argument("--apply", action="store_true", help="Apply the migration")
 
+    scheduler_cmd = commands.add_parser(
+        "scheduler", help="Manage the project scheduler (two-phase startup)."
+    )
+    scheduler_sub = scheduler_cmd.add_subparsers(dest="scheduler_action")
+
+    sched_enable = scheduler_sub.add_parser("enable", help="Enable scheduler with optional start time.")
+    sched_enable.add_argument("--start-time", metavar="HH:MM", help="Scheduled start time (e.g. 08:00)")
+    sched_enable.add_argument("--timezone", default="Asia/Ho_Chi_Minh")
+
+    scheduler_sub.add_parser("disable", help="Disable scheduler (running services stay up).")
+    scheduler_sub.add_parser("status", help="Print current scheduler state.")
+    scheduler_sub.add_parser("tick",   help="Force one evaluation tick.")
+
     return parser
 
 
@@ -638,6 +651,37 @@ def _run_official_command(
         db.migrate()
         print("Migrations applied successfully.")
         return 0
+
+    if args.command == "scheduler":
+        import json as _json
+        from app.scheduler.engine import ProjectScheduler
+        scheduler = ProjectScheduler(db_path=settings.database_path)
+        action = getattr(args, "scheduler_action", None) or "status"
+
+        if action == "status":
+            data = scheduler.get_status()
+            print(_json.dumps(data, ensure_ascii=False, indent=2))
+            return 0
+
+        if action == "enable":
+            start_time = getattr(args, "start_time", None) or scheduler.state.scheduled_start_time
+            tz = getattr(args, "timezone", None) or scheduler.state.timezone
+            state = scheduler.enable(start_time=start_time, tz=tz)
+            print(_json.dumps(state.to_dict(), ensure_ascii=False, indent=2))
+            return 0
+
+        if action == "disable":
+            state = scheduler.disable()
+            print(_json.dumps(state.to_dict(), ensure_ascii=False, indent=2))
+            return 0
+
+        if action == "tick":
+            state = scheduler.tick()
+            print(_json.dumps(state.to_dict(), ensure_ascii=False, indent=2))
+            return 0
+
+        print(f"Unknown scheduler action: {action}")
+        return 1
 
     raise AssertionError(f"Unhandled command: {args.command}")
 

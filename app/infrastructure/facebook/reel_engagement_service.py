@@ -124,7 +124,7 @@ class FacebookReelEngagementService:
             await self._navigate(page, reel_url)
             await self._ensure_authenticated(page)
             await self._dismiss_blocking_popups(page)
-            reel_author = await self._extract_reel_author(page)
+            reel_author = await self._extract_reel_author(page, reel_url)
             result.update(
                 reel_url=str(getattr(page, "url", reel_url) or reel_url),
                 reel_author=reel_author.name,
@@ -135,7 +135,7 @@ class FacebookReelEngagementService:
 
             if like_reel:
                 try:
-                    liked, clicked = await self._ensure_reel_liked(page)
+                    liked, clicked = await self._ensure_reel_liked(page, reel_url)
                     result["reel_liked"] = liked
                     result["reel_like_clicked"] = clicked
                 except Exception as exc:
@@ -146,13 +146,14 @@ class FacebookReelEngagementService:
                     self.logger.warning("[REEL] Like failed: %s", exc)
 
             if like_comments:
-                await self._open_comment_panel(page)
+                await self._open_comment_panel(page, reel_url)
                 comments = await self._load_all_comments(
-                    page, like_replies=like_replies
+                    page, reel_url, like_replies=like_replies
                 )
                 result["comments_found"] = len(comments)
                 await self._process_comments(
                     page,
+                    reel_url,
                     comments,
                     reel_author,
                     like_replies=like_replies,
@@ -206,8 +207,8 @@ class FacebookReelEngagementService:
             except Exception as exc:
                 self.logger.debug("Popup close control disappeared: %s", exc)
 
-    async def _extract_reel_author(self, page: Any) -> FacebookActorIdentity:
-        if not await self._mark_active_reel_scope(page):
+    async def _extract_reel_author(self, page: Any, reel_url: str) -> FacebookActorIdentity:
+        if not await self._resolve_active_reel_context(page, reel_url):
             return FacebookActorIdentity()
         raw = await page.evaluate(
             r"""({scopeAttribute}) => {
@@ -271,8 +272,8 @@ class FacebookReelEngagementService:
             profile_url=str(raw.get("url") or "") or None,
         )
 
-    async def _ensure_reel_liked(self, page: Any) -> tuple[bool, bool]:
-        button, state = await self._find_reel_reaction_button(page)
+    async def _ensure_reel_liked(self, page: Any, reel_url: str) -> tuple[bool, bool]:
+        button, state = await self._find_reel_reaction_button(page, reel_url)
         if state == "liked":
             self.logger.info("[REEL] Already liked")
             return True, False
@@ -280,16 +281,16 @@ class FacebookReelEngagementService:
             raise RuntimeError("Reel Like state could not be determined safely")
         await button.click(timeout=self.click_timeout_ms)
         await self._bounded_delay()
-        _verified_button, verified_state = await self._find_reel_reaction_button(page)
+        _verified_button, verified_state = await self._find_reel_reaction_button(page, reel_url)
         if verified_state != "liked":
             raise RuntimeError("Reel Like click could not be verified")
         self.logger.info("[REEL] LIKE")
         return True, True
 
     async def _find_reel_reaction_button(
-        self, page: Any
+        self, page: Any, reel_url: str
     ) -> tuple[Any | None, ReactionState]:
-        scope = await self._active_reel_scope(page)
+        scope = await self._active_reel_scope(page, reel_url)
         if scope is None:
             return None, "unknown"
         controls = scope.locator(self._REACTION_SELECTOR)
@@ -323,10 +324,10 @@ class FacebookReelEngagementService:
                 continue
         return None, "unknown"
 
-    async def _open_comment_panel(self, page: Any) -> None:
-        if await self._discover_comments(page, like_replies=False):
+    async def _open_comment_panel(self, page: Any, reel_url: str) -> None:
+        if await self._discover_comments(page, reel_url, like_replies=False):
             return
-        scope = await self._active_reel_scope(page)
+        scope = await self._active_reel_scope(page, reel_url)
         if scope is None:
             raise RuntimeError("Active Reel container could not be located")
         controls = scope.locator(self._COMMENT_PANEL_SELECTOR)
@@ -349,21 +350,21 @@ class FacebookReelEngagementService:
         self.logger.info("[REEL] Comment panel was already open or has no toggle")
 
     async def _load_all_comments(
-        self, page: Any, *, like_replies: bool
+        self, page: Any, reel_url: str, *, like_replies: bool
     ) -> list[FacebookCommentSnapshot]:
         discovered: dict[str, FacebookCommentSnapshot] = {}
         no_new_rounds = 0
         for _round in range(1, self.max_scroll_rounds + 1):
             before = len(discovered)
             for comment in await self._discover_comments(
-                page, like_replies=like_replies
+                page, reel_url, like_replies=like_replies
             ):
                 discovered.setdefault(comment.identity_key, comment)
-            await self._expand_comment_controls(page, like_replies=like_replies)
-            await self._scroll_comment_region(page)
+            await self._expand_comment_controls(page, reel_url, like_replies=like_replies)
+            await self._scroll_comment_region(page, reel_url)
             await self._bounded_delay(0.35, 0.7)
             for comment in await self._discover_comments(
-                page, like_replies=like_replies
+                page, reel_url, like_replies=like_replies
             ):
                 discovered.setdefault(comment.identity_key, comment)
             if len(discovered) == before:
@@ -375,9 +376,9 @@ class FacebookReelEngagementService:
         return list(discovered.values())
 
     async def _expand_comment_controls(
-        self, page: Any, *, like_replies: bool
+        self, page: Any, reel_url: str, *, like_replies: bool
     ) -> int:
-        scope = await self._active_reel_scope(page)
+        scope = await self._active_reel_scope(page, reel_url)
         if scope is None:
             return 0
         controls = scope.locator(self._EXPAND_SELECTOR)
@@ -406,8 +407,8 @@ class FacebookReelEngagementService:
                 self.logger.debug("Comment expander disappeared: %s", exc)
         return clicked
 
-    async def _scroll_comment_region(self, page: Any) -> None:
-        if not await self._mark_active_reel_scope(page):
+    async def _scroll_comment_region(self, page: Any, reel_url: str) -> None:
+        if not await self._resolve_active_reel_context(page, reel_url):
             return
         await page.evaluate(
             r"""({scopeAttribute}) => {
@@ -443,9 +444,9 @@ class FacebookReelEngagementService:
         )
 
     async def _discover_comments(
-        self, page: Any, *, like_replies: bool
+        self, page: Any, reel_url: str, *, like_replies: bool
     ) -> list[FacebookCommentSnapshot]:
-        if not await self._mark_active_reel_scope(page):
+        if not await self._resolve_active_reel_context(page, reel_url):
             return []
         raw_comments = await page.evaluate(
             r"""({includeReplies, domAttribute, scopeAttribute}) => {
@@ -474,8 +475,31 @@ class FacebookReelEngagementService:
                     .filter((el) => visible(el) && commentLike(el));
                 if (!candidates.length) {
                     candidates = [...root.querySelectorAll(
-                        '[data-commentid], [data-comment-id]'
+                        '[data-commentid], [data-comment-id], div[aria-label*="comment by" i], div[aria-label*="bình luận của" i]'
                     )].filter(visible);
+                }
+                if (!candidates.length) {
+                    const replyText = ['reply', 'phản hồi', 'trả lời', 'like', 'thích'];
+                    const links = [...root.querySelectorAll('div[role="button"], span, a')].filter(el => {
+                        const txt = (el.innerText || '').trim().toLowerCase();
+                        return visible(el) && replyText.includes(txt);
+                    });
+                    candidates = links.map(el => {
+                        let parent = el.parentElement;
+                        for(let i=0; i<8 && parent; i++) {
+                            const hasLink = parent.querySelector('a[href*="/"]');
+                            const hasText = parent.querySelector('[dir="auto"]') || parent.querySelector('span');
+                            if(hasLink && hasText && parent.innerText.length > 5 && !parent.innerText.includes('Follow')) {
+                                return parent;
+                            }
+                            parent = parent.parentElement;
+                        }
+                        return null;
+                    }).filter(Boolean);
+                    // Keep outermost containers only among candidates
+                    candidates = [...new Set(candidates)].filter(c => {
+                        return !candidates.some(other => other !== c && other.contains(c));
+                    });
                 }
                 let sequence = 0;
                 return candidates.map((container) => {
@@ -587,6 +611,7 @@ class FacebookReelEngagementService:
     async def _process_comments(
         self,
         page: Any,
+        reel_url: str,
         comments: list[FacebookCommentSnapshot],
         reel_author: FacebookActorIdentity,
         *,
@@ -613,7 +638,7 @@ class FacebookReelEngagementService:
             author_name = snapshot.author.name or "UNKNOWN"
             try:
                 fresh = await self._refresh_comment(
-                    page, snapshot, like_replies=like_replies
+                    page, reel_url, snapshot, like_replies=like_replies
                 )
                 if fresh is None:
                     raise RuntimeError("comment detached or no longer rendered")
@@ -641,7 +666,7 @@ class FacebookReelEngagementService:
                 await button.click(timeout=self.click_timeout_ms)
                 await self._bounded_delay()
                 verified = await self._refresh_comment(
-                    page, fresh, like_replies=like_replies
+                    page, reel_url, fresh, like_replies=like_replies
                 )
                 if verified is None:
                     raise RuntimeError("comment detached before Like verification")
@@ -661,6 +686,7 @@ class FacebookReelEngagementService:
     async def _refresh_comment(
         self,
         page: Any,
+        reel_url: str,
         snapshot: FacebookCommentSnapshot,
         *,
         like_replies: bool,
@@ -742,13 +768,18 @@ class FacebookReelEngagementService:
             (await control.get_attribute("aria-pressed")) or ""
         )
         combined = " ".join(part for part in (label, text) if part)
-        if pressed == "true" or any(term in combined for term in self._LIKED_TERMS):
-            return "liked"
+
+        has_liked_term = any(term in combined for term in self._LIKED_TERMS)
         label_is_not_liked = self._is_not_liked_action(label)
         text_is_not_liked = self._is_not_liked_action(text)
         has_not_liked_term = label_is_not_liked or text_is_not_liked
-        if not has_not_liked_term:
+
+        # Must contain like-related terms to be considered a reaction button
+        if not (has_liked_term or has_not_liked_term):
             return "unknown"
+
+        if pressed == "true" or has_liked_term:
+            return "liked"
         if pressed == "false":
             return "not_liked"
         color = ""
@@ -771,43 +802,115 @@ class FacebookReelEngagementService:
         upper = self.action_delay_range[1] if maximum is None else max(lower, maximum)
         await self._sleep(random.uniform(lower, upper))
 
-    async def _mark_active_reel_scope(self, page: Any) -> bool:
-        return bool(
-            await page.evaluate(
-                r"""({scopeAttribute}) => {
+    async def _resolve_active_reel_context(self, page: Any, reel_url: str) -> bool:
+        match = re.search(r'/reel/(\d+)', reel_url)
+        target_id = match.group(1) if match else ""
+
+        for attempt in range(1, 4):
+            result = await page.evaluate(
+                r"""({scopeAttribute, targetUrl, targetId}) => {
                     const visible = (el) => {
                         const rect = el.getBoundingClientRect();
                         const style = window.getComputedStyle(el);
                         return rect.width > 0 && rect.height > 0 &&
                             style.display !== 'none' && style.visibility !== 'hidden';
                     };
+                    
+                    // If already marked, return true
+                    if (document.querySelector(`[${scopeAttribute}="true"]`)) {
+                        return [true, null];
+                    }
+
                     for (const old of document.querySelectorAll(`[${scopeAttribute}]`)) {
                         old.removeAttribute(scopeAttribute);
                     }
-                    const activeDialogs = [...document.querySelectorAll('[role="dialog"]')]
-                        .filter((dialog) => visible(dialog) && (
-                            dialog.querySelector('video') ||
-                            dialog.querySelector('a[href*="/reel/"]')
-                        ));
-                    let root = activeDialogs.at(-1) || null;
-                    if (!root) {
+
+                    let roots = [];
+
+                    if (targetId) {
+                        const links = [...document.querySelectorAll(`a[href*="/reel/${targetId}"]`)].filter(visible);
+                        for (const link of links) {
+                            const container = link.closest('[role="article"]') || link.closest('[role="dialog"]') || link.closest('[role="main"]') || link.closest('div[data-pagelet]');
+                            if (container && !roots.includes(container)) roots.push(container);
+                        }
+                    }
+
+                    if (roots.length === 0) {
+                        const activeDialogs = [...document.querySelectorAll('[role="dialog"]')]
+                            .filter((dialog) => visible(dialog) && (
+                                dialog.querySelector('video') ||
+                                dialog.querySelector('a[href*="/reel/"]')
+                            ));
+                        if (activeDialogs.length > 0) {
+                            roots.push(activeDialogs.at(-1));
+                        }
+                    }
+
+                    if (roots.length === 0) {
                         const media = [...document.querySelectorAll('video')]
                             .find(visible) || [...document.querySelectorAll(
                                 'a[href*="/reel/"]'
                             )].find(visible);
-                        root = media?.closest('[role="article"]') ||
+                        let root = media?.closest('[role="article"]') ||
                             media?.closest('main, [role="main"]') || null;
+                        if (root) roots.push(root);
                     }
-                    if (!root) return false;
-                    root.setAttribute(scopeAttribute, 'true');
-                    return true;
-                }""",
-                {"scopeAttribute": self._REEL_SCOPE_ATTRIBUTE},
-            )
-        )
 
-    async def _active_reel_scope(self, page: Any) -> Any | None:
-        if not await self._mark_active_reel_scope(page):
+                    let finalRoot = roots.find(r => visible(r));
+
+                    if (finalRoot) {
+                        finalRoot.setAttribute(scopeAttribute, 'true');
+                        return [true, null];
+                    }
+
+                    const login_dialog_detected = !![...document.querySelectorAll('[role="dialog"], div')].find(d => {
+                        if (!visible(d)) return false;
+                        const text = d.innerText?.toLowerCase() || '';
+                        return (text.includes('log in') || text.includes('đăng nhập')) && text.length < 200;
+                    });
+                    const checkpoint_detected = window.location.href.includes('/checkpoint/') || window.location.href.includes('/login/');
+                    const visible_buttons = [...document.querySelectorAll('button, [role="button"]')].filter(visible).length;
+                    const candidate_containers = document.querySelectorAll('[role="article"], [role="dialog"]').length;
+
+                    return [false, {
+                        current_url: window.location.href,
+                        target_reel_url: targetUrl,
+                        reel_id: targetId,
+                        page_title: document.title,
+                        video_count: document.querySelectorAll('video').length,
+                        button_count: document.querySelectorAll('button, [role="button"]').length,
+                        visible_buttons: visible_buttons,
+                        candidate_reel_containers: candidate_containers,
+                        login_dialog_detected: login_dialog_detected,
+                        checkpoint_detected: checkpoint_detected
+                    }];
+                }""",
+                {"scopeAttribute": self._REEL_SCOPE_ATTRIBUTE, "targetUrl": reel_url, "targetId": target_id},
+            )
+            
+            success = result[0]
+            diagnostic = result[1]
+            
+            if success:
+                return True
+                
+            if attempt < 3:
+                self.logger.debug(f"[_resolve_active_reel_context] Attempt {attempt} failed, waiting for UI update...")
+                await self._bounded_delay(1.5, 2.5)
+
+        if diagnostic:
+            if diagnostic.get("login_dialog_detected"):
+                raise RuntimeError("Facebook login dialog detected")
+            if diagnostic.get("checkpoint_detected"):
+                raise RuntimeError("Facebook checkpoint/verification detected")
+            diag_str = ", ".join(f"{k}={v}" for k, v in diagnostic.items())
+            raise RuntimeError(f"Active Reel container could not be located. Diagnostic: {diag_str}")
+            
+        return False
+
+
+    async def _active_reel_scope(self, page: Any, reel_url: str) -> Any | None:
+        if not await self._resolve_active_reel_context(page, reel_url):
             return None
         scope = page.locator(f'[{self._REEL_SCOPE_ATTRIBUTE}="true"]')
         if not await scope.count():
